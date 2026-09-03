@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
-"""entropy-arb entry point.
+"""arcus-arb Phase A entry point.
 
-    # collect minute data only — no strategy, no credentials needed
+    # collect public market data only — no credentials needed
     python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 
-    # LIVE trading: real orders, real money (needs .env credentials)
-    python3 main.py --symbol SNDK --hedge lighter-rh
-
 --symbol and --hedge are required on every start: the markets you trade are
-an explicit decision, not a config default. Add --cn for a Chinese-language
-dashboard. There is no paper mode. Collect data with --record-only, review
-the market, select a strategy and parameters in config.yaml, then go live
-with small position caps.
+an explicit decision, not a config default. Phase A requires --record-only;
+there is no live or paper trading mode in this project.
 
-On a terminal the bot shows a live Rich dashboard (books, signal, positions,
-PnL, last executions) and writes log lines to logging.file; use
---no-dashboard for plain console logs (nohup/systemd). Strategy lives in
-config.yaml, credentials in .env — see the README (English) /
-README.zh-CN.md (中文).
+On a terminal the bot shows a live Rich market-data dashboard (BBO, premium,
+RTH state, sequence health, recorder rows) and writes log lines to
+logging.file; use --no-dashboard for plain console logs (nohup/systemd). See
+the README (English) / README.zh-CN.md (中文).
 """
 import argparse
 import asyncio
@@ -27,7 +21,7 @@ import os
 import signal
 import sys
 
-from entropy_arb.config import HEDGE_VENUES, ConfigError, load_config
+from entropy_arb.config import ConfigError, load_config
 from entropy_arb.engine import Engine
 
 
@@ -77,20 +71,18 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Two-venue LIVE arbitrage: Entropy vs Lighter mainnet / "
-                    "Lighter Robinhood / trade.xyz. Without --record-only, "
-                    "real orders are sent.")
+        description="Arcus SNDK × Lighter-RH SNDK public market-data recorder "
+                    "(Phase A, record-only)")
     p.add_argument("--symbol", required=True,
                    help="symbol traded on both venues, e.g. SNDK / "
                         "两个交易所共同交易的品种")
-    p.add_argument("--hedge", required=True, choices=HEDGE_VENUES,
+    p.add_argument("--hedge", required=True, choices=("lighter-rh",),
                    metavar="VENUE",
-                   help=f"hedge venue, one of: {', '.join(HEDGE_VENUES)} / "
-                        f"对冲腿，三选一")
+                   help="Phase A hedge venue: lighter-rh / 对冲腿：lighter-rh")
     p.add_argument("--config", default="config.yaml",
                    help="strategy config (default: config.yaml)")
     p.add_argument("--env-file", default=".env",
-                   help="credentials file (default: .env)")
+                   help="optional legacy env-file path; no Arcus credentials are used")
     p.add_argument("--record-only", action="store_true",
                    help="only collect minute data, run no strategy, send no "
                         "orders (needs no credentials)")
@@ -102,6 +94,14 @@ def main() -> None:
     disp.add_argument("--no-dashboard", action="store_true",
                       help="plain console logs instead of the dashboard")
     args = p.parse_args()
+
+    if not args.record_only:
+        print(
+            "Phase A is record-only; pass --record-only. "
+            "Arcus trading is not implemented in Phase A",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     try:
         cfg = load_config(args.config, args.env_file,

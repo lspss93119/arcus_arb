@@ -1,20 +1,19 @@
-"""Configuration: strategy from a YAML file, credentials from .env, market
-selection (symbol + hedge venue) from the command line.
+"""Configuration for the Arcus × hedge record-only runtime.
 
-The split is deliberate: config.yaml IS the strategy (thresholds, sizing,
-risk) and is safe to share/commit as an example; .env holds only secrets;
-which markets to trade is stated explicitly on every start (--symbol,
---hedge). Every YAML key is validated against the schema below, so a typo
-is an error rather than a setting that silently does nothing.
+The split is deliberate: config.yaml contains analysis/recording settings and
+is safe to share/commit as an example; Phase A needs no environment secrets;
+which market pair to observe is stated explicitly on every start (--symbol,
+--hedge). Every YAML key is validated against the schema below, so a typo is
+an error rather than a setting that silently does nothing.
 
 Strategy model:
 
-    premium_bps = (entropy_price / hedge_price - 1) * 10_000
+    premium_bps = (arcus_price / hedge_price - 1) * 10_000
 
     stable_basis:
-        SELL entropy / BUY hedge fires when executable premium
+        SELL Arcus / BUY hedge fires when executable premium
             >= center_bps + upper_bps
-        BUY entropy / SELL hedge fires when executable premium
+        BUY Arcus / SELL hedge fires when executable premium
             <= center_bps - lower_bps
 
     Both hurdles are net of both venues' taker fees, so a full round trip
@@ -32,6 +31,8 @@ from dotenv import load_dotenv
 
 HL_API_URL = "https://api.hyperliquid.xyz"
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"   # official ws — the only HL feed used
+ARCUS_REST_URL = "https://api.arcus.xyz"
+ARCUS_WS_URL = "wss://api.arcus.xyz/v1/ws"
 
 HEDGE_VENUES = ("lighter", "lighter-rh", "tradexyz")
 DEFAULT_RECORDER_DATABASE = "data/market-history.sqlite"
@@ -94,9 +95,9 @@ class HLCreds:
 
 @dataclass
 class VenueConf:
-    key: str                  # "entropy" | "hedge"
-    kind: str                 # "hl" | "lighter"
-    label: str                # human name for logs, e.g. "ENTROPY", "RH"
+    key: str                  # "arcus" | "hedge"
+    kind: str                 # "arcus" | "hl" | "lighter"
+    label: str                # human name for logs, e.g. "ARCUS", "RH"
     symbol: str
     fee_bps: float
     cap_usd: float
@@ -127,7 +128,7 @@ class StrategyConf:
 class Config:
     symbol: str
     hedge_venue: str
-    entropy: VenueConf
+    arcus: VenueConf
     hedge: VenueConf
     strategy: StrategyConf
     # sizing
@@ -162,10 +163,23 @@ class Config:
     # runtime
     hl_api_url: str = HL_API_URL
     hl_ws_url: str = HL_WS_URL
+    arcus_rest_url: str = ARCUS_REST_URL
+    arcus_ws_url: str = ARCUS_WS_URL
+
+    @property
+    def entropy(self) -> VenueConf:
+        """Compatibility alias for mature generic strategy/test helpers.
+
+        The runtime and configuration use ``arcus``; this alias avoids an
+        unnecessary rewrite of venue-agnostic historical code in the fork.
+        """
+        return self.arcus
 
     @property
     def creds_complete(self) -> bool:
-        for v in (self.entropy, self.hedge):
+        for v in (self.arcus, self.hedge):
+            if v.kind == "arcus":
+                continue
             if v.kind == "hl" and not (v.hl_creds and v.hl_creds.complete):
                 return False
             if v.kind == "lighter" and not (v.lighter_creds
@@ -181,8 +195,7 @@ _SCHEMA: Dict[str, Any] = {
         "name": str,
         "params": dict,
     },
-    "entropy": {
-        "dex": str,
+    "arcus": {
         "taker_fee_bps": float,
         "max_position_usd": float,
         "max_orders_per_min": int,
@@ -431,21 +444,12 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                           "more than the profitable depth loses money on the "
                           "tail / 必须在 (0, 1] 之间")
 
-    entropy_dex = _get(raw, "entropy", "dex", "io")
-    if hedge_venue == "tradexyz" and entropy_dex == "xyz":
-        raise ConfigError("entropy.dex 'xyz' with hedge_venue 'tradexyz' is "
-                          "the same market on both legs / 两条腿是同一个市场")
-
-    entropy_hl_creds = HLCreds(_env_s("HL_PRIVATE_KEY"),
-                               _env_s("HL_ACCOUNT_ADDRESS"))
-    entropy = VenueConf(
-        key="entropy", kind="hl", label="ENTROPY",
+    arcus = VenueConf(
+        key="arcus", kind="arcus", label="ARCUS",
         symbol=symbol,
-        fee_bps=float(_get(raw, "entropy", "taker_fee_bps", 0.0)),
-        cap_usd=float(_get(raw, "entropy", "max_position_usd", 1000.0)),
-        orders_per_min=int(_get(raw, "entropy", "max_orders_per_min", 120)),
-        hl_dex=entropy_dex,
-        hl_creds=entropy_hl_creds,
+        fee_bps=float(_get(raw, "arcus", "taker_fee_bps", 0.0)),
+        cap_usd=float(_get(raw, "arcus", "max_position_usd", 1000.0)),
+        orders_per_min=int(_get(raw, "arcus", "max_orders_per_min", 0)),
     )
 
     if hedge_venue == "tradexyz":
@@ -479,7 +483,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     return Config(
         symbol=symbol,
         hedge_venue=hedge_venue,
-        entropy=entropy,
+        arcus=arcus,
         hedge=hedge,
         strategy=strategy_conf,
         take_fraction=take_fraction,
@@ -507,4 +511,6 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),
         dashboard=bool(_get(raw, "logging", "dashboard", True)),
         log_file=_get(raw, "logging", "file", "logs/engine.log"),
+        arcus_rest_url=ARCUS_REST_URL,
+        arcus_ws_url=ARCUS_WS_URL,
     )

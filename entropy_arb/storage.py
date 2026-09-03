@@ -78,6 +78,108 @@ class HedgeReferenceRow:
 
 
 @dataclass(frozen=True)
+class ArcusSampleRow:
+    timestamp_ms: int
+    symbol: str
+    arcus_bid: float
+    arcus_ask: float
+    arcus_bid_size: float
+    arcus_ask_size: float
+    arcus_mid: float
+    rh_bid: float
+    rh_ask: float
+    rh_bid_size: float
+    rh_ask_size: float
+    rh_mid: float
+    premium_bps: float
+    arcus_book_sequence_id: int | None
+    arcus_global_sequence_id: int | None
+    arcus_exchange_timestamp_us: int | None
+    arcus_local_receive_ts_ms: int
+    arcus_local_receive_monotonic_ns: int | None
+    rh_local_receive_ts_ms: int
+    is_outside_rth: bool | None
+    current_settlement_price: str | None
+    upper_trading_bound: str | None
+    lower_trading_bound: str | None
+    next_upper_trading_bound: str | None
+    next_lower_trading_bound: str | None
+    hedge: str = "lighter-rh"
+
+
+@dataclass(frozen=True)
+class ArcusMinuteRow:
+    minute_ts: int
+    symbol: str
+    hedge: str
+    arcus_bid: float
+    arcus_ask: float
+    rh_bid: float
+    rh_ask: float
+    premium_open_bps: float
+    premium_high_bps: float
+    premium_low_bps: float
+    premium_close_bps: float
+    premium_mean_bps: float
+    premium_std_bps: float
+    samples: int
+
+
+@dataclass(frozen=True)
+class ArcusTradeRow:
+    symbol: str
+    market_id: int
+    market_display_name: str
+    trade_id: str
+    exchange_timestamp_us: int
+    local_receive_ts_ms: int
+    local_receive_monotonic_ns: int | None
+    price: str
+    quantity: str
+    aggressor_side: str | None
+    sequence_number: int
+
+
+@dataclass(frozen=True)
+class ArcusMarketAttributesRow:
+    symbol: str
+    market_id: int
+    market_display_name: str
+    market_status: str
+    local_receive_ts_ms: int
+    local_receive_monotonic_ns: int | None
+    event_timestamp_us: int | None
+    market_sequence_num: int | None
+    is_outside_rth: bool | None
+    current_settlement_price: str | None
+    upper_trading_bound: str | None
+    lower_trading_bound: str | None
+    next_upper_trading_bound: str | None
+    next_lower_trading_bound: str | None
+
+
+@dataclass(frozen=True)
+class ArcusMarketMetadataRow:
+    discovered_at_ms: int
+    symbol: str
+    market_id: int
+    market_display_name: str
+    status: str
+    tick_size: str
+    step_size: str
+    min_order_size: str | None
+    min_order_notional: str | None
+    max_order_size: str | None
+    is_outside_rth: bool | None
+    current_settlement_price: str | None
+    upper_trading_bound: str | None
+    lower_trading_bound: str | None
+    next_upper_trading_bound: str | None
+    next_lower_trading_bound: str | None
+    regular_trading_hours: str | None
+
+
+@dataclass(frozen=True)
 class InsertCounts:
     inserted: int = 0
     duplicates: int = 0
@@ -102,6 +204,42 @@ _SPECS = {
                            ("symbol", "hedge", "recv_ms", "oracle_px", "mark_px")),
     "hedge_reference": (HedgeReferenceRow, ("symbol", "hedge", "recv_ms", "server_ms", "index_px", "mark_px"),
                          ("symbol", "hedge", "recv_ms", "server_ms", "index_px", "mark_px")),
+    "arcus_samples": (ArcusSampleRow, ("symbol", "hedge", "timestamp_ms"), (
+        "timestamp_ms", "symbol", "hedge", "arcus_bid", "arcus_ask",
+        "arcus_bid_size", "arcus_ask_size", "arcus_mid", "rh_bid", "rh_ask",
+        "rh_bid_size", "rh_ask_size", "rh_mid", "premium_bps",
+        "arcus_book_sequence_id", "arcus_global_sequence_id",
+        "arcus_exchange_timestamp_us", "arcus_local_receive_ts_ms",
+        "arcus_local_receive_monotonic_ns", "rh_local_receive_ts_ms",
+        "is_outside_rth", "current_settlement_price", "upper_trading_bound",
+        "lower_trading_bound", "next_upper_trading_bound",
+        "next_lower_trading_bound")),
+    "arcus_minutes": (ArcusMinuteRow, ("symbol", "hedge", "minute_ts"), (
+        "minute_ts", "symbol", "hedge", "arcus_bid", "arcus_ask", "rh_bid",
+        "rh_ask", "premium_open_bps", "premium_high_bps", "premium_low_bps",
+        "premium_close_bps", "premium_mean_bps", "premium_std_bps", "samples")),
+    "arcus_trades": (ArcusTradeRow, (
+        "symbol", "market_id", "trade_id", "exchange_timestamp_us", "price",
+        "quantity"), (
+        "symbol", "market_id", "market_display_name", "trade_id",
+        "exchange_timestamp_us", "local_receive_ts_ms",
+        "local_receive_monotonic_ns", "price", "quantity", "aggressor_side",
+        "sequence_number")),
+    "arcus_market_attributes": (ArcusMarketAttributesRow, (
+        "symbol", "market_id", "local_receive_ts_ms", "local_receive_monotonic_ns"), (
+        "symbol", "market_id", "market_display_name", "market_status",
+        "local_receive_ts_ms", "local_receive_monotonic_ns", "event_timestamp_us",
+        "market_sequence_num", "is_outside_rth", "current_settlement_price",
+        "upper_trading_bound", "lower_trading_bound", "next_upper_trading_bound",
+        "next_lower_trading_bound")),
+    "arcus_market_metadata": (ArcusMarketMetadataRow, (
+        "market_id", "discovered_at_ms"), (
+        "discovered_at_ms", "symbol", "market_id", "market_display_name",
+        "status", "tick_size", "step_size", "min_order_size",
+        "min_order_notional", "max_order_size", "is_outside_rth",
+        "current_settlement_price", "upper_trading_bound", "lower_trading_bound",
+        "next_upper_trading_bound", "next_lower_trading_bound",
+        "regular_trading_hours")),
 }
 
 _CREATE = {
@@ -122,6 +260,53 @@ _CREATE = {
         PRIMARY KEY (symbol, hedge, minute_ts))""",
     "entropy_reference": "CREATE TABLE IF NOT EXISTS entropy_reference (symbol TEXT NOT NULL, hedge TEXT NOT NULL, recv_ms INTEGER NOT NULL, oracle_px REAL NOT NULL, mark_px REAL NOT NULL, PRIMARY KEY (symbol, hedge, recv_ms, oracle_px, mark_px))",
     "hedge_reference": "CREATE TABLE IF NOT EXISTS hedge_reference (symbol TEXT NOT NULL, hedge TEXT NOT NULL, recv_ms INTEGER NOT NULL, server_ms INTEGER NOT NULL, index_px REAL NOT NULL, mark_px REAL NOT NULL, PRIMARY KEY (symbol, hedge, recv_ms, server_ms, index_px, mark_px))",
+    "arcus_samples": """CREATE TABLE IF NOT EXISTS arcus_samples (
+        timestamp_ms INTEGER NOT NULL, symbol TEXT NOT NULL, hedge TEXT NOT NULL,
+        arcus_bid REAL NOT NULL, arcus_ask REAL NOT NULL,
+        arcus_bid_size REAL NOT NULL, arcus_ask_size REAL NOT NULL,
+        arcus_mid REAL NOT NULL, rh_bid REAL NOT NULL, rh_ask REAL NOT NULL,
+        rh_bid_size REAL NOT NULL, rh_ask_size REAL NOT NULL, rh_mid REAL NOT NULL,
+        premium_bps REAL NOT NULL, arcus_book_sequence_id INTEGER,
+        arcus_global_sequence_id INTEGER, arcus_exchange_timestamp_us INTEGER,
+        arcus_local_receive_ts_ms INTEGER NOT NULL,
+        arcus_local_receive_monotonic_ns INTEGER, rh_local_receive_ts_ms INTEGER NOT NULL,
+        is_outside_rth INTEGER, current_settlement_price TEXT,
+        upper_trading_bound TEXT, lower_trading_bound TEXT,
+        next_upper_trading_bound TEXT, next_lower_trading_bound TEXT,
+        PRIMARY KEY (symbol, hedge, timestamp_ms))""",
+    "arcus_minutes": """CREATE TABLE IF NOT EXISTS arcus_minutes (
+        minute_ts INTEGER NOT NULL, symbol TEXT NOT NULL, hedge TEXT NOT NULL,
+        arcus_bid REAL NOT NULL, arcus_ask REAL NOT NULL, rh_bid REAL NOT NULL,
+        rh_ask REAL NOT NULL, premium_open_bps REAL NOT NULL,
+        premium_high_bps REAL NOT NULL, premium_low_bps REAL NOT NULL,
+        premium_close_bps REAL NOT NULL, premium_mean_bps REAL NOT NULL,
+        premium_std_bps REAL NOT NULL, samples INTEGER NOT NULL,
+        PRIMARY KEY (symbol, hedge, minute_ts))""",
+    "arcus_trades": """CREATE TABLE IF NOT EXISTS arcus_trades (
+        symbol TEXT NOT NULL, market_id INTEGER NOT NULL,
+        market_display_name TEXT NOT NULL, trade_id TEXT NOT NULL,
+        exchange_timestamp_us INTEGER NOT NULL, local_receive_ts_ms INTEGER NOT NULL,
+        local_receive_monotonic_ns INTEGER, price TEXT NOT NULL, quantity TEXT NOT NULL,
+        aggressor_side TEXT, sequence_number INTEGER NOT NULL,
+        PRIMARY KEY (symbol, market_id, trade_id, exchange_timestamp_us, price, quantity))""",
+    "arcus_market_attributes": """CREATE TABLE IF NOT EXISTS arcus_market_attributes (
+        symbol TEXT NOT NULL, market_id INTEGER NOT NULL,
+        market_display_name TEXT NOT NULL, market_status TEXT NOT NULL,
+        local_receive_ts_ms INTEGER NOT NULL, local_receive_monotonic_ns INTEGER,
+        event_timestamp_us INTEGER, market_sequence_num INTEGER,
+        is_outside_rth INTEGER, current_settlement_price TEXT,
+        upper_trading_bound TEXT, lower_trading_bound TEXT,
+        next_upper_trading_bound TEXT, next_lower_trading_bound TEXT,
+        PRIMARY KEY (symbol, market_id, local_receive_ts_ms, local_receive_monotonic_ns))""",
+    "arcus_market_metadata": """CREATE TABLE IF NOT EXISTS arcus_market_metadata (
+        discovered_at_ms INTEGER NOT NULL, symbol TEXT NOT NULL, market_id INTEGER NOT NULL,
+        market_display_name TEXT NOT NULL, status TEXT NOT NULL, tick_size TEXT NOT NULL,
+        step_size TEXT NOT NULL, min_order_size TEXT, min_order_notional TEXT,
+        max_order_size TEXT, is_outside_rth INTEGER, current_settlement_price TEXT,
+        upper_trading_bound TEXT, lower_trading_bound TEXT,
+        next_upper_trading_bound TEXT, next_lower_trading_bound TEXT,
+        regular_trading_hours TEXT,
+        PRIMARY KEY (market_id, discovered_at_ms))""",
 }
 
 
@@ -229,6 +414,13 @@ class MarketHistoryStore:
     def append_minute(self, row: MinuteRow) -> None: self._append("minutes", row)
     def append_entropy_reference(self, row: EntropyReferenceRow) -> None: self._append("entropy_reference", row)
     def append_hedge_reference(self, row: HedgeReferenceRow) -> None: self._append("hedge_reference", row)
+    def append_arcus_sample(self, row: ArcusSampleRow) -> None: self._append("arcus_samples", row)
+    def append_arcus_minute(self, row: ArcusMinuteRow) -> None: self._append("arcus_minutes", row)
+    def append_arcus_trade(self, row: ArcusTradeRow) -> None: self._append("arcus_trades", row)
+    def append_arcus_market_attributes(self, row: ArcusMarketAttributesRow) -> None:
+        self._append("arcus_market_attributes", row)
+    def append_arcus_market_metadata(self, row: ArcusMarketMetadataRow) -> None:
+        self._append("arcus_market_metadata", row)
 
     def recent_premium_observations(
         self,
@@ -248,11 +440,25 @@ class MarketHistoryStore:
             return []
         with self._db_lock:
             rows = self._conn.execute(
-                "SELECT timestamp_ms, premium_bps FROM samples "
+                "SELECT timestamp_ms, premium_bps FROM arcus_samples "
                 "WHERE symbol=? AND hedge=? AND timestamp_ms>=? "
                 "AND timestamp_ms<? ORDER BY timestamp_ms",
                 (symbol, hedge, int(start_ms), int(end_ms)),
             ).fetchall()
+            if not rows:
+                rows = self._conn.execute(
+                    "SELECT timestamp_ms, premium_bps FROM samples "
+                "WHERE symbol=? AND hedge=? AND timestamp_ms>=? "
+                "AND timestamp_ms<? ORDER BY timestamp_ms",
+                (symbol, hedge, int(start_ms), int(end_ms)),
+                ).fetchall()
+            if not rows:
+                rows = self._conn.execute(
+                    "SELECT minute_ts, premium_mean_bps FROM arcus_minutes "
+                    "WHERE symbol=? AND hedge=? AND minute_ts*1000>=? "
+                    "AND minute_ts*1000<? ORDER BY minute_ts",
+                    (symbol, hedge, int(start_ms), int(end_ms)),
+                ).fetchall()
             if not rows:
                 rows = self._conn.execute(
                     "SELECT minute_ts, premium_mean_bps FROM minutes "
@@ -265,6 +471,15 @@ class MarketHistoryStore:
             for timestamp, value in rows
             if value is not None and math.isfinite(float(value))
         ]
+
+    def count_rows(self, dataset: str) -> int:
+        """Return a committed row count for smoke tests and the dashboard."""
+        if dataset not in _SPECS:
+            raise ValueError(f"unknown dataset: {dataset}")
+        with self._db_lock:
+            return int(self._conn.execute(
+                f"SELECT COUNT(*) FROM {dataset}"
+            ).fetchone()[0])
 
     def _write(self, dataset: str, rows: Sequence[object]) -> InsertCounts:
         _, keys, fields = _SPECS[dataset]

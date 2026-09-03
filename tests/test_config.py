@@ -6,8 +6,6 @@ import os
 import sys
 import tempfile
 
-import pytest
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from entropy_arb.config import ConfigError, load_config  # noqa: E402
@@ -43,11 +41,11 @@ def test_example_config_loads():
     cfg = load_config(example_file, NO_ENV,
                       symbol="SNDK", hedge_venue="lighter-rh")
     assert cfg.symbol == "SNDK"
-    assert cfg.entropy.kind == "hl" and cfg.entropy.hl_dex == "io"
+    assert cfg.arcus.kind == "arcus" and cfg.arcus.label == "ARCUS"
     assert cfg.hedge_venue == "lighter-rh"
     assert cfg.hedge.kind == "lighter"
     assert cfg.hedge.lighter_profile.chain_id == 466324
-    assert cfg.entropy.symbol == "SNDK" and cfg.hedge.symbol == "SNDK"
+    assert cfg.arcus.symbol == "SNDK" and cfg.hedge.symbol == "SNDK"
     assert cfg.recorder_enabled and cfg.recorder_database
     assert cfg.dashboard and cfg.log_file
     assert cfg.strategy.name == "stable_basis"

@@ -1,17 +1,17 @@
-"""Two-venue arbitrage engine: Entropy vs one hedge venue.
+"""Two-venue market-data engine: Arcus vs Lighter-RH in Phase A.
 
 The signal is a fixed band around the configured or effective center
 (config.yaml):
 
-    SELL entropy / BUY hedge  when executable premium >= midline + upper (+fees)
-    BUY entropy / SELL hedge  when executable premium <= midline - lower (+fees)
+    SELL Arcus / BUY hedge  when executable premium >= midline + upper (+fees)
+    BUY Arcus / SELL hedge  when executable premium <= midline - lower (+fees)
 
 Around the signal: per-direction persistence arming,
 per-venue inventory ladder + position caps, per-venue order budgets and
 reactive rate-limit exclusion, net-delta hedging, venue-outage pausing with
-probing, and periodic on-chain reconciliation. There is no paper mode: the
-bot either trades live or runs --record-only (data collection, no strategy).
-Both venues' books and reference prices are persisted to SQLite throughout.
+probing, and periodic on-chain reconciliation are retained for the mature
+architecture.  Phase A itself is strictly record-only: public books and
+market events are persisted to SQLite and no order path is enabled.
 """
 from __future__ import annotations
 
@@ -30,12 +30,14 @@ from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
 from .entropy_quota import EntropyQuotaCoordinator
 from .premium import calculate_premiums
+from .arcus_recorder import ArcusMarketRecorder
 from .recorder import MinuteRecorder
 from .reference import ReferenceRecorder
 from .storage import FLUSH_INTERVAL_SEC, MarketHistoryStore
 from .strategy import RollingCenterUpdate, StrategyState, build_strategy
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
+from .venue_arcus import ArcusVenue
 
 log = logging.getLogger("engine")
 
@@ -77,6 +79,7 @@ class Engine:
         self.entropy_quota = EntropyQuotaCoordinator()
         self.record_only = record_only
         self.session: Optional[aiohttp.ClientSession] = None
+        self.arcus = None
         self.entropy = None
         self.hedge = None
         self.venues: Dict[str, object] = {}
@@ -170,6 +173,14 @@ class Engine:
             await self.session.close()
 
     def _make_venue(self, vc):
+        if (getattr(vc, "key", None) == "arcus"
+                or getattr(vc, "kind", None) == "arcus"):
+            return ArcusVenue(
+                vc,
+                self.session,
+                rest_url=self.cfg.arcus_rest_url,
+                ws_url=self.cfg.arcus_ws_url,
+            )
         if vc.kind == "lighter":
             return LighterVenue(vc, self.session, self.cfg.settle_timeout_sec)
         return HLVenue(vc, self.cfg.hl_api_url, self.cfg.hl_ws_url,
@@ -215,9 +226,112 @@ class Engine:
             if self.market_history is not None:
                 await asyncio.to_thread(self.market_history.flush)
 
+    async def _run_arcus_record_only(self, arcus: ArcusVenue) -> None:
+        """Run Phase A using public Arcus and public Lighter market data only."""
+        cfg = self.cfg
+        self.arcus = arcus
+        # The alias keeps mature venue-agnostic strategy and analysis helpers
+        # reusable without presenting Entropy as a runtime venue.
+        self.entropy = arcus
+        self.hedge = self._make_venue(cfg.hedge)
+        self.venues = {"arcus": self.arcus, "hedge": self.hedge}
+
+        metadata, _ = await asyncio.gather(
+            self.arcus.load_market(), self.hedge.load_market()
+        )
+        self.markets_ready = True
+        self.market_history = MarketHistoryStore(cfg.recorder_database)
+        self.recorder = ArcusMarketRecorder(
+            self.market_history,
+            symbol=cfg.symbol,
+            arcus_book=self.arcus.book,
+            rh_book=self.hedge.book,
+            hedge=cfg.hedge_venue,
+            is_fresh_seconds=cfg.staleness_sec,
+        )
+        self.recorder.record_metadata(metadata)
+        self.arcus.set_market_data_sinks(
+            self.recorder.record_trade,
+            lambda attributes, receive_ms, monotonic_ns: self.recorder.record_attributes(
+                attributes,
+                receive_ms,
+                monotonic_ns,
+                market_status=metadata.status,
+            ),
+        )
+        await self._bootstrap_rolling_center()
+
+        self._step = max(
+            self.arcus.size_step,
+            10 ** -min(self.arcus.size_decimals, self.hedge.size_decimals),
+        )
+        self._min_base = max(self.arcus.min_base, self.hedge.min_base, self._step)
+        self._min_notional = max(
+            cfg.min_order_notional, self.arcus.min_quote, self.hedge.min_quote
+        )
+        log.info(
+            "pair ARCUS(%s)-%s(%s): %s fees=%.2f+%.2f step=%g min_ntl=$%g",
+            self.arcus.exchange_symbol,
+            self.hedge.name,
+            self.hedge.conf.symbol,
+            self._startup_strategy_desc(self.strategy.state()),
+            self.arcus.fee_bps,
+            self.hedge.fee_bps,
+            self._step,
+            self._min_notional,
+        )
+        log.info("No automatic strategy selection.")
+        log.warning(
+            "RECORD-ONLY — ARCUS trading disabled in Phase A; collecting "
+            "public market data and sending no orders"
+        )
+
+        tasks: List[asyncio.Task] = [asyncio.create_task(
+            self._storage_flush_loop(), name="storage-flush"
+        )]
+        tasks += self.arcus.start_tasks(self.stop, self._update_evt.set, False)
+        tasks += self.hedge.start_tasks(self.stop, self._update_evt.set, False)
+        tasks.append(asyncio.create_task(self.recorder.run(self.stop), name="recorder"))
+        tasks.append(asyncio.create_task(self._status_loop(), name="status"))
+
+        try:
+            await self.stop.wait()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for venue in self.venues.values():
+                await venue.close()
+            if self.market_history is not None:
+                await asyncio.to_thread(self.market_history.flush)
+                sample_count = self.market_history.count_rows("arcus_samples")
+                trade_count = self.market_history.count_rows("arcus_trades")
+                attribute_count = self.market_history.count_rows(
+                    "arcus_market_attributes"
+                )
+                await asyncio.to_thread(self.market_history.close)
+                log.info(
+                    "shutdown — record-only samples=%d trades=%d attrs=%d",
+                    sample_count,
+                    trade_count,
+                    attribute_count,
+                )
+
     async def _run_inner(self) -> None:
         cfg = self.cfg
-        self.entropy = self._make_venue(cfg.entropy)
+        selected = self._make_venue(getattr(cfg, "arcus", cfg.entropy))
+        if isinstance(selected, ArcusVenue):
+            if not self.record_only:
+                raise RuntimeError(
+                    "Phase A is record-only; pass --record-only. "
+                    "Arcus trading is not implemented in Phase A"
+                )
+            await self._run_arcus_record_only(selected)
+            return
+
+        # Compatibility path for the mature strategy/execution unit tests and
+        # historical helpers.  It is unreachable from the Arcus config.
+        self.entropy = selected
         self.hedge = self._make_venue(cfg.hedge)
         self.venues = {"entropy": self.entropy, "hedge": self.hedge}
         await asyncio.gather(self.entropy.load_market(), self.hedge.load_market())
