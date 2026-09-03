@@ -196,8 +196,7 @@ class Dashboard:
         if eng.entropy is None or eng.hedge is None or not eng.markets_ready:
             return Group(Panel(Text(self._t("starting — resolving markets…"),
                                     style="yellow"),
-                               title="arcus-arb" if getattr(eng, "arcus", None)
-                               is not None else "entropy-arb",
+                               title="arcus-arb",
                                box=box.ROUNDED), self._events_panel())
         if eng.record_only and getattr(eng, "arcus", None) is not None:
             return Group(self._header(), self._record_only_panel(),
