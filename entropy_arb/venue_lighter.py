@@ -74,6 +74,7 @@ class AccountOrdersFeed:
             fut.set_result(info)
 
     def _handle_orders(self, msg: dict) -> None:
+        receive_ts_ms = time.time_ns() // 1_000_000
         for lst in (msg.get("orders") or {}).values():
             for o in lst or []:
                 status = str(o.get("status", ""))
@@ -87,7 +88,8 @@ class AccountOrdersFeed:
                 fq = float(o.get("filled_quote_amount") or 0.0)
                 self._resolve(coi, {"status": status, "filled_base": fb,
                                     "filled_quote": fq,
-                                    "avg_px": (fq / fb) if fb > 0 else None})
+                                    "avg_px": (fq / fb) if fb > 0 else None,
+                                    "fill_receive_ts_ms": receive_ts_ms})
 
     async def run(self, stop: asyncio.Event) -> None:
         backoff = 1.0
@@ -273,6 +275,7 @@ class LighterVenue:
         """Market order with avg-price protection; settle via account ws."""
         assert self.signer is not None
         from lighter import SignerClient
+        order_send_ts_ms = time.time_ns() // 1_000_000
         coi = self._next_coi()
         fut = self.orders_feed.watch(coi) if self.orders_feed else None
         base_amount = int(round(qty * 10 ** self.size_decimals))
@@ -296,7 +299,9 @@ class LighterVenue:
             if getattr(e, "status", None) == 429 or "(429)" in str(e):
                 msg = "RATE_LIMITED: " + msg
             return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": msg, "unresolved": False}
+                    "err": msg, "unresolved": False,
+                    "order_send_ts_ms": order_send_ts_ms}
+        ack_ts_ms = time.time_ns() // 1_000_000
         if err is not None or (getattr(resp, "code", 200) or 200) != 200:
             if fut is not None:
                 self.orders_feed.unwatch(coi)
@@ -305,20 +310,29 @@ class LighterVenue:
             if "rate limit" in msg.lower():
                 msg = "RATE_LIMITED: " + msg
             return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": msg, "unresolved": False}
+                    "err": msg, "unresolved": False,
+                    "order_send_ts_ms": order_send_ts_ms,
+                    "ack_ts_ms": ack_ts_ms}
         if fut is None:
             return {"status": "sent-unconfirmed", "filled_base": 0.0,
-                    "avg_px": None, "err": None, "unresolved": True}
+                    "avg_px": None, "err": None, "unresolved": True,
+                    "order_send_ts_ms": order_send_ts_ms,
+                    "ack_ts_ms": ack_ts_ms}
         try:
             info = await asyncio.wait_for(fut, timeout=self.settle_timeout)
             return {"status": info["status"], "filled_base": info["filled_base"],
-                    "avg_px": info.get("avg_px"), "err": None, "unresolved": False}
+                    "avg_px": info.get("avg_px"), "err": None, "unresolved": False,
+                    "order_send_ts_ms": order_send_ts_ms,
+                    "ack_ts_ms": ack_ts_ms,
+                    "fill_receive_ts_ms": info.get("fill_receive_ts_ms")}
         except asyncio.TimeoutError:
             self.orders_feed.unwatch(coi)
             log.warning("[%s] no settle confirmation for coi %d in %.1fs",
                         self.name, coi, self.settle_timeout)
             return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
-                    "err": None, "unresolved": True}
+                    "err": None, "unresolved": True,
+                    "order_send_ts_ms": order_send_ts_ms,
+                    "ack_ts_ms": ack_ts_ms}
 
     # -------------------------------------------------------------- accounts
 

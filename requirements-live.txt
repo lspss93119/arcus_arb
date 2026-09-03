@@ -2,6 +2,9 @@
 # 实盘依赖（交易签名 SDK）
 -r requirements.txt
 
+# Arcus B0 Ed25519 request signing (no wallet/API registration helper).
+cryptography>=41
+
 # Inherited Hyperliquid signing dependencies; unused by Arcus Phase A.
 hyperliquid-python-sdk>=0.9
 eth-account>=0.10

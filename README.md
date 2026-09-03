@@ -6,10 +6,12 @@ Phase A is a public-market-data and record-only fork of `entropy-arb` for:
 Arcus SNDK × Lighter-RH SNDK
 ```
 
-It contains zero trading capability for Arcus. `--record-only` is mandatory;
-starting without it exits locally before market discovery, and
-`ArcusVenue.supports_trading` is permanently `False` in this phase. No Arcus
-credential, wallet, private key, signer, or API registration is needed.
+Record-only remains the default-safe workflow and needs no credentials. Phase
+B0 adds a separate, tiny-live preflight for one-sided Arcus LIMIT+ALO maker
+calibration and an existing Lighter-RH hedge after an authoritative Arcus
+fill. B0 needs both `--tiny-live` and `--confirm-mainnet`; it also requires
+the separate `--approve-first-order` gate before the first Arcus order. This
+repository does not submit that first order automatically.
 
 ## Run
 
@@ -23,6 +25,19 @@ Use `--no-dashboard` for plain logs. The recorder writes to the independent
 `data/market-history.sqlite` database by default; it never opens the source
 project's database.
 
+For B0 preflight only, configure the existing Arcus Ed25519 API identity and
+the existing Lighter-RH credentials in a local, ignored `.env`, then run:
+
+```bash
+python3 main.py --config config.yaml --symbol SNDK \
+  --hedge lighter-rh --tiny-live --confirm-mainnet --no-dashboard
+```
+
+This prints the fresh account, market, BBO, fee, center, quote, and safety
+state, then stops before `placeOrder` unless the separate first-order approval
+flag is deliberately supplied after a human review. No wallet generation or
+API-key registration is performed.
+
 ## Arcus public API used
 
 The implementation follows the official documentation at
@@ -34,6 +49,14 @@ The implementation follows the official documentation at
   for `SNDK-USD`, and global `marketAttributes`.
 - The `bbo` channel is intentionally not subscribed. The L2 update snapshot
   already supplies the BBO and the deltas maintain the local book.
+
+B0's account websocket uses four additional account-state subscriptions on its
+separate connection: `userFills`, `orders`, `positions`, and
+`accountAttributeUpdates`. These are not redundant public market-data
+subscriptions. The account stream is used for asynchronous lifecycle and fee
+state; only signed `placeOrder`/`cancelOrder` RPCs can mutate the Arcus
+account, and B0 exposes no Arcus taker, modify, cancel-all, or private trading
+channel operation.
 
 The CLI symbol is resolved from live metadata (`baseAsset` or
 `marketDisplayName`); tick and quantity precision are never hard-coded. L2
@@ -85,17 +108,44 @@ informational in Phase A; no Arcus thresholds are tuned here.
 
 The dashboard displays `ARCUS`, `RH`, BBO age, premium, center, recorder rows,
 RTH state, sequence health (`OK`/`RESYNC`/`STALE`), and an explicit
-`RECORD-ONLY · Arcus trading disabled` banner. It has no Arcus execution
-controls.
+`RECORD-ONLY · Arcus trading disabled` banner. In B0 preflight it instead
+shows `TINY-LIVE PRE-ORDER`, `Arcus ALO only`, and the separate approval gate;
+it does not expose generic live-trading controls.
 
 The record-only dashboard also shows the session raw L2 event count alongside
 the Arcus sequence health, without exposing any trading controls.
 
-## Scope boundary
+## B0 safety boundary
 
-This phase does not implement Arcus orders, signing, API keys, withdrawals,
-maker/taker execution, cancels, private channels, positions, fills, shadow
-maker simulation, production thresholds, or RH hedging. The inherited
-Entropy/Hyperliquid and execution modules remain only as historical/reusable
-code paths for the mature test and analysis architecture; the Arcus config and
-Phase A engine never select them.
+B0 is a calibration envelope, not a production strategy: one Arcus SNDK order
+at a fixed `0.01` quantity, one side at a time, maximum 20 Arcus fill events,
+`$500` filled notional, `$5` session loss, and 60 minutes. Quotes are LIMIT
+ALO only and wait when the modeled post-hedge edge is below 4 bps; the 1.5 bps
+cancel threshold is hysteretic. A fill is hedged on RH only after it is
+authoritatively received, with residual quantities below the RH minimum kept
+visible rather than rounded up. Any account disconnect, stale/resync market,
+RTH transition, unresolved RH hedge, telemetry failure, or hard limit halts
+new quoting and explicitly reconciles/cancels the known Arcus order.
+
+The Arcus identity is loaded only from `ARCUS_ACCOUNT_ADDRESS`,
+`ARCUS_API_KEY`, and `ARCUS_ED25519_PRIVATE_KEY` or
+`ARCUS_ED25519_PRIVATE_KEY_FILE`; credentials are never written to config or
+logged. Fee tier is resolved from `GET https://api.arcus.xyz/v1/feetiers` plus
+the account attribute stream; unknown fees abort B0.
+
+The documented `userFills` stream can omit store-only `createdAt` and `fee`
+fields. B0 hedges an actionable fill immediately using the resolved maker-tier
+fee as a provisional accounting value, then reconciles the public
+`GET /v1/fills` row without replaying the hedge; if the actual fee cannot be
+recovered, the session halts and does not quote again.
+
+The inherited Entropy/Hyperliquid and mature execution modules remain only as
+historical/reusable architecture. The Arcus path never uses them for Arcus
+orders. Shadow maker simulation, maker strategy optimization, execution
+research, and production deployment are out of scope.
+
+The authentication docs currently describe the compact sorted-JSON Ed25519
+request scheme for orders, while the registration material includes a current
+EIP-712 flow and a legacy EIP-191 quickstart note. B0 does not register keys;
+it only validates a user-provided keypair and signs the documented LIMIT+ALO
+request when the separate approval gate is used.

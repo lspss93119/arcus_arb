@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import contextlib
 import logging
 import os
 import time
 from collections import deque
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -31,6 +33,15 @@ from .config import Config
 from .entropy_quota import EntropyQuotaCoordinator
 from .premium import calculate_premiums
 from .arcus_recorder import ArcusMarketRecorder
+from .arcus_auth import ArcusCredentials, ArcusSigner
+from .arcus_execution import (
+    ArcusAccountFeed,
+    ArcusAccountRest,
+    ArcusAccountState,
+    ArcusMakerClient,
+    resolve_arcus_account_fee_tier,
+)
+from .calibration_runtime import CalibrationController, fetch_lighter_open_orders
 from .recorder import MinuteRecorder
 from .reference import ReferenceRecorder
 from .storage import FLUSH_INTERVAL_SEC, MarketHistoryStore
@@ -73,11 +84,16 @@ class _ExecutionContext:
 
 
 class Engine:
-    def __init__(self, cfg: Config, record_only: bool = False) -> None:
+    def __init__(self, cfg: Config, record_only: bool = False, *,
+                 tiny_live: bool = False, confirm_mainnet: bool = False,
+                 allow_first_order: bool = False) -> None:
         self.cfg = cfg
         self.strategy = build_strategy(cfg.strategy)
         self.entropy_quota = EntropyQuotaCoordinator()
         self.record_only = record_only
+        self.tiny_live = tiny_live
+        self.confirm_mainnet = confirm_mainnet
+        self.allow_first_order = allow_first_order
         self.session: Optional[aiohttp.ClientSession] = None
         self.arcus = None
         self.entropy = None
@@ -127,6 +143,7 @@ class Engine:
         # Optional override is useful for tests; live defaults to a separate
         # append-only file beside the configured engine log.
         self.execution_telemetry_csv: Optional[str] = None
+        self.calibration: Optional[CalibrationController] = None
 
     # ------------------------------------------------------------- utilities
 
@@ -224,7 +241,10 @@ class Engine:
             if self.stop.is_set():
                 break
             if self.market_history is not None:
-                await asyncio.to_thread(self.market_history.flush)
+                if self.calibration is not None:
+                    await self.calibration.telemetry.flush()
+                else:
+                    await asyncio.to_thread(self.market_history.flush)
 
     async def _run_arcus_record_only(self, arcus: ArcusVenue) -> None:
         """Run Phase A using public Arcus and public Lighter market data only."""
@@ -320,10 +340,504 @@ class Engine:
                     l2_stats.wal_bytes,
                 )
 
+    async def _wait_b0_market_state(self, timeout: float = 20.0) -> None:
+        """Wait for both public books and explicit Arcus RTH state."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            attributes = getattr(self.arcus, "latest_attributes", None)
+            if (
+                self.arcus is not None
+                and self.hedge is not None
+                and self.arcus.book.ready
+                and self.hedge.book.ready
+                and attributes is not None
+            ):
+                return
+            if self.stop.is_set():
+                raise RuntimeError("B0 startup stopped before public BBO state was ready")
+            await asyncio.sleep(0.1)
+        raise RuntimeError(
+            "B0 startup timed out waiting for Arcus/RH BBO and market attributes"
+        )
+
+    async def _wait_b0_account_state(
+        self, account_feed: ArcusAccountFeed, timeout: float = 15.0
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if account_feed.ready.is_set() and account_feed.latest_fee_tier is not None:
+                return
+            if self.stop.is_set():
+                raise RuntimeError(
+                    "B0 startup stopped before Arcus account subscriptions were ready"
+                )
+            await asyncio.sleep(0.1)
+        raise RuntimeError(
+            "Arcus accountAttributeUpdates did not expose the account fee tier"
+        )
+
+    async def _calibration_status_loop(self) -> None:
+        while not self.stop.is_set():
+            try:
+                await asyncio.sleep(self.cfg.status_interval_sec)
+            except asyncio.CancelledError:
+                raise
+            if self.calibration is None:
+                continue
+            self.halted = self.calibration.risk.halted
+            stats = self.market_history.arcus_l2_stats() if self.market_history else None
+            log.info(
+                "[B0 status] premium=%s bps arcus=%s/%s RH=%s/%s "
+                "state=%s residual=%s pnl=%s fills=%d notional=%s "
+                "l2=%s events/s=%s%s",
+                f"{self.premium_bps():+.2f}" if self.premium_bps() is not None else "—",
+                self.arcus.book.best_bid() if self.arcus else "—",
+                self.arcus.book.best_ask() if self.arcus else "—",
+                self.hedge.book.best_bid() if self.hedge else "—",
+                self.hedge.book.best_ask() if self.hedge else "—",
+                self.calibration.lifecycle.state,
+                self.calibration.accumulator.residual_exposure,
+                self.calibration.pnl.actual_usd,
+                self.calibration.risk.fill_events,
+                self.calibration.risk.filled_notional_usd,
+                stats.rows if stats else 0,
+                f"{stats.events_per_sec:.2f}" if stats else "0.00",
+                f" HALT={self.calibration.risk.halt_reason}"
+                if self.calibration.risk.halted else "",
+            )
+
+    async def _run_arcus_tiny_live(self, arcus: ArcusVenue) -> None:
+        """Run B0 preflight and, only after the separate approval flag, B0.
+
+        The normal CLI reaches this method only with ``--tiny-live`` and
+        ``--confirm-mainnet``.  ``allow_first_order`` is a third deliberate
+        gate: without it the method performs public/account preflight, prints
+        the proposed order, and stops before calling ``placeOrder``.
+        """
+        from .calibration import SessionLimits
+
+        if not self.tiny_live or not self.confirm_mainnet:
+            raise RuntimeError(
+                "B0 live execution requires --tiny-live and --confirm-mainnet"
+            )
+        if self.session is None:
+            raise RuntimeError("HTTP session is not initialized")
+
+        cfg = self.cfg
+        self.arcus = arcus
+        self.entropy = arcus  # compatibility alias for generic premium helpers
+        self.hedge = self._make_venue(cfg.hedge)
+        self.venues = {"arcus": self.arcus, "hedge": self.hedge}
+        tasks: list[asyncio.Task] = []
+        controller: CalibrationController | None = None
+        account_feed: ArcusAccountFeed | None = None
+        try:
+            metadata, _ = await asyncio.gather(
+                self.arcus.load_market(), self.hedge.load_market()
+            )
+            self.markets_ready = True
+            if metadata.status != "ONLINE":
+                raise RuntimeError(
+                    f"Arcus SNDK market status={metadata.status}; aborting B0"
+                )
+            calibration_qty = Decimal("0.01")
+            if metadata.min_order_size is None:
+                raise RuntimeError(
+                    "Arcus SNDK metadata omitted minOrderSize; refusing to "
+                    "assume a live calibration quantity"
+                )
+            if Decimal(metadata.min_order_size) > calibration_qty:
+                raise RuntimeError(
+                    f"Arcus SNDK minOrderSize={metadata.min_order_size} "
+                    f"exceeds fixed B0 quantity={calibration_qty}"
+                )
+            if (
+                metadata.max_order_size is not None
+                and Decimal(metadata.max_order_size) < calibration_qty
+            ):
+                raise RuntimeError(
+                    f"Arcus SNDK maxOrderSize={metadata.max_order_size} "
+                    f"is below fixed B0 quantity={calibration_qty}"
+                )
+            if calibration_qty % Decimal(metadata.step_size) != 0:
+                raise RuntimeError(
+                    f"fixed B0 quantity={calibration_qty} is not aligned to "
+                    f"Arcus stepSize={metadata.step_size}"
+                )
+
+            self.market_history = MarketHistoryStore(cfg.recorder_database)
+            self.recorder = ArcusMarketRecorder(
+                self.market_history,
+                symbol=cfg.symbol,
+                arcus_book=self.arcus.book,
+                rh_book=self.hedge.book,
+                hedge=cfg.hedge_venue,
+                is_fresh_seconds=cfg.staleness_sec,
+            )
+            self.recorder.record_metadata(metadata)
+            self.arcus.set_market_data_sinks(
+                self.recorder.record_trade,
+                lambda attributes, receive_ms, monotonic_ns:
+                    self.recorder.record_attributes(
+                        attributes,
+                        receive_ms,
+                        monotonic_ns,
+                        market_status=metadata.status,
+                    ),
+                self.recorder.record_l2_event,
+            )
+            await self._bootstrap_rolling_center()
+
+            # Arcus credentials are loaded only inside this explicitly gated
+            # path.  No wallet generation or registration is attempted.
+            credentials = ArcusCredentials.from_env()
+            signer = ArcusSigner(credentials)
+            rh_fee_bps = Decimal(str(self.hedge.fee_bps))
+            if not rh_fee_bps.is_finite() or rh_fee_bps <= 0:
+                raise RuntimeError(
+                    "B0 requires a verified positive hedge.taker_fee_bps; "
+                    "refusing to model the RH fee as zero"
+                )
+            if not cfg.creds_complete:
+                raise RuntimeError(
+                    "B0 requires Lighter-RH credentials in .env: "
+                    "LIGHTER_ACCOUNT_INDEX, LIGHTER_API_KEY_INDEX, and "
+                    "LIGHTER_API_PRIVATE_KEY"
+                )
+            self.hedge.init_signer()
+            account_rest = ArcusAccountRest(
+                self.session, rest_url=cfg.arcus_rest_url
+            )
+            fee_table = await account_rest.fee_tiers()
+            startup_state = ArcusAccountState(
+                startup_watermark_us=time.time_ns() // 1000
+            )
+            arcus_position = await account_rest.position(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            rh_position = Decimal(str(await self.hedge.fetch_position()))
+            rh_open_orders = await fetch_lighter_open_orders(self.hedge)
+            if rh_open_orders:
+                raise RuntimeError(
+                    "RH SNDK open order exists; aborting B0 without touching it"
+                )
+            ArcusAccountState.validate_starting_inventory(
+                arcus_position, rh_position
+            )
+            arcus_open_orders = await account_rest.open_orders(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            calibration_prefix = "b0-"
+            stale_calibration = startup_state.validate_startup_orders(
+                arcus_open_orders, calibration_prefix=calibration_prefix
+            )
+
+            account_feed = ArcusAccountFeed(
+                credentials.account_address,
+                metadata.symbol,
+                ws_url=cfg.arcus_ws_url,
+                account_index=credentials.account_index,
+                startup_state=startup_state,
+                api_key=credentials.api_key,
+            )
+            maker = ArcusMakerClient(
+                credentials=credentials,
+                signer=signer,
+                rpc=account_feed,
+                ws_url=cfg.arcus_ws_url,
+            )
+
+            # The public market feeds and account state stream are started
+            # before any order decision.  The account stream is public for
+            # reads; the API key is used only by the signed post/cancel RPC.
+            tasks += self.arcus.start_tasks(self.stop, self._update_evt.set, False)
+            tasks += self.hedge.start_tasks(self.stop, self._update_evt.set, True)
+            tasks.append(asyncio.create_task(
+                account_feed.run(self.stop), name="acct-arcus-b0"
+            ))
+            tasks.append(asyncio.create_task(
+                self._storage_flush_loop(), name="storage-flush"
+            ))
+            tasks.append(asyncio.create_task(
+                self.recorder.run(self.stop), name="recorder"
+            ))
+
+            await self._wait_b0_account_state(account_feed)
+            await self._wait_b0_market_state()
+            account_fee = account_feed.latest_fee_tier
+            fee_tier = resolve_arcus_account_fee_tier(fee_table, account_fee)
+            if fee_tier is None:
+                raise RuntimeError(
+                    "Arcus account fee tier could not be resolved from "
+                    "accountAttributeUpdates and /v1/feetiers; aborting B0"
+                )
+
+            controller = CalibrationController(
+                arcus=self.arcus,
+                hedge=self.hedge,
+                maker=maker,
+                account_feed=account_feed,
+                account_rest=account_rest,
+                account_state=startup_state,
+                metadata=metadata,
+                fee_tier=fee_tier,
+                strategy=self.strategy,
+                store=self.market_history,
+                allow_first_order=self.allow_first_order,
+                staleness_sec=cfg.staleness_sec,
+                session_limits=SessionLimits(),
+            )
+            self.calibration = controller
+            account_feed.on_fill = controller.on_fill
+            account_feed.on_order = controller.on_order
+            account_feed.on_disconnect = controller.on_disconnect
+            account_feed.on_connect = controller.on_connect
+
+            # Existing calibration orders are explicitly safe to identify and
+            # cancel; unknown user orders were rejected above.
+            for stale_order in stale_calibration:
+                if stale_order.client_id is None:
+                    raise RuntimeError(
+                        "known Arcus calibration order has no clientId"
+                    )
+                await maker.cancel_calibration_order(
+                    market_id=metadata.market_id,
+                    client_id=stale_order.client_id,
+                )
+                log.warning(
+                    "[B0] canceled stale calibration order clientId=%s orderId=%s",
+                    stale_order.client_id,
+                    stale_order.order_id,
+                )
+            if stale_calibration:
+                cancel_deadline = time.monotonic() + 15.0
+                while time.monotonic() < cancel_deadline:
+                    remaining = await account_rest.open_orders(
+                        credentials.account_address,
+                        metadata.symbol,
+                        credentials.account_index,
+                    )
+                    def matches_stale(order) -> bool:
+                        return any(
+                            (
+                                stale.order_id is not None
+                                and stale.order_id == order.order_id
+                            )
+                            or (
+                                stale.client_id is not None
+                                and stale.client_id == order.client_id
+                            )
+                            for stale in stale_calibration
+                        )
+
+                    if not any(
+                        matches_stale(order) for order in remaining
+                    ):
+                        break
+                    await asyncio.sleep(1.0)
+                else:
+                    raise RuntimeError(
+                        "stale Arcus calibration order did not reach terminal "
+                        "state after cancel; aborting B0"
+                    )
+
+                # A cancel request can race a fill.  Do not adopt or hedge a
+                # previous session's fill during startup; instead fail closed
+                # if the stale order produced any post-watermark fill while
+                # it was being canceled.
+                stale_fills = await account_rest.fills(
+                    credentials.account_address,
+                    metadata.symbol,
+                    credentials.account_index,
+                )
+                stale_order_ids = {
+                    order.order_id for order in stale_calibration
+                    if order.order_id is not None
+                }
+                stale_client_ids = {
+                    order.client_id for order in stale_calibration
+                    if order.client_id is not None
+                }
+                if any(
+                    fill.created_at_us is not None
+                    and fill.created_at_us > startup_state.startup_watermark_us
+                    and (
+                        fill.order_id in stale_order_ids
+                        or fill.client_id in stale_client_ids
+                    )
+                    for fill in stale_fills
+                ):
+                    raise RuntimeError(
+                        "stale Arcus calibration order filled during startup "
+                        "cancellation; aborting without adopting its inventory"
+                    )
+
+            fresh_arcus_open_orders = await account_rest.open_orders(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            # The initial startup gate rejected unknown orders.  Re-run it
+            # after stale-order cancellation so a newly observed or lingering
+            # order cannot be mistaken for an empty calibration book.
+            if fresh_arcus_open_orders:
+                startup_state.validate_startup_orders(
+                    fresh_arcus_open_orders, calibration_prefix=calibration_prefix
+                )
+                raise RuntimeError(
+                    "Arcus calibration order remains open after cancellation; "
+                    "aborting before any replacement"
+                )
+
+            # Re-read all startup gates after stale-order cleanup.  The first
+            # read is not enough because a cancel/fill race can change both
+            # inventory and the account order set while preflight is running.
+            arcus_position = await account_rest.position(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            rh_position = Decimal(str(await self.hedge.fetch_position()))
+            rh_open_orders = await fetch_lighter_open_orders(self.hedge)
+            if rh_open_orders:
+                raise RuntimeError(
+                    "RH SNDK open order appeared during B0 preflight; aborting"
+                )
+            ArcusAccountState.validate_starting_inventory(
+                arcus_position, rh_position
+            )
+
+            preflight = controller.pre_order_state(
+                arcus_position=arcus_position,
+                rh_position=rh_position,
+                arcus_open_orders=fresh_arcus_open_orders,
+                rh_open_orders=rh_open_orders,
+            )
+            self._log_b0_pre_order_state(preflight, metadata)
+            if not self.allow_first_order:
+                log.warning(
+                    "[B0] pre-order STOP: no Arcus order will be submitted; "
+                    "obtain separate human approval before using "
+                    "--approve-first-order"
+                )
+                return
+
+            tasks.append(asyncio.create_task(
+                controller.run(self.stop), name="arcus-b0-calibration"
+            ))
+            tasks.append(asyncio.create_task(
+                self._calibration_status_loop(), name="b0-status"
+            ))
+            await self.stop.wait()
+        finally:
+            self.stop.set()
+            calibration_task = next(
+                (
+                    task for task in tasks
+                    if task.get_name() == "arcus-b0-calibration"
+                ),
+                None,
+            )
+            if calibration_task is not None and not calibration_task.done():
+                # Let the controller execute its cancel/reconcile barrier
+                # while both account and public sockets are still alive.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(calibration_task, timeout=20.0)
+            if controller is not None:
+                with contextlib.suppress(Exception):
+                    await controller.shutdown()
+            for task in tasks:
+                if task is not calibration_task:
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for venue in self.venues.values():
+                with contextlib.suppress(Exception):
+                    await venue.close()
+            if self.market_history is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self.market_history.flush)
+                with contextlib.suppress(Exception):
+                    log.info(
+                        "[B0] shutdown calibration_events=%d samples=%d trades=%d",
+                        self.market_history.count_rows("arcus_calibration_events"),
+                        self.market_history.count_rows("arcus_samples"),
+                        self.market_history.count_rows("arcus_trades"),
+                    )
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self.market_history.close)
+
+    def _log_b0_pre_order_state(self, state, metadata) -> None:
+        candidate = state.proposed_quote
+        log.info(
+            "[B0 pre-order] fee tier=%s maker=%.4fbps taker=%.4fbps "
+            "market id=%s symbol=%s tick=%s step=%s minOrderSize=%s "
+            "status=%s modeled RH taker=%.4fbps",
+            state.fee_tier,
+            state.maker_fee_bps,
+            state.taker_fee_bps,
+            metadata.market_id,
+            metadata.symbol,
+            metadata.tick_size,
+            metadata.step_size,
+            metadata.min_order_size,
+            metadata.status,
+            self.hedge.fee_bps,
+        )
+        log.info(
+            "[B0 pre-order] positions ARCUS=%s RH=%s open_orders ARCUS=%s RH=%s",
+            state.arcus_position,
+            state.rh_position,
+            list(state.arcus_open_orders),
+            list(state.rh_open_orders),
+        )
+        log.info(
+            "[B0 pre-order] BBO ARCUS=%s/%s RH=%s/%s premium=%s center=%s "
+            "isOutsideRth=%s sequence=%s",
+            state.arcus_bid,
+            state.arcus_ask,
+            state.rh_bid,
+            state.rh_ask,
+            state.premium_bps,
+            state.center_bps,
+            state.outside_rth,
+            getattr(self.arcus.book, "sequence_health", "UNKNOWN"),
+        )
+        if candidate is None:
+            log.info("[B0 pre-order] proposed maker quote=NONE; no >=4.0bps side")
+        else:
+            log.info(
+                "[B0 pre-order] proposed maker side=%s price=%s qty=%s "
+                "expected_edge=%s bps expected_usd=%s TIF=ALO",
+                candidate.side,
+                candidate.price,
+                candidate.quantity,
+                candidate.expected_edge_bps,
+                candidate.expected_usd,
+            )
+        log.info(
+            "[B0 pre-order] limits qty=%s max_fill_events=%s "
+            "max_notional=$%s max_loss=$%s runtime=%ss "
+            "RH_slippage_allowance=%sbps RH_hard_cap=%sbps",
+            state.limits.max_order_qty,
+            state.limits.max_fill_events,
+            state.limits.max_filled_notional_usd,
+            state.limits.max_loss_usd,
+            state.limits.max_runtime_seconds,
+            "2.0",
+            "20.0",
+        )
+
     async def _run_inner(self) -> None:
         cfg = self.cfg
         selected = self._make_venue(getattr(cfg, "arcus", cfg.entropy))
         if isinstance(selected, ArcusVenue):
+            if self.tiny_live:
+                await self._run_arcus_tiny_live(selected)
+                return
             if not self.record_only:
                 raise RuntimeError(
                     "Phase A is record-only; pass --record-only. "

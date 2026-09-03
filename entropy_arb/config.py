@@ -1,10 +1,11 @@
-"""Configuration for the Arcus × hedge record-only runtime.
+"""Configuration for the Arcus × Lighter-RH runtime.
 
 The split is deliberate: config.yaml contains analysis/recording settings and
-is safe to share/commit as an example; Phase A needs no environment secrets;
-which market pair to observe is stated explicitly on every start (--symbol,
---hedge). Every YAML key is validated against the schema below, so a typo is
-an error rather than a setting that silently does nothing.
+is safe to share/commit as an example; record-only Phase A needs no environment
+secrets; B0 loads its live credentials separately and only behind explicit CLI
+gates. Which market pair to observe is stated explicitly on every start
+(--symbol, --hedge). Every YAML key is validated against the schema below, so a
+typo is an error rather than a setting that silently does nothing.
 
 Strategy model:
 

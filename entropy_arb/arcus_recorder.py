@@ -113,6 +113,7 @@ class ArcusMarketRecorder:
         self.interval_sec = interval_sec
         self.rows_written = 0
         self.minute_rows_written = 0
+        self.trades_written = 0
         self.l2_events_written = 0
         self._agg: Optional[_ArcusMinuteAgg] = None
         self.attributes: Optional[ArcusMarketAttributes] = None
@@ -198,6 +199,7 @@ class ArcusMarketRecorder:
             aggressor_side=trade.aggressor_side,
             sequence_number=trade.sequence_number,
         ))
+        self.trades_written += 1
 
     def record_l2_event(self, event: ArcusL2Event) -> None:
         """Append one raw Arcus L2 level without committing synchronously."""

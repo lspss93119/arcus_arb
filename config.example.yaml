@@ -1,8 +1,8 @@
 # arcus-arb Phase A configuration / Phase A 配置
 #
-# This file configures reusable analysis/recording settings only.  Phase A is
-# permanently record-only: the reserved trading values below are inactive and
-# no Arcus credentials are required.
+# This file configures reusable analysis/recording settings. Record-only needs
+# no credentials. Phase B0 uses only the explicitly gated tiny-live path; its
+# fixed safety envelope is in code and is not enabled by these YAML values.
 
 strategy:
   name: stable_basis
@@ -16,14 +16,15 @@ strategy:
     lower_bps: 4.0
 
 arcus:
-  # Reserved for a future phase; not read by any Phase A order path.
+  # Reserved compatibility value; B0 resolves Arcus fees from the live fee
+  # table/account stream and does not use this field for maker fees.
   taker_fee_bps: 0.0
   max_position_usd: 1000.0
   max_orders_per_min: 0
 
 hedge:
-  # Lighter-RH public market data is used in Phase A.  Order values remain
-  # reserved for future compatibility and are not active.
+  # Set this to a verified current Lighter-RH taker fee before any approved
+  # B0 first order. It is a modeled input, not an Arcus credential.
   taker_fee_bps: 0.0
   max_position_usd: 1000.0
   max_orders_per_min: 30

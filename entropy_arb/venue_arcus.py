@@ -135,6 +135,15 @@ class ArcusVenue:
             raise RuntimeError("Arcus trading is not implemented in Phase A")
         if self.market is None:
             raise RuntimeError("Arcus market must be resolved before starting feed")
+        async def record_attributes(attributes, receive_ms, monotonic_ns):
+            self.latest_attributes = attributes
+            if self._attribute_sink is not None:
+                result = self._attribute_sink(
+                    attributes, receive_ms, monotonic_ns
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+
         feed = ArcusBookFeed(
             self.market.symbol,
             self.book,
@@ -143,7 +152,7 @@ class ArcusVenue:
             notify=notify,
             l2_event_sink=self._l2_event_sink,
             trade_sink=self._trade_sink,
-            attribute_sink=self._attribute_sink,
+            attribute_sink=record_attributes,
         )
         self.feed = feed
         return [asyncio.create_task(feed.run(stop), name="book-arcus")]

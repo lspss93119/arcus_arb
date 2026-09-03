@@ -217,6 +217,58 @@ class ArcusL2Stats:
 
 
 @dataclass(frozen=True)
+class ArcusCalibrationEventRow:
+    """Append-only lifecycle telemetry for one Phase B0 event.
+
+    Nullable columns intentionally keep order, fill, hedge, and halt events
+    in one append-only stream while retaining partial-fill granularity.  All
+    prices, quantities, fees, and PnL values are stored as decimal text so the
+    recorder does not introduce another binary-float rounding boundary.
+    """
+
+    session_id: str
+    execution_id: str
+    event_type: str
+    event_ts_ms: int
+    event_local_receive_monotonic_ns: int | None
+    client_id: str | None
+    order_id: str | None
+    arcus_side: str | None
+    arcus_quote_price: str | None
+    quote_qty: str | None
+    quote_created_ts_ms: int | None
+    expected_edge_bps: str | None
+    expected_edge_at_fill_bps: str | None
+    expected_usd: str | None
+    fill_trade_id: str | None
+    fill_ts_us: int | None
+    arcus_fill_price: str | None
+    arcus_fill_qty: str | None
+    arcus_fee: str | None
+    fill_to_hedge_send_ms: int | None
+    fill_to_rh_fill_ms: int | None
+    rh_signal_bid: str | None
+    rh_signal_ask: str | None
+    rh_hedge_side: str | None
+    rh_hedge_qty: str | None
+    rh_hedge_avg_fill: str | None
+    rh_fee: str | None
+    matched_edge_usd: str | None
+    actual_usd: str | None
+    remaining_arcus_qty: str | None
+    unhedged_residual_qty: str | None
+    lifecycle_state: str
+    halt_reason: str | None
+    account_sequence_id: int | None
+    rh_order_send_ts_ms: int | None = None
+    rh_ack_ts_ms: int | None = None
+    rh_fill_receive_ts_ms: int | None = None
+    rh_realized_slippage_bps: str | None = None
+    arcus_fee_is_estimated: bool = False
+    id: int | None = None
+
+
+@dataclass(frozen=True)
 class InsertCounts:
     inserted: int = 0
     duplicates: int = 0
@@ -282,6 +334,20 @@ _SPECS = {
         "local_receive_ts_ms", "local_receive_monotonic_ns",
         "last_sequence_id", "global_sequence_id", "side", "price",
         "absolute_size", "event_index", "exchange_timestamp_us")),
+    "arcus_calibration_events": (ArcusCalibrationEventRow, ("id",), (
+        "session_id", "execution_id", "event_type", "event_ts_ms",
+        "event_local_receive_monotonic_ns", "client_id", "order_id",
+        "arcus_side", "arcus_quote_price", "quote_qty",
+        "quote_created_ts_ms", "expected_edge_bps",
+        "expected_edge_at_fill_bps", "expected_usd", "fill_trade_id",
+        "fill_ts_us", "arcus_fill_price", "arcus_fill_qty", "arcus_fee",
+        "fill_to_hedge_send_ms", "fill_to_rh_fill_ms", "rh_signal_bid",
+        "rh_signal_ask", "rh_hedge_side", "rh_hedge_qty",
+        "rh_hedge_avg_fill", "rh_fee", "matched_edge_usd", "actual_usd",
+        "remaining_arcus_qty", "unhedged_residual_qty", "lifecycle_state",
+        "halt_reason", "account_sequence_id", "rh_order_send_ts_ms",
+        "rh_ack_ts_ms", "rh_fill_receive_ts_ms", "rh_realized_slippage_bps",
+        "arcus_fee_is_estimated")),
 }
 
 _CREATE = {
@@ -361,6 +427,33 @@ _CREATE = {
         price TEXT NOT NULL, absolute_size TEXT NOT NULL,
         event_index INTEGER NOT NULL,
         exchange_timestamp_us INTEGER)""",
+    "arcus_calibration_events": """CREATE TABLE IF NOT EXISTS arcus_calibration_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL, execution_id TEXT NOT NULL,
+        event_type TEXT NOT NULL, event_ts_ms INTEGER NOT NULL,
+        event_local_receive_monotonic_ns INTEGER,
+        client_id TEXT, order_id TEXT, arcus_side TEXT,
+        arcus_quote_price TEXT, quote_qty TEXT, quote_created_ts_ms INTEGER,
+        expected_edge_bps TEXT, expected_edge_at_fill_bps TEXT,
+        expected_usd TEXT, fill_trade_id TEXT, fill_ts_us INTEGER,
+        arcus_fill_price TEXT, arcus_fill_qty TEXT, arcus_fee TEXT,
+        fill_to_hedge_send_ms INTEGER, fill_to_rh_fill_ms INTEGER,
+        rh_signal_bid TEXT, rh_signal_ask TEXT, rh_hedge_side TEXT,
+        rh_hedge_qty TEXT, rh_hedge_avg_fill TEXT, rh_fee TEXT,
+        matched_edge_usd TEXT, actual_usd TEXT, remaining_arcus_qty TEXT,
+        unhedged_residual_qty TEXT, lifecycle_state TEXT NOT NULL,
+        halt_reason TEXT, account_sequence_id INTEGER,
+        rh_order_send_ts_ms INTEGER, rh_ack_ts_ms INTEGER,
+        rh_fill_receive_ts_ms INTEGER, rh_realized_slippage_bps TEXT,
+        arcus_fee_is_estimated INTEGER NOT NULL DEFAULT 0)""",
+}
+
+_CALIBRATION_MIGRATION_COLUMNS = {
+    "rh_order_send_ts_ms": "INTEGER",
+    "rh_ack_ts_ms": "INTEGER",
+    "rh_fill_receive_ts_ms": "INTEGER",
+    "rh_realized_slippage_bps": "TEXT",
+    "arcus_fee_is_estimated": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -428,6 +521,18 @@ class MarketHistoryStore:
                 try:
                     for sql in _CREATE.values():
                         self._conn.execute(sql)
+                    existing_columns = {
+                        row[1]
+                        for row in self._conn.execute(
+                            "PRAGMA table_info(arcus_calibration_events)"
+                        ).fetchall()
+                    }
+                    for column, column_type in _CALIBRATION_MIGRATION_COLUMNS.items():
+                        if column not in existing_columns:
+                            self._conn.execute(
+                                f"ALTER TABLE arcus_calibration_events "
+                                f"ADD COLUMN {column} {column_type}"
+                            )
                     current = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
                     if current and current[0] != SCHEMA_VERSION:
                         raise RuntimeError(f"unsupported market-history schema version: {current[0]}")
@@ -477,6 +582,11 @@ class MarketHistoryStore:
         self._append("arcus_market_metadata", row)
     def append_arcus_l2_event(self, row: ArcusL2EventRow) -> None:
         self._append("arcus_l2_events", row)
+
+    def append_arcus_calibration_event(
+        self, row: ArcusCalibrationEventRow
+    ) -> None:
+        self._append("arcus_calibration_events", row)
 
     def arcus_l2_stats(self) -> ArcusL2Stats:
         """Return committed L2 row/rate/file-size telemetry.

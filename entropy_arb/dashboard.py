@@ -169,6 +169,17 @@ class Dashboard:
             t.append(f" — Arcus trading disabled — full log: {self.log_file}")
             self.console.print(t)
             return
+        if getattr(eng, "tiny_live", False) and getattr(eng, "arcus", None) is not None:
+            t = Text("arcus-arb stopped — B0 pre-order calibration", style="bold")
+            calibration = getattr(eng, "calibration", None)
+            if calibration is not None:
+                t.append(f", state={calibration.lifecycle.state}")
+                if calibration.risk.halt_reason:
+                    t.append(f", halt={calibration.risk.halt_reason}")
+            t.append(" — no first order submitted by default")
+            t.append(f" — full log: {self.log_file}")
+            self.console.print(t)
+            return
         t = Text()
         t.append(self._t("entropy-arb stopped"), style="bold")
         t.append(self._t(" — {t} trades / {h} hedges, session PnL ",
@@ -201,6 +212,8 @@ class Dashboard:
         if eng.record_only and getattr(eng, "arcus", None) is not None:
             return Group(self._header(), self._record_only_panel(),
                          self._events_panel())
+        if getattr(eng, "tiny_live", False) and getattr(eng, "arcus", None) is not None:
+            return Group(self._header(), self._b0_panel(), self._events_panel())
         if self.console.width >= 100:
             mid = Table.grid(expand=True)
             mid.add_column(ratio=5)
@@ -214,9 +227,12 @@ class Dashboard:
     def _header(self):
         eng, cfg = self.eng, self.eng.cfg
         now = time.time()
-        mode = Text(self._t(" RECORD-ONLY "), style="black on yellow") \
-            if eng.record_only \
-            else Text(self._t(" LIVE "), style="white on dark_green")
+        if getattr(eng, "tiny_live", False):
+            mode = Text(" TINY-LIVE ", style="white on dark_yellow")
+        elif eng.record_only:
+            mode = Text(self._t(" RECORD-ONLY "), style="black on yellow")
+        else:
+            mode = Text(self._t(" LIVE "), style="white on dark_green")
         stale = sum(1 for v in eng.venues.values()
                     if not v.book.is_fresh(cfg.staleness_sec))
         limited = sum(1 for v in eng.venues.values() if eng._venue_limited(v))
@@ -231,6 +247,12 @@ class Dashboard:
             state = Text(self._t(" RATE-LTD "), style="black on yellow")
         elif eng.record_only:
             state = Text(self._t(" RECORDING "), style="bold white on green")
+        elif getattr(eng, "tiny_live", False):
+            calibration = getattr(eng, "calibration", None)
+            if calibration is not None and calibration.risk.halted:
+                state = Text(" HALTED ", style="bold white on red")
+            else:
+                state = Text(" PRE-ORDER ", style="black on yellow")
         else:
             state = Text(self._t(" RUNNING "), style="bold white on green")
         up = int(now - eng.start_ts)
@@ -319,6 +341,76 @@ class Dashboard:
         body.append(f"\nrecorder rows {rows}   L2 events {l2_rows}   RTH {rth}")
         body.append(f"\nArcus sequence {health}")
         return Panel(body, title="ARCUS / RH market data", box=box.ROUNDED,
+                     padding=(0, 1))
+
+    def _b0_panel(self):
+        """B0 state view with no order controls or action affordances."""
+        eng = self.eng
+        arcus, rh = eng.arcus, eng.hedge
+        now = time.time()
+
+        def bbo_line(venue, label: str) -> str:
+            bid = self._book_value(venue.book, "best_bid")
+            ask = self._book_value(venue.book, "best_ask")
+            receive_ts = getattr(venue.book, "last_update_ts", 0.0)
+            age = f"{max(0.0, now - receive_ts):.1f}s" if receive_ts else "—"
+            return (
+                f"{label:<5} {bid:,.8g} / {ask:,.8g}  age {age}"
+                if bid is not None and ask is not None
+                else f"{label:<5} —  age {age}"
+            )
+
+        premium = eng.premium_bps()
+        calibration = getattr(eng, "calibration", None)
+        if calibration is None:
+            center = getattr(eng.strategy.state(), "center_bps", None)
+            state_text = "PRE-ORDER — account checks in progress"
+            risk_text = "—"
+            residual_text = "—"
+            quote_text = "—"
+            seq = getattr(arcus.book, "sequence_health", "UNKNOWN")
+        else:
+            center = calibration.center_bps()
+            state_text = calibration.lifecycle.state
+            risk_text = (
+                calibration.risk.halt_reason
+                if calibration.risk.halted else "RUNNING"
+            )
+            residual_text = str(calibration.accumulator.residual_exposure)
+            candidate = calibration.current_candidate or calibration.proposed_quote()
+            quote_text = (
+                f"{candidate.side} {candidate.price} × {candidate.quantity} "
+                f"({candidate.expected_edge_bps} bps)"
+                if candidate is not None else "NONE"
+            )
+            seq = getattr(arcus.book, "sequence_health", "UNKNOWN")
+        attributes = getattr(arcus, "latest_attributes", None)
+        rth = (
+            "OUTSIDE_RTH" if attributes and attributes.is_outside_rth
+            else "RTH" if attributes and attributes.is_outside_rth is False
+            else "UNKNOWN"
+        )
+        body = Text()
+        body.append("TINY-LIVE PRE-ORDER · Arcus ALO only · RH hedge gated\n",
+                    style="bold yellow")
+        body.append(bbo_line(arcus, "ARCUS") + "\n")
+        body.append(bbo_line(rh, "RH") + "\n")
+        body.append(
+            f"premium {premium:+.3f} bps" if premium is not None else "premium —"
+        )
+        body.append(f"   center {center:+.3f} bps" if center is not None else "   center —")
+        body.append(f"   RTH {rth}   sequence {seq}\n")
+        body.append(f"lifecycle {state_text}   residual {residual_text}\n")
+        body.append(f"proposed {quote_text}\n")
+        recorder = getattr(eng, "recorder", None)
+        body.append(
+            f"recorder samples {getattr(recorder, 'rows_written', 0)} "
+            f"trades {getattr(recorder, 'trades_written', 0)}"
+            f"   L2 {getattr(recorder, 'l2_events_written', 0)}\n"
+        )
+        body.append(f"risk {risk_text}\n")
+        body.append("Arcus trading is disabled until separate first-order approval")
+        return Panel(body, title="ARCUS / RH B0 calibration", box=box.ROUNDED,
                      padding=(0, 1))
 
     def _venues_panel(self):
