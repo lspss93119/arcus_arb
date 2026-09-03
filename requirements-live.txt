@@ -2,7 +2,7 @@
 # 实盘依赖（交易签名 SDK）
 -r requirements.txt
 
-# Hyperliquid signing (Entropy leg, and the tradexyz hedge)
+# Inherited Hyperliquid signing dependencies; unused by Arcus Phase A.
 hyperliquid-python-sdk>=0.9
 eth-account>=0.10
 

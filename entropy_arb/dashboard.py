@@ -1,4 +1,4 @@
-"""Rich terminal dashboard (English by default, Chinese with --cn).
+"""Rich terminal dashboard for Arcus record-only market data.
 
 While the bot runs on a terminal, log lines go to logging.file (and the
 events panel); the screen shows live state: both venues with equity, the
@@ -162,6 +162,13 @@ class Dashboard:
                     await asyncio.wait_for(eng.stop.wait(), timeout=0.25)
                 except asyncio.TimeoutError:
                     pass
+        if eng.record_only and getattr(eng, "arcus", None) is not None:
+            t = Text("arcus-arb stopped — RECORD-ONLY", style="bold")
+            if eng.recorder is not None:
+                t.append(f", {eng.recorder.rows_written} samples recorded")
+            t.append(f" — Arcus trading disabled — full log: {self.log_file}")
+            self.console.print(t)
+            return
         t = Text()
         t.append(self._t("entropy-arb stopped"), style="bold")
         t.append(self._t(" — {t} trades / {h} hedges, session PnL ",
@@ -188,8 +195,13 @@ class Dashboard:
         eng = self.eng
         if eng.entropy is None or eng.hedge is None or not eng.markets_ready:
             return Group(Panel(Text(self._t("starting — resolving markets…"),
-                                    style="yellow"), title="entropy-arb",
+                                    style="yellow"),
+                               title="arcus-arb" if getattr(eng, "arcus", None)
+                               is not None else "entropy-arb",
                                box=box.ROUNDED), self._events_panel())
+        if eng.record_only and getattr(eng, "arcus", None) is not None:
+            return Group(self._header(), self._record_only_panel(),
+                         self._events_panel())
         if self.console.width >= 100:
             mid = Table.grid(expand=True)
             mid.add_column(ratio=5)
@@ -226,9 +238,14 @@ class Dashboard:
         g = Table.grid(expand=True)
         g.add_column(justify="left")
         g.add_column(justify="right")
-        left = Text.assemble(("entropy-arb  ", "bold"),
-                             (f"{cfg.symbol} × ENTROPY · {eng.hedge.name}",
-                              "bold cyan"))
+        if getattr(eng, "arcus", None) is not None:
+            left = Text.assemble(("arcus-arb  ", "bold"),
+                                 (f"{cfg.symbol} × ARCUS · {eng.hedge.name}",
+                                  "bold cyan"))
+        else:
+            left = Text.assemble(("entropy-arb  ", "bold"),
+                                 (f"{cfg.symbol} × ENTROPY · {eng.hedge.name}",
+                                  "bold cyan"))
         right = Text()
         right.append_text(mode)
         right.append("  ")
@@ -238,6 +255,69 @@ class Dashboard:
                                f":{up % 60:02d}"), style="dim")
         g.add_row(left, right)
         return Panel(g, box=box.ROUNDED, padding=(0, 1))
+
+    @staticmethod
+    def _book_value(book, method: str):
+        value = getattr(book, method, None)
+        return value() if callable(value) else value
+
+    def _record_only_panel(self):
+        """Compact market-data view with no execution controls or state."""
+        eng, cfg = self.eng, self.eng.cfg
+        arcus = eng.arcus
+        rh = eng.hedge
+        now = time.time()
+
+        def line(venue, label: str) -> str:
+            book = venue.book
+            bid = self._book_value(book, "best_bid")
+            ask = self._book_value(book, "best_ask")
+            receive_ts = getattr(book, "last_update_ts", 0.0)
+            if not receive_ts:
+                receive_ts = getattr(book, "alive_ts", 0.0)
+            age = f"{max(0.0, now - receive_ts):.1f}s" if receive_ts else "—"
+            fresh = book.is_fresh(cfg.staleness_sec)
+            return ((f"{label:<5} {bid:,.8g} / {ask:,.8g}"
+                     if bid is not None and ask is not None
+                     else f"{label:<5} —") + f"  age {age}"
+                    + ("" if fresh else "  STALE"))
+
+        arcus_bid = self._book_value(arcus.book, "best_bid")
+        arcus_ask = self._book_value(arcus.book, "best_ask")
+        rh_bid = self._book_value(rh.book, "best_bid")
+        rh_ask = self._book_value(rh.book, "best_ask")
+        premium = None
+        if None not in (arcus_bid, arcus_ask, rh_bid, rh_ask):
+            premium = (((arcus_bid + arcus_ask) / 2)
+                       / ((rh_bid + rh_ask) / 2) - 1) * 1e4
+        strategy = getattr(cfg, "strategy", None)
+        center = getattr(eng, "rolling_center_bps", None)
+        if center is None:
+            strategy_state = getattr(getattr(eng, "strategy", None), "state", None)
+            if callable(strategy_state):
+                center = getattr(strategy_state(), "center_bps", None)
+        if center is None and strategy is not None:
+            center = getattr(strategy, "center_bps", None)
+        attributes = getattr(arcus, "latest_attributes", None)
+        rth = ("OUTSIDE_RTH" if attributes and attributes.is_outside_rth
+               else "RTH" if attributes and attributes.is_outside_rth is False
+               else "UNKNOWN")
+        book = arcus.book
+        health = getattr(book, "health", "OK" if book.is_fresh(cfg.staleness_sec)
+                         else "STALE")
+        rows = getattr(getattr(eng, "recorder", None), "rows_written", 0)
+        body = Text()
+        body.append("RECORD-ONLY · Arcus trading disabled\n", style="bold yellow")
+        body.append(line(arcus, "ARCUS") + "\n")
+        body.append(line(rh, "RH") + "\n")
+        body.append("premium ")
+        body.append(f"{premium:+.3f} bps" if premium is not None else "—")
+        body.append("   rolling/fixed center ")
+        body.append(f"{center:+.3f} bps" if center is not None else "—")
+        body.append(f"\nrecorder rows {rows}   RTH {rth}")
+        body.append(f"\nArcus sequence {health}")
+        return Panel(body, title="ARCUS / RH market data", box=box.ROUNDED,
+                     padding=(0, 1))
 
     def _venues_panel(self):
         eng, cfg = self.eng, self.eng.cfg
