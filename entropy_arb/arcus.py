@@ -208,6 +208,31 @@ class ArcusBookUpdate:
     exchange_timestamp_us: Optional[int]
 
 
+@dataclass(frozen=True)
+class ArcusL2Event:
+    """One raw price-level event from an Arcus L2 frame.
+
+    ``event_index`` is zero-based within the source websocket frame.  The
+    feed emits bids in wire order followed by asks in wire order, which gives
+    snapshot and delta rows a deterministic order even though the API keeps
+    the two sides in separate arrays.
+    """
+
+    market_id: Optional[int]
+    market_display_name: str
+    event_type: str
+    book_epoch: int
+    local_receive_ts_ms: int
+    local_receive_monotonic_ns: int
+    last_sequence_id: int
+    global_sequence_id: Optional[int]
+    side: str
+    price: str
+    absolute_size: str
+    event_index: int
+    exchange_timestamp_us: Optional[int]
+
+
 def _levels(value: Any, path: str) -> tuple[tuple[str, str], ...]:
     if not isinstance(value, list):
         raise ArcusMarketDataError(f"{path} must be an array")

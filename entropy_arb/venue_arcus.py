@@ -62,6 +62,7 @@ class ArcusVenue:
         self.start_equity = None
         self.last_traded_ts = 0.0
         self.latest_attributes = None
+        self._l2_event_sink = None
         self._trade_sink = None
         self._attribute_sink = None
 
@@ -122,7 +123,10 @@ class ArcusVenue:
         )
         return metadata
 
-    def set_market_data_sinks(self, trade_sink=None, attribute_sink=None) -> None:
+    def set_market_data_sinks(
+        self, trade_sink=None, attribute_sink=None, l2_event_sink=None
+    ) -> None:
+        self._l2_event_sink = l2_event_sink
         self._trade_sink = trade_sink
         self._attribute_sink = attribute_sink
 
@@ -137,6 +141,7 @@ class ArcusVenue:
             ws_url=self.ws_url,
             market_id=self.market.market_id,
             notify=notify,
+            l2_event_sink=self._l2_event_sink,
             trade_sink=self._trade_sink,
             attribute_sink=self._attribute_sink,
         )

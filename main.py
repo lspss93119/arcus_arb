@@ -9,9 +9,9 @@ an explicit decision, not a config default. Phase A requires --record-only;
 there is no live or paper trading mode in this project.
 
 On a terminal the bot shows a live Rich market-data dashboard (BBO, premium,
-RTH state, sequence health, recorder rows) and writes log lines to
-logging.file; use --no-dashboard for plain console logs (nohup/systemd). See
-the README (English) / README.zh-CN.md (中文).
+RTH state, sequence health, recorder rows, and raw L2 event count) and writes
+log lines to logging.file; use --no-dashboard for plain console logs
+(nohup/systemd). See the README (English) / README.zh-CN.md (中文).
 """
 import argparse
 import asyncio
@@ -82,10 +82,11 @@ def main() -> None:
     p.add_argument("--config", default="config.yaml",
                    help="strategy config (default: config.yaml)")
     p.add_argument("--env-file", default=".env",
-                   help="optional legacy env-file path; no Arcus credentials are used")
+                   help="optional legacy env-file path; no Arcus credentials "
+                        "are used")
     p.add_argument("--record-only", action="store_true",
-                   help="only collect minute data, run no strategy, send no "
-                        "orders (needs no credentials)")
+                   help="collect public BBO, trades, and raw L2 data only; "
+                        "run no strategy or orders (needs no credentials)")
     p.add_argument("--cn", action="store_true",
                    help="display the dashboard in Chinese / 仪表盘使用中文")
     disp = p.add_mutually_exclusive_group()

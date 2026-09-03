@@ -305,6 +305,9 @@ class Dashboard:
         health = getattr(book, "health", "OK" if book.is_fresh(cfg.staleness_sec)
                          else "STALE")
         rows = getattr(getattr(eng, "recorder", None), "rows_written", 0)
+        l2_rows = getattr(
+            getattr(eng, "recorder", None), "l2_events_written", 0
+        )
         body = Text()
         body.append("RECORD-ONLY · Arcus trading disabled\n", style="bold yellow")
         body.append(line(arcus, "ARCUS") + "\n")
@@ -313,7 +316,7 @@ class Dashboard:
         body.append(f"{premium:+.3f} bps" if premium is not None else "—")
         body.append("   rolling/fixed center ")
         body.append(f"{center:+.3f} bps" if center is not None else "—")
-        body.append(f"\nrecorder rows {rows}   RTH {rth}")
+        body.append(f"\nrecorder rows {rows}   L2 events {l2_rows}   RTH {rth}")
         body.append(f"\nArcus sequence {health}")
         return Panel(body, title="ARCUS / RH market data", box=box.ROUNDED,
                      padding=(0, 1))

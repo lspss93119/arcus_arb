@@ -258,6 +258,7 @@ class Engine:
                 monotonic_ns,
                 market_status=metadata.status,
             ),
+            self.recorder.record_l2_event,
         )
         await self._bootstrap_rolling_center()
 
@@ -309,12 +310,14 @@ class Engine:
                 attribute_count = self.market_history.count_rows(
                     "arcus_market_attributes"
                 )
+                l2_stats = self.market_history.arcus_l2_stats()
                 await asyncio.to_thread(self.market_history.close)
                 log.info(
-                    "shutdown — record-only samples=%d trades=%d attrs=%d",
-                    sample_count,
-                    trade_count,
-                    attribute_count,
+                    "shutdown — record-only samples=%d trades=%d attrs=%d "
+                    "l2_events=%d l2_events_per_sec=%.2f db_bytes=%d wal_bytes=%d",
+                    sample_count, trade_count, attribute_count, l2_stats.rows,
+                    l2_stats.events_per_sec, l2_stats.database_bytes,
+                    l2_stats.wal_bytes,
                 )
 
     async def _run_inner(self) -> None:

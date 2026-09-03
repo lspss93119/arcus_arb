@@ -46,6 +46,19 @@ market attributes 会保留 nullable 的 RTH 状态、settlement price、当前/
 
 ## SQLite 与分析
 
+Phase A.1 另外把每一个 wire-level 写入 append-only 的 arcus_l2_events。
+snapshot/delta 会保存 event type、SQLite 接收顺序 id、消息内 event_index、
+book_epoch、每市场 lastSequenceId、仅作 telemetry 的 globalSequenceId、
+local wall/monotonic receive clocks、side、price 与 absolute size。delta 的
+zero-size 行会原样保留作删除记录；同一价位的不同更新不会聚合。sequence
+gap 的 delta 也会先原样保存，但本地 book 会失效，直到新 snapshot 开始
+下一个 epoch。既有 bounded WAL writer 会批量写入，并在 shutdown flush；
+arcus_l2_stats() 与 shutdown log 会显示已提交行数、按 receive timestamp
+span 计算的 events/sec、SQLite bytes 与 WAL bytes。
+
+arcus_l2_events 是按价位聚合的 L2，不是逐笔订单的 L3，因此单凭它不能
+得到精确 maker queue position；未来 replay 仍需采用保守 queue model。
+
 `arcus_samples` 每秒左右记录一笔两个 venue 都有效的 BBO，包含 bid/ask
 数量、mid、premium、Arcus sequence ID、两种 timestamp 与 nullable attributes。
 `arcus_trades`、`arcus_market_attributes`、`arcus_market_metadata` 是分开的
@@ -63,6 +76,9 @@ Phase A 中 center 仅供观察；本任务不调整 Arcus 门槛。
 Dashboard 会显示 `ARCUS`、`RH`、BBO age、premium、center、recorder rows、
 RTH state、sequence health（`OK`/`RESYNC`/`STALE`），并明确显示
 `RECORD-ONLY · Arcus trading disabled`；没有 Arcus 交易控制项。
+
+Record-only dashboard 也会在 Arcus sequence health 旁显示本次运行的 raw L2
+event count，并且不会提供任何交易控制项。
 
 ## 范围边界
 

@@ -21,6 +21,7 @@ from .arcus import (
     ARCUS_BOOK_LEVELS,
     ARCUS_PUBLIC_SUBSCRIPTIONS,
     ARCUS_WS_URL,
+    ArcusL2Event,
     ArcusMarketAttributes,
     ArcusTrade,
     parse_arcus_book_snapshot,
@@ -36,7 +37,7 @@ Callback = Callable[..., Any]
 
 
 class ArcusBookFeed:
-    """Consume Arcus public book, trades, and attribute events."""
+    """Consume Arcus public book, raw L2 levels, trades, and attributes."""
 
     def __init__(
         self,
@@ -46,6 +47,7 @@ class ArcusBookFeed:
         ws_url: str = ARCUS_WS_URL,
         market_id: Optional[int] = None,
         notify: Optional[Callable[[], None]] = None,
+        l2_event_sink: Optional[Callback] = None,
         trade_sink: Optional[Callback] = None,
         attribute_sink: Optional[Callback] = None,
         n_levels: int = ARCUS_BOOK_LEVELS,
@@ -57,11 +59,13 @@ class ArcusBookFeed:
         self.ws_url = ws_url
         self.book = book
         self.notify = notify or (lambda: None)
+        self.l2_event_sink = l2_event_sink
         self.trade_sink = trade_sink
         self.attribute_sink = attribute_sink
         self.n_levels = n_levels
         self.latest_attributes: Optional[ArcusMarketAttributes] = None
         self._resync_requested = False
+        self.l2_event_rows = 0
 
     async def _call(self, callback: Optional[Callback], *args: Any) -> None:
         if callback is None:
@@ -103,6 +107,42 @@ class ArcusBookFeed:
             "nLevels": self.n_levels,
         }, separators=(",", ":")))
 
+    async def _emit_l2_events(
+        self,
+        *,
+        event_type: str,
+        bids: tuple[tuple[str, str], ...],
+        asks: tuple[tuple[str, str], ...],
+        last_sequence_id: int,
+        global_sequence_id: Optional[int],
+        exchange_timestamp_us: Optional[int],
+        local_receive_ts_ms: int,
+        local_receive_monotonic_ns: int,
+    ) -> None:
+        """Emit one callback per wire level, retaining frame-local order."""
+        levels = [("bid", price, size) for price, size in bids]
+        levels.extend(("ask", price, size) for price, size in asks)
+        for event_index, (side, price, size) in enumerate(levels):
+            await self._call(
+                self.l2_event_sink,
+                ArcusL2Event(
+                    market_id=self.market_id,
+                    market_display_name=self.market_display_name,
+                    event_type=event_type,
+                    book_epoch=self.book.book_epoch,
+                    local_receive_ts_ms=local_receive_ts_ms,
+                    local_receive_monotonic_ns=local_receive_monotonic_ns,
+                    last_sequence_id=last_sequence_id,
+                    global_sequence_id=global_sequence_id,
+                    side=side,
+                    price=price,
+                    absolute_size=size,
+                    event_index=event_index,
+                    exchange_timestamp_us=exchange_timestamp_us,
+                ),
+            )
+            self.l2_event_rows += 1
+
     def _is_target(self, message: dict) -> bool:
         identifier = message.get("id")
         return identifier is None or str(identifier).upper() == self.market_display_name.upper()
@@ -125,8 +165,19 @@ class ArcusBookFeed:
 
         if channel == "l2OrderbookUpdates":
             if message.get("type") == "subscribed":
+                snapshot = parse_arcus_book_snapshot(message)
                 self.book.apply_snapshot(
-                    parse_arcus_book_snapshot(message), wall_ms, mono_ns
+                    snapshot, wall_ms, mono_ns
+                )
+                await self._emit_l2_events(
+                    event_type="snapshot",
+                    bids=snapshot.bids,
+                    asks=snapshot.asks,
+                    last_sequence_id=snapshot.last_sequence_id,
+                    global_sequence_id=snapshot.global_sequence_id,
+                    exchange_timestamp_us=snapshot.exchange_timestamp_us,
+                    local_receive_ts_ms=wall_ms,
+                    local_receive_monotonic_ns=mono_ns,
                 )
                 self._resync_requested = False
                 log.info(
@@ -142,6 +193,19 @@ class ArcusBookFeed:
             if message.get("type") != "channel_data":
                 return
             update = parse_arcus_book_update(message)
+            # Persist the raw delta even when its sequence is gapped.  The
+            # local book rejects that update; the row remains evidence of the
+            # discontinuity and is never replaced with a fabricated event.
+            await self._emit_l2_events(
+                event_type="delta",
+                bids=update.bids,
+                asks=update.asks,
+                last_sequence_id=update.last_sequence_id,
+                global_sequence_id=update.global_sequence_id,
+                exchange_timestamp_us=update.exchange_timestamp_us,
+                local_receive_ts_ms=wall_ms,
+                local_receive_monotonic_ns=mono_ns,
+            )
             applied = self.book.apply_update(update, wall_ms, mono_ns)
             if not applied and self.book.health == "RESYNC":
                 if not self._resync_requested:

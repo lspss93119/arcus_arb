@@ -51,6 +51,21 @@ current/next bounds, event timestamp, and market sequence number.
 
 ## Storage and analysis
 
+Phase A.1 additionally stores every wire price-level in the append-only
+arcus_l2_events table. Snapshot and delta rows retain event type, the
+SQLite receive-order id, event_index, book_epoch, per-market lastSequenceId,
+telemetry globalSequenceId, both local receive clocks, side, price, and
+absolute size. Zero-size delta rows are retained as deletes; levels at the
+same price are never aggregated. A sequence-gap delta is also stored as
+received, while the local book is invalidated until a fresh snapshot starts
+the next epoch. The bounded WAL writer batches these rows and flushes them on
+shutdown. arcus_l2_stats() and the shutdown log expose committed row count,
+receive-span event rate, database bytes, and WAL bytes.
+
+arcus_l2_events is aggregated market-by-price data, not individual order data,
+so it does not provide exact maker queue position by itself. Future queue
+replay must use a conservative model.
+
 `arcus_samples` stores approximately one valid BBO sample per second for both
 legs, including sizes, midpoint prices, premium, Arcus sequence IDs, both
 timestamp domains, and nullable market attributes. `arcus_trades`,
@@ -72,6 +87,9 @@ The dashboard displays `ARCUS`, `RH`, BBO age, premium, center, recorder rows,
 RTH state, sequence health (`OK`/`RESYNC`/`STALE`), and an explicit
 `RECORD-ONLY · Arcus trading disabled` banner. It has no Arcus execution
 controls.
+
+The record-only dashboard also shows the session raw L2 event count alongside
+the Arcus sequence health, without exposing any trading controls.
 
 ## Scope boundary
 

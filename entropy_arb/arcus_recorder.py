@@ -8,11 +8,17 @@ import math
 import time
 from typing import Optional
 
-from .arcus import ArcusMarketAttributes, ArcusMarketMetadata, ArcusTrade
+from .arcus import (
+    ArcusL2Event,
+    ArcusMarketAttributes,
+    ArcusMarketMetadata,
+    ArcusTrade,
+)
 from .arcus_book import ArcusOrderBook
 from .premium import calculate_premiums
 from .storage import (
     ArcusMarketAttributesRow,
+    ArcusL2EventRow,
     ArcusMarketMetadataRow,
     ArcusMinuteRow,
     ArcusSampleRow,
@@ -107,6 +113,7 @@ class ArcusMarketRecorder:
         self.interval_sec = interval_sec
         self.rows_written = 0
         self.minute_rows_written = 0
+        self.l2_events_written = 0
         self._agg: Optional[_ArcusMinuteAgg] = None
         self.attributes: Optional[ArcusMarketAttributes] = None
         self.market_metadata: Optional[ArcusMarketMetadata] = None
@@ -191,6 +198,34 @@ class ArcusMarketRecorder:
             aggressor_side=trade.aggressor_side,
             sequence_number=trade.sequence_number,
         ))
+
+    def record_l2_event(self, event: ArcusL2Event) -> None:
+        """Append one raw Arcus L2 level without committing synchronously."""
+        market_id = event.market_id
+        if market_id is None and self.market_metadata is not None:
+            market_id = self.market_metadata.market_id
+        if market_id is None:
+            # ArcusVenue always resolves a market id before starting this
+            # feed. Keep a malformed/direct feed observable rather than
+            # losing an otherwise replayable event.
+            market_id = -1
+            log.warning("[ARCUS] L2 event has no market id; storing -1")
+        self.store.append_arcus_l2_event(ArcusL2EventRow(
+            symbol=self.symbol,
+            market_id=int(market_id),
+            event_type=event.event_type,
+            book_epoch=event.book_epoch,
+            local_receive_ts_ms=int(event.local_receive_ts_ms),
+            local_receive_monotonic_ns=int(event.local_receive_monotonic_ns),
+            last_sequence_id=event.last_sequence_id,
+            global_sequence_id=event.global_sequence_id,
+            side=event.side,
+            price=event.price,
+            absolute_size=event.absolute_size,
+            event_index=event.event_index,
+            exchange_timestamp_us=event.exchange_timestamp_us,
+        ))
+        self.l2_events_written += 1
 
     def _flush_minute(self) -> None:
         if self._agg is None or self._agg.n == 0:
@@ -278,7 +313,9 @@ class ArcusMarketRecorder:
         finally:
             self.close()
             log.info(
-                "[ARCUS] recorder stopped — %d samples, %d minute rows buffered",
+                "[ARCUS] recorder stopped — %d samples, %d minute rows, "
+                "%d L2 events buffered",
                 self.rows_written,
                 self.minute_rows_written,
+                self.l2_events_written,
             )

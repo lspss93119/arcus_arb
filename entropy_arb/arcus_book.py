@@ -21,6 +21,7 @@ class ArcusOrderBook(OrderBook):
     def __init__(self) -> None:
         super().__init__()
         self.health = "STALE"
+        self.book_epoch = 0
         self.sequence_id: Optional[int] = None
         self.global_sequence_id: Optional[int] = None
         self.exchange_timestamp_us: Optional[int] = None
@@ -83,6 +84,10 @@ class ArcusOrderBook(OrderBook):
         local_receive_ts_ms: Optional[int] = None,
         local_receive_monotonic_ns: Optional[int] = None,
     ) -> None:
+        # Every subscribe-time snapshot starts a new replayable continuous
+        # segment, including the first snapshot after startup/reconnect or a
+        # sequence-gap resync.
+        self.book_epoch += 1
         self.bids.clear()
         self.asks.clear()
         self._apply_levels(self.bids, snapshot.bids)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,7 @@ from entropy_arb.arcus import (
     ARCUS_PUBLIC_SUBSCRIPTIONS,
     ArcusMarketAttributes,
     ArcusMarketMetadata,
+    ArcusL2Event,
     ArcusTrade,
     parse_arcus_book_snapshot,
     parse_arcus_book_update,
@@ -28,6 +30,7 @@ from entropy_arb.arcus_feed import ArcusBookFeed
 from entropy_arb.arcus_recorder import ArcusMarketRecorder
 from entropy_arb.premium import calculate_premiums
 from entropy_arb.storage import (
+    ArcusL2EventRow,
     ArcusMarketAttributesRow,
     ArcusMarketMetadataRow,
     ArcusSampleRow,
@@ -310,6 +313,15 @@ def test_sqlite_arcus_sample_and_public_trade_persistence_is_restart_safe(
     assert reopened.recent_premium_observations(
         "SNDK", "lighter-rh", 0, 1788425527000
     ) == [(pytest.approx(1788425526.0), pytest.approx(6.56))]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT arcus_local_receive_ts_ms, arcus_local_receive_monotonic_ns "
+            "FROM arcus_samples"
+        ).fetchone() == (1788425525850030, 123)
+        assert conn.execute(
+            "SELECT local_receive_ts_ms, local_receive_monotonic_ns "
+            "FROM arcus_trades"
+        ).fetchone() == (1788425525851001, 456)
     reopened.close()
 
 
@@ -437,6 +449,264 @@ def test_arcus_feed_gap_requests_book_resync_without_extra_channels() -> None:
         "l2OrderbookUpdates",
     ]
     assert feed.book.health == "RESYNC"
+
+
+def _l2_recorder(store: MarketHistoryStore) -> ArcusMarketRecorder:
+    return ArcusMarketRecorder(
+        store,
+        symbol="SNDK",
+        arcus_book=ArcusOrderBook(),
+        rh_book=SimpleNamespace(),
+    )
+
+
+def _l2_feed(
+    recorder: ArcusMarketRecorder,
+    *,
+    events: list[ArcusL2Event] | None = None,
+) -> ArcusBookFeed:
+    sinks = [] if events is None else events
+    sink = recorder.record_l2_event if events is None else sinks.append
+    return ArcusBookFeed(
+        "SNDK-USD",
+        recorder.arcus_book,
+        market_id=33,
+        l2_event_sink=sink,
+    )
+
+
+def _l2_delta(
+    *,
+    sequence: int = 91051779,
+    global_sequence: int = 1789133353,
+    bids: list[list[str]] | None = None,
+    asks: list[list[str]] | None = None,
+) -> dict:
+    return {
+        "type": "channel_data",
+        "channel": "l2OrderbookUpdates",
+        "id": "SNDK-USD",
+        "contents": {
+            "bids": bids if bids is not None else [["1540.35", "0"]],
+            "asks": asks if asks is not None else [["1540.67", "0.4412"]],
+            "lastSequenceId": sequence,
+            "globalSequenceId": global_sequence,
+        },
+    }
+
+
+def _stored_l2_rows(store: MarketHistoryStore) -> list[tuple]:
+    return store._conn.execute(
+        "SELECT id, symbol, market_id, event_type, book_epoch, "
+        "local_receive_ts_ms, local_receive_monotonic_ns, last_sequence_id, "
+        "global_sequence_id, side, price, absolute_size, event_index, "
+        "exchange_timestamp_us FROM arcus_l2_events ORDER BY id"
+    ).fetchall()
+
+
+def test_arcus_l2_snapshot_persists_every_level_with_sequence_metadata(
+    tmp_path: Path,
+) -> None:
+    store = MarketHistoryStore(tmp_path / "market-history.sqlite")
+    recorder = _l2_recorder(store)
+    feed = _l2_feed(recorder)
+
+    asyncio.run(feed.handle_message(_FakeWebSocket(), SNAPSHOT, 1000, 10))
+    assert store.flush().ok
+
+    rows = _stored_l2_rows(store)
+    assert [row[3] for row in rows] == ["snapshot"] * 4
+    assert [(row[9], row[10], row[11], row[12]) for row in rows] == [
+        ("bid", "1540.35", "0.3182", 0),
+        ("bid", "1540.16", "0.3246408", 1),
+        ("ask", "1540.67", "0.3307", 2),
+        ("ask", "1540.86", "0.2811", 3),
+    ]
+    assert all(row[1:3] == ("SNDK", 33) for row in rows)
+    assert all(row[4] == 1 for row in rows)
+    assert all(row[5:9] == (1000, 10, 91051778, 1789133352) for row in rows)
+    assert rows[0][13] == 1788425525850028
+    store.close()
+
+
+def test_arcus_l2_delta_persists_each_change_and_zero_size_delete(
+    tmp_path: Path,
+) -> None:
+    store = MarketHistoryStore(tmp_path / "market-history.sqlite")
+    recorder = _l2_recorder(store)
+    feed = _l2_feed(recorder)
+    delta = _l2_delta(
+        bids=[["1540.35", "0"], ["1540.12", "1.2500"]],
+        asks=[["1540.67", "0.4412"], ["1540.92", "0"]],
+    )
+
+    async def deliver() -> None:
+        await feed.handle_message(_FakeWebSocket(), SNAPSHOT, 1000, 10)
+        await feed.handle_message(_FakeWebSocket(), delta, 1001, 11)
+
+    asyncio.run(deliver())
+    assert store.flush().ok
+
+    rows = _stored_l2_rows(store)[4:]
+    assert [row[3] for row in rows] == ["delta"] * 4
+    assert [(row[7], row[8], row[9], row[10], row[11], row[12]) for row in rows] == [
+        (91051779, 1789133353, "bid", "1540.35", "0", 0),
+        (91051779, 1789133353, "bid", "1540.12", "1.2500", 1),
+        (91051779, 1789133353, "ask", "1540.67", "0.4412", 2),
+        (91051779, 1789133353, "ask", "1540.92", "0", 3),
+    ]
+    assert feed.book.best_bid() == pytest.approx(1540.16)
+    assert feed.book.best_ask() == pytest.approx(1540.67)
+    store.close()
+
+
+def test_arcus_l2_event_order_is_stable_inside_one_message() -> None:
+    events: list[ArcusL2Event] = []
+    recorder = ArcusMarketRecorder(
+        MarketHistoryStore(":memory:"),
+        symbol="SNDK",
+        arcus_book=ArcusOrderBook(),
+        rh_book=SimpleNamespace(),
+    )
+    feed = _l2_feed(recorder, events=events)
+    delta = _l2_delta(
+        bids=[["1540.35", "0"], ["1540.12", "1.2500"]],
+        asks=[["1540.67", "0.4412"], ["1540.92", "0"]],
+    )
+
+    async def deliver() -> None:
+        await feed.handle_message(_FakeWebSocket(), SNAPSHOT, 1000, 10)
+        await feed.handle_message(_FakeWebSocket(), delta, 1001, 11)
+
+    asyncio.run(deliver())
+    assert all(isinstance(event, ArcusL2Event) for event in events)
+    assert [(event.event_type, event.event_index, event.side, event.price)
+            for event in events] == [
+        ("snapshot", 0, "bid", "1540.35"),
+        ("snapshot", 1, "bid", "1540.16"),
+        ("snapshot", 2, "ask", "1540.67"),
+        ("snapshot", 3, "ask", "1540.86"),
+        ("delta", 0, "bid", "1540.35"),
+        ("delta", 1, "bid", "1540.12"),
+        ("delta", 2, "ask", "1540.67"),
+        ("delta", 3, "ask", "1540.92"),
+    ]
+    assert [(event.last_sequence_id, event.global_sequence_id)
+            for event in events[4:]] == [(91051779, 1789133353)] * 4
+    assert [(event.local_receive_ts_ms, event.local_receive_monotonic_ns)
+            for event in events[4:]] == [(1001, 11)] * 4
+    recorder.store.close()
+
+
+def test_arcus_l2_gap_rows_and_new_snapshot_epoch_are_distinguishable(
+    tmp_path: Path,
+) -> None:
+    store = MarketHistoryStore(tmp_path / "market-history.sqlite")
+    recorder = _l2_recorder(store)
+    feed = _l2_feed(recorder)
+    gap = _l2_delta(sequence=91051781, global_sequence=1789133355)
+    fresh_snapshot = {
+        **SNAPSHOT,
+        "contents": {**SNAPSHOT["contents"], "lastSequenceId": 91051790},
+    }
+
+    async def deliver() -> None:
+        websocket = _FakeWebSocket()
+        await feed.handle_message(websocket, SNAPSHOT, 1000, 10)
+        await feed.handle_message(websocket, UPDATE, 1001, 11)
+        await feed.handle_message(websocket, gap, 1002, 12)
+        await feed.handle_message(websocket, fresh_snapshot, 1003, 13)
+
+    asyncio.run(deliver())
+    assert store.flush().ok
+
+    rows = _stored_l2_rows(store)
+    assert len(rows) == 12
+    assert [(row[3], row[4], row[7]) for row in rows] == [
+        *( [("snapshot", 1, 91051778)] * 4),
+        *( [("delta", 1, 91051779)] * 2),
+        *( [("delta", 1, 91051781)] * 2),
+        *( [("snapshot", 2, 91051790)] * 4),
+    ]
+    assert 91051780 not in {row[7] for row in rows}
+    assert feed.book.health == "OK"
+    assert feed.book.book_epoch == 2
+    store.close()
+
+
+def _l2_row(
+    *,
+    sequence: int,
+    receive_ms: int,
+    event_type: str = "delta",
+    event_index: int = 0,
+    epoch: int = 1,
+) -> ArcusL2EventRow:
+    return ArcusL2EventRow(
+        symbol="SNDK",
+        market_id=33,
+        event_type=event_type,
+        book_epoch=epoch,
+        local_receive_ts_ms=receive_ms,
+        local_receive_monotonic_ns=receive_ms * 10,
+        last_sequence_id=sequence,
+        global_sequence_id=sequence + 1000,
+        side="bid",
+        price="1540.35",
+        absolute_size="0",
+        event_index=event_index,
+        exchange_timestamp_us=None,
+    )
+
+
+def test_arcus_l2_shutdown_flush_and_restart_append_preserve_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "market-history.sqlite"
+    store = MarketHistoryStore(db_path)
+    store.append_arcus_l2_event(_l2_row(sequence=100, receive_ms=1000))
+    store.append_arcus_l2_event(_l2_row(sequence=101, receive_ms=2000))
+    store.close()
+
+    reopened = MarketHistoryStore(db_path)
+    assert reopened.count_rows("arcus_l2_events") == 2
+    reopened.append_arcus_l2_event(_l2_row(sequence=102, receive_ms=3000))
+    reopened.close()
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT id, last_sequence_id, local_receive_ts_ms "
+            "FROM arcus_l2_events ORDER BY id"
+        ).fetchall() == [(1, 100, 1000), (2, 101, 2000), (3, 102, 3000)]
+        assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+
+def test_arcus_l2_burst_is_buffered_until_batched_flush(tmp_path: Path) -> None:
+    store = MarketHistoryStore(tmp_path / "market-history.sqlite")
+    for sequence in range(1000):
+        store.append_arcus_l2_event(
+            _l2_row(sequence=sequence, receive_ms=1000 + sequence)
+        )
+
+    assert store.pending_rows["arcus_l2_events"] == 1000
+    assert store.count_rows("arcus_l2_events") == 0
+    assert store.flush().datasets["arcus_l2_events"].inserted == 1000
+    assert store.count_rows("arcus_l2_events") == 1000
+    store.close()
+
+
+def test_arcus_l2_stats_expose_rows_rate_and_sqlite_size(tmp_path: Path) -> None:
+    store = MarketHistoryStore(tmp_path / "market-history.sqlite")
+    store.append_arcus_l2_event(_l2_row(sequence=100, receive_ms=1000))
+    store.append_arcus_l2_event(_l2_row(sequence=101, receive_ms=2000))
+    store.flush()
+
+    stats = store.arcus_l2_stats()
+    assert stats.rows == 2
+    assert stats.events_per_sec == pytest.approx(2.0)
+    assert stats.database_bytes > 0
+    assert stats.wal_bytes >= 0
+    store.close()
 
 
 def test_rolling_center_reads_arcus_rh_midpoint_samples(tmp_path: Path) -> None:
@@ -687,7 +957,7 @@ def test_record_only_dashboard_mentions_arcus_and_rh() -> None:
         ),
         rolling_center_bps=None,
         latest_sample_ts=1000,
-        recorder=SimpleNamespace(rows_written=7),
+        recorder=SimpleNamespace(rows_written=7, l2_events_written=19),
     )
 
     rendered = dashboard._record_only_panel()
@@ -698,3 +968,4 @@ def test_record_only_dashboard_mentions_arcus_and_rh() -> None:
     assert "RECORD-ONLY" in rendered_text
     assert "Arcus trading disabled" in rendered_text
     assert "OK" in rendered_text
+    assert "L2 events 19" in rendered_text
