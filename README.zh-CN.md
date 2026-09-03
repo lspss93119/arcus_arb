@@ -1,4 +1,4 @@
-# entropy-arb
+# arcus-arb
 
 **[English documentation / 英文文档 → README.md](README.md)**
 
