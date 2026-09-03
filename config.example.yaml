@@ -23,9 +23,10 @@ arcus:
   max_orders_per_min: 0
 
 hedge:
-  # Set this to a verified current Lighter-RH taker fee before any approved
-  # B0 first order. It is a modeled input, not an Arcus credential.
+  # Set the applicable current Lighter-RH taker fee without changing it just
+  # to pass B0. A verified 0.0 bps fee is valid; unknown values fail closed.
   taker_fee_bps: 0.0
+  taker_fee_bps_verified: false
   max_position_usd: 1000.0
   max_orders_per_min: 30
 

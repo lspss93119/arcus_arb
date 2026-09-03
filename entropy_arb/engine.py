@@ -41,7 +41,11 @@ from .arcus_execution import (
     ArcusMakerClient,
     resolve_arcus_account_fee_tier,
 )
-from .calibration_runtime import CalibrationController, fetch_lighter_open_orders
+from .calibration_runtime import (
+    CalibrationController,
+    fetch_lighter_open_orders,
+    resolve_verified_rh_fee_bps,
+)
 from .recorder import MinuteRecorder
 from .reference import ReferenceRecorder
 from .storage import FLUSH_INTERVAL_SEC, MarketHistoryStore
@@ -492,12 +496,7 @@ class Engine:
             # path.  No wallet generation or registration is attempted.
             credentials = ArcusCredentials.from_env()
             signer = ArcusSigner(credentials)
-            rh_fee_bps = Decimal(str(self.hedge.fee_bps))
-            if not rh_fee_bps.is_finite() or rh_fee_bps <= 0:
-                raise RuntimeError(
-                    "B0 requires a verified positive hedge.taker_fee_bps; "
-                    "refusing to model the RH fee as zero"
-                )
+            rh_fee_bps = resolve_verified_rh_fee_bps(self.hedge)
             if not cfg.creds_complete:
                 raise RuntimeError(
                     "B0 requires Lighter-RH credentials in .env: "
@@ -589,6 +588,7 @@ class Engine:
                 store=self.market_history,
                 allow_first_order=self.allow_first_order,
                 staleness_sec=cfg.staleness_sec,
+                rh_fee_bps=rh_fee_bps,
                 session_limits=SessionLimits(),
             )
             self.calibration = controller

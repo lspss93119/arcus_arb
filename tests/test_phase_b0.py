@@ -54,7 +54,10 @@ try:
         choose_quote,
         expected_edge_bps,
     )
-    from entropy_arb.calibration_runtime import CalibrationController
+    from entropy_arb.calibration_runtime import (
+        CalibrationController,
+        resolve_verified_rh_fee_bps,
+    )
     from entropy_arb.book import OrderBook
     from entropy_arb.storage import ArcusCalibrationEventRow, MarketHistoryStore
 except ImportError as exc:  # RED phase: the new public API is not present yet.
@@ -117,6 +120,42 @@ def test_live_mode_requires_both_explicit_cli_gates() -> None:
 def test_missing_arcus_credentials_fails_before_order_submission() -> None:
     with pytest.raises(ArcusCredentialError, match="ARCUS_API_KEY"):
         ArcusCredentials.from_env({})
+
+
+@pytest.mark.parametrize(
+    ("fee_bps", "verified", "expected"),
+    (
+        (Decimal("0.0"), True, Decimal("0.0")),
+        (Decimal("1.25"), True, Decimal("1.25")),
+        (Decimal("0.0"), False, None),
+    ),
+)
+def test_rh_fee_gate_requires_verification_not_positive_value(
+    fee_bps: Decimal, verified: bool, expected: Decimal | None
+) -> None:
+    hedge = SimpleNamespace(
+        fee_bps=fee_bps,
+        fee_bps_verified=verified,
+    )
+    if expected is None:
+        with pytest.raises(RuntimeError, match="verified RH"):
+            resolve_verified_rh_fee_bps(hedge)
+    else:
+        assert resolve_verified_rh_fee_bps(hedge) == expected
+
+
+def test_verified_rh_fee_value_is_used_by_expected_edge_model() -> None:
+    hedge = SimpleNamespace(fee_bps=Decimal("1.25"), fee_bps_verified=True)
+    verified_fee = resolve_verified_rh_fee_bps(hedge)
+    edge = expected_edge_bps(
+        side="SELL",
+        arcus_price=Decimal("101.00"),
+        hedge_price=Decimal("100.00"),
+        arcus_fee_bps=Decimal("0.00"),
+        rh_fee_bps=verified_fee,
+        rh_slippage_allowance_bps=Decimal("2.00"),
+    )
+    assert edge == pytest.approx(95.79, abs=0.01)
 
 
 def test_record_only_does_not_require_arcus_private_credentials() -> None:

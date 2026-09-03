@@ -167,6 +167,10 @@ class LighterVenue:
         self.min_base = 0.0
         self.min_quote = 10.0
         self.signer = None
+        # ``fee_bps`` is usable by B0 only when its account/venue source has
+        # been explicitly verified in configuration.  In particular, zero is
+        # a valid verified fee and must not be confused with the default.
+        self.fee_bps_verified = bool(getattr(conf, "fee_bps_verified", False))
         self.orders_feed: Optional[AccountOrdersFeed] = None
         self._coi = int(time.time() * 1000)
 

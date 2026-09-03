@@ -109,6 +109,9 @@ class VenueConf:
     # lighter
     lighter_profile: Optional[LighterProfile] = None
     lighter_creds: Optional[LighterCreds] = None
+    # B0 must distinguish an explicitly verified zero fee from the default
+    # modeling value.  This flag never changes the configured fee itself.
+    fee_bps_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -203,6 +206,7 @@ _SCHEMA: Dict[str, Any] = {
     },
     "hedge": {
         "taker_fee_bps": float,
+        "taker_fee_bps_verified": bool,
         "max_position_usd": float,
         "max_orders_per_min": int,
     },
@@ -460,6 +464,9 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 1.0)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 120)),
+            fee_bps_verified=bool(
+                _get(raw, "hedge", "taker_fee_bps_verified", False)
+            ),
             hl_dex="xyz",
             hl_creds=HLCreds(
                 _env_s("HL_PRIVATE_KEY_XYZ") or _env_s("HL_PRIVATE_KEY"),
@@ -475,6 +482,9 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 0.0)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 30)),
+            fee_bps_verified=bool(
+                _get(raw, "hedge", "taker_fee_bps_verified", False)
+            ),
             lighter_profile=LIGHTER_PROFILES[hedge_venue],
             lighter_creds=LighterCreds(_env_i("LIGHTER_ACCOUNT_INDEX"),
                                        _env_i("LIGHTER_API_KEY_INDEX"),

@@ -56,6 +56,32 @@ def _decimal(value: Any, field: str) -> Decimal:
     return result
 
 
+def resolve_verified_rh_fee_bps(hedge: Any) -> Decimal:
+    """Return the configured RH fee only when its source is verified.
+
+    ``0`` is a valid Lighter-RH fee, so positivity cannot be used as the
+    verification signal.  The separate flag prevents an omitted/default
+    ``0.0`` model input from being treated as an account fee.  The engine
+    passes the returned value into the B0 controller so edge and PnL use the
+    same verified number.
+    """
+    verified = getattr(hedge, "fee_bps_verified", None)
+    if verified is None:
+        verified = getattr(
+            getattr(hedge, "conf", None), "fee_bps_verified", False
+        )
+    if not isinstance(verified, bool) or not verified:
+        raise RuntimeError(
+            "B0 requires a verified RH taker fee; set "
+            "hedge.taker_fee_bps_verified=true only when "
+            "hedge.taker_fee_bps comes from the applicable account/venue source"
+        )
+    value = _decimal(getattr(hedge, "fee_bps", None), "RH fee")
+    if value < 0:
+        raise RuntimeError("verified RH taker fee must be non-negative")
+    return value
+
+
 def _text(value: Any) -> str | None:
     if value is None:
         return None
@@ -211,6 +237,7 @@ class CalibrationController:
         store: MarketHistoryStore,
         allow_first_order: bool,
         staleness_sec: float,
+        rh_fee_bps: Decimal | None = None,
         session_id: str | None = None,
         session_limits: SessionLimits | None = None,
     ) -> None:
@@ -225,6 +252,11 @@ class CalibrationController:
         self.strategy = strategy
         self.allow_first_order = allow_first_order
         self.staleness_sec = staleness_sec
+        self._rh_fee_bps = (
+            _decimal(rh_fee_bps, "verified RH fee")
+            if rh_fee_bps is not None
+            else _decimal(getattr(hedge, "fee_bps", 0), "RH fee")
+        )
         self.session_id = session_id or f"b0-{uuid.uuid4().hex[:12]}"
         self.limits = session_limits or SessionLimits()
         self.risk = SessionRisk(self.limits)
@@ -325,7 +357,7 @@ class CalibrationController:
 
     @property
     def rh_taker_fee_bps(self) -> Decimal:
-        return _decimal(getattr(self.hedge, "fee_bps", 0), "RH fee")
+        return self._rh_fee_bps
 
     def _book_bbo(self, venue: Any) -> tuple[Decimal | None, Decimal | None]:
         bid = venue.book.best_bid()
