@@ -370,6 +370,15 @@ class Engine:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if account_feed.ready.is_set() and account_feed.latest_fee_tier is not None:
+                if not account_feed.required_channels_healthy:
+                    errors = ", ".join(
+                        f"{channel}: {error}"
+                        for channel, error in account_feed.channel_errors.items()
+                    )
+                    raise RuntimeError(
+                        "Arcus account channel health gate failed"
+                        + (f": {errors}" if errors else "")
+                    )
                 return
             if self.stop.is_set():
                 raise RuntimeError(

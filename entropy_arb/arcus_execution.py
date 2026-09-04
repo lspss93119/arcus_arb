@@ -129,8 +129,20 @@ def _fill_from_content(
     message: Mapping[str, Any],
     is_snapshot: bool,
 ) -> ArcusUserFill:
-    price = _decimal(content.get("fillPrice", content.get("price")), "fill.price")
-    quantity = _decimal(content.get("fillSize", content.get("size")), "fill.size")
+    # Arcus account snapshots wrap the rows in ``contents.fills``.  The row
+    # schema itself uses fillPrice/fillSize; keep the older aliases only for
+    # recorded fixtures and REST compatibility.  An explicitly present null
+    # canonical value must remain invalid rather than silently falling back.
+    price_value = (
+        content["fillPrice"] if "fillPrice" in content else content.get("price")
+    )
+    quantity_value = (
+        content["fillSize"]
+        if "fillSize" in content
+        else content.get("size", content.get("quantity"))
+    )
+    price = _decimal(price_value, "fill.price")
+    quantity = _decimal(quantity_value, "fill.size")
     assert price is not None and quantity is not None
     if price <= 0 or quantity <= 0:
         raise ValueError("fill price and size must be > 0")
@@ -169,40 +181,79 @@ def parse_arcus_user_fill(message: Mapping[str, Any]) -> ArcusUserFill | None:
     an array.  Use :func:`parse_arcus_user_fills` for that form; this helper
     returns the single object form and ``None`` for an empty snapshot.
     """
+    fills = parse_arcus_user_fills(message)
+    return fills[0] if fills else None
+
+
+def _user_fill_rows(
+    message: Mapping[str, Any],
+) -> tuple[list[Any], bool]:
     if message.get("channel") != "userFills":
         raise ValueError("message is not userFills")
     contents = message.get("contents")
     if contents is None:
-        return None
-    if isinstance(contents, list):
-        if not contents:
-            return None
-        contents = contents[0]
-    if not isinstance(contents, Mapping):
-        raise ValueError("userFills.contents must be an object or array")
-    is_snapshot = bool(
-        message.get("type") == "subscribed" or contents.get("isSnapshot") is True
-    )
-    return _fill_from_content(contents, message=message, is_snapshot=is_snapshot)
-
-
-def parse_arcus_user_fills(message: Mapping[str, Any]) -> list[ArcusUserFill]:
-    if message.get("channel") != "userFills":
-        raise ValueError("message is not userFills")
-    contents = message.get("contents")
-    if contents is None:
-        return []
-    is_snapshot = bool(message.get("type") == "subscribed")
+        return [], bool(message.get("type") == "subscribed")
     if isinstance(contents, Mapping):
-        return [_fill_from_content(contents, message=message, is_snapshot=is_snapshot or contents.get("isSnapshot") is True)]
-    if not isinstance(contents, list):
-        raise ValueError("userFills.contents must be an object or array")
+        # Current Arcus subscribe snapshots use this wrapper.  Live
+        # channel_data frames continue to carry one fill object directly.
+        if "fills" in contents:
+            rows = contents["fills"]
+            if not isinstance(rows, list):
+                raise ValueError("userFills.contents.fills must be an array")
+            return rows, bool(
+                message.get("type") == "subscribed"
+                or contents.get("isSnapshot") is True
+            )
+        return [contents], bool(
+            message.get("type") == "subscribed"
+            or contents.get("isSnapshot") is True
+        )
+    if isinstance(contents, list):
+        return contents, bool(message.get("type") == "subscribed")
+    raise ValueError("userFills.contents must be an object or array")
+
+
+def _parse_arcus_user_fills(
+    message: Mapping[str, Any],
+    *,
+    tolerate_snapshot_errors: bool,
+) -> tuple[list[ArcusUserFill], int]:
+    rows, is_snapshot = _user_fill_rows(message)
     result = []
-    for item in contents:
-        if not isinstance(item, Mapping):
-            raise ValueError("userFills.contents entries must be objects")
-        result.append(_fill_from_content(item, message=message, is_snapshot=is_snapshot))
-    return result
+    skipped = 0
+    for index, item in enumerate(rows):
+        try:
+            if not isinstance(item, Mapping):
+                raise ValueError("userFills.contents entries must be objects")
+            result.append(
+                _fill_from_content(item, message=message, is_snapshot=is_snapshot)
+            )
+        except ValueError as exc:
+            if not (is_snapshot and tolerate_snapshot_errors):
+                raise
+            skipped += 1
+            fields = (
+                ",".join(sorted(str(key) for key in item))
+                if isinstance(item, Mapping)
+                else "<non-object>"
+            )
+            log.warning(
+                "[ARCUS] skipped malformed historical userFills row "
+                "index=%d fields=%s error=%s",
+                index,
+                fields,
+                exc,
+            )
+    return result, skipped
+
+
+def parse_arcus_user_fills(
+    message: Mapping[str, Any], *, tolerate_snapshot_errors: bool = False
+) -> list[ArcusUserFill]:
+    fills, _ = _parse_arcus_user_fills(
+        message, tolerate_snapshot_errors=tolerate_snapshot_errors
+    )
+    return fills
 
 
 @dataclass(frozen=True)
@@ -649,6 +700,37 @@ class ArcusAccountFeed:
         # be reconciled after callbacks are attached or after a reconnect.
         self.latest_orders: dict[str, ArcusOrderUpdate] = {}
         self._subscribed_channels: set[str] = set()
+        # A malformed frame must invalidate only its own channel.  The
+        # aggregate property below remains fail-closed for B0 quoting while
+        # allowing independent account channels to continue processing.
+        self.channel_health: dict[str, bool] = {
+            channel: False for channel in ARCUS_ACCOUNT_SUBSCRIPTIONS
+        }
+        self.channel_errors: dict[str, str] = {}
+        self.channel_error_counts: dict[str, int] = {}
+
+    @property
+    def required_channels_healthy(self) -> bool:
+        return self.ready.is_set() and all(
+            self.channel_health.get(channel, False)
+            for channel in ARCUS_ACCOUNT_SUBSCRIPTIONS
+        )
+
+    def _mark_channel_healthy(self, channel: str) -> None:
+        self.channel_health[channel] = True
+        self.channel_errors.pop(channel, None)
+
+    def _mark_channel_error(self, channel: str, error: Exception | str) -> None:
+        self.channel_health[channel] = False
+        self.channel_errors[channel] = str(error)
+        self.channel_error_counts[channel] = (
+            self.channel_error_counts.get(channel, 0) + 1
+        )
+        log.warning(
+            "[ARCUS] account channel error channel=%s error=%s",
+            channel,
+            error,
+        )
 
     def _next_request_id(self) -> int:
         self._request_id += 1
@@ -793,37 +875,69 @@ class ArcusAccountFeed:
             return
 
         channel = message.get("channel")
-        if channel == "userFills":
-            receive_ms = int(time.time() * 1000)
-            receive_ns = time.monotonic_ns()
-            for fill in parse_arcus_user_fills(message):
-                fill = replace(
-                    fill,
-                    local_receive_ts_ms=receive_ms,
-                    local_receive_monotonic_ns=receive_ns,
-                )
-                if self.startup_state is not None and fill.sequence_number is not None:
-                    self.startup_state.account_sequence_id = fill.sequence_number
-                await self._callback(self.on_fill, fill)
+        if not isinstance(channel, str) or channel not in ARCUS_ACCOUNT_SUBSCRIPTIONS:
             return
-        if channel == "orders":
-            if message.get("type") == "subscribed":
-                open_orders, closed_orders = parse_arcus_order_snapshot(message)
-                for order in [*open_orders, *closed_orders]:
+        try:
+            message_type = message.get("type")
+            if message_type not in ("subscribed", "channel_data"):
+                raise ValueError(
+                    f"unsupported account frame type={message_type!s}"
+                )
+            if channel == "userFills":
+                receive_ms = int(time.time() * 1000)
+                receive_ns = time.monotonic_ns()
+                is_snapshot = bool(message.get("type") == "subscribed")
+                fills, skipped = _parse_arcus_user_fills(
+                    message,
+                    # Historical snapshot rows can be malformed without
+                    # being actionable.  New fills remain strict and fail
+                    # closed so no unsafe hedge can be triggered.
+                    tolerate_snapshot_errors=is_snapshot,
+                )
+                for fill in fills:
+                    fill = replace(
+                        fill,
+                        local_receive_ts_ms=receive_ms,
+                        local_receive_monotonic_ns=receive_ns,
+                    )
+                    if self.startup_state is not None and fill.sequence_number is not None:
+                        self.startup_state.account_sequence_id = fill.sequence_number
+                    await self._callback(self.on_fill, fill)
+                if skipped:
+                    self._mark_channel_error(
+                        channel,
+                        f"skipped {skipped} malformed historical snapshot row(s)",
+                    )
+                else:
+                    self._mark_channel_healthy(channel)
+                return
+            if channel == "orders":
+                if message.get("type") == "subscribed":
+                    open_orders, closed_orders = parse_arcus_order_snapshot(message)
+                    for order in [*open_orders, *closed_orders]:
+                        self._remember_order(order)
+                        await self._callback(self.on_order, order)
+                elif message.get("type") == "channel_data":
+                    order = parse_arcus_order_update(message)
                     self._remember_order(order)
                     await self._callback(self.on_order, order)
-            elif message.get("type") == "channel_data":
-                order = parse_arcus_order_update(message)
-                self._remember_order(order)
-                await self._callback(self.on_order, order)
-            return
-        if channel == "marketAttributes":
-            return
-        if channel == "accountAttributeUpdates":
-            tier = parse_arcus_account_fee_tier(message)
-            if tier is not None:
-                self.latest_fee_tier = tier
-            await self._callback(self.on_attribute, message)
+                self._mark_channel_healthy(channel)
+                return
+            if channel == "positions":
+                # Positions are consumed by the authenticated REST startup
+                # gate; the account stream still participates in the health
+                # gate and must remain independently alive.
+                self._mark_channel_healthy(channel)
+                return
+            if channel == "accountAttributeUpdates":
+                tier = parse_arcus_account_fee_tier(message)
+                if tier is not None:
+                    self.latest_fee_tier = tier
+                await self._callback(self.on_attribute, message)
+                self._mark_channel_healthy(channel)
+                return
+        except Exception as exc:
+            self._mark_channel_error(channel, exc)
 
     def _remember_order(self, order: ArcusOrderUpdate) -> None:
         for value in (order.order_id, order.client_id):
@@ -845,6 +959,10 @@ class ArcusAccountFeed:
                     self.healthy = True
                     self.ready.clear()
                     self._subscribed_channels.clear()
+                    self.channel_health = {
+                        channel: False for channel in ARCUS_ACCOUNT_SUBSCRIPTIONS
+                    }
+                    self.channel_errors.clear()
                     await self.subscribe(websocket)
                     log.info("[ARCUS] account websocket connected")
                     await self._callback(self.on_connect)

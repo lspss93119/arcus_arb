@@ -37,6 +37,7 @@ try:
         parse_arcus_order_snapshot,
         parse_arcus_order_update,
         parse_arcus_user_fill,
+        parse_arcus_user_fills,
     )
     from entropy_arb.calibration import (
         ARCUS_CALIBRATION_QTY,
@@ -807,6 +808,163 @@ def test_historical_userfills_snapshot_is_not_rehedged() -> None:
     assert live is not None
     state.calibration_client_ids.add("new-order")
     assert state.should_hedge_fill(live) is True
+
+
+def test_arcus_userfills_snapshot_unwraps_current_fills_wrapper() -> None:
+    fills = parse_arcus_user_fills({
+        "type": "subscribed",
+        "channel": "userFills",
+        "contents": {
+            "isSnapshot": True,
+            "fills": [{
+                "tradeId": "snapshot-fill",
+                "orderId": "snapshot-order",
+                "market": "SNDK-USD",
+                "side": "SELL",
+                "fillPrice": "100.25",
+                "fillSize": "0.01",
+                "createdAt": 1_001,
+            }],
+        },
+    })
+    assert len(fills) == 1
+    assert fills[0].price == Decimal("100.25")
+    assert fills[0].quantity == Decimal("0.01")
+    assert fills[0].is_snapshot is True
+
+
+def test_arcus_userfills_snapshot_preserves_each_fill_row() -> None:
+    fills = parse_arcus_user_fills({
+        "type": "subscribed",
+        "channel": "userFills",
+        "contents": {
+            "isSnapshot": True,
+            "fills": [
+                {"side": "BUY", "fillPrice": "100", "fillSize": "0.01"},
+                {"side": "SELL", "fillPrice": "101", "fillSize": "0.02"},
+            ],
+        },
+    })
+    assert [(fill.price, fill.quantity) for fill in fills] == [
+        (Decimal("100"), Decimal("0.01")),
+        (Decimal("101"), Decimal("0.02")),
+    ]
+
+
+def test_new_arcus_userfill_with_missing_or_nonfinite_price_fails_closed() -> None:
+    for price in (None, "NaN", "Infinity"):
+        with pytest.raises(ValueError, match="fill.price must be a finite decimal"):
+            parse_arcus_user_fills({
+                "type": "channel_data",
+                "channel": "userFills",
+                "contents": {
+                    "side": "BUY",
+                    "fillPrice": price,
+                    "fillSize": "0.01",
+                },
+            })
+
+
+def test_malformed_historical_userfill_is_skipped_without_losing_valid_rows(
+    caplog,
+) -> None:
+    caplog.set_level("WARNING", logger="arcus-execution")
+    fills = parse_arcus_user_fills(
+        {
+            "type": "subscribed",
+            "channel": "userFills",
+            "contents": {
+                "isSnapshot": True,
+                "fills": [
+                    {"side": "SELL", "fillPrice": None, "fillSize": "0.01"},
+                    {"side": "SELL", "fillPrice": "100", "fillSize": "0.01"},
+                ],
+            },
+        },
+        tolerate_snapshot_errors=True,
+    )
+    assert len(fills) == 1
+    assert fills[0].price == Decimal("100")
+    assert "skipped malformed historical userFills row" in caplog.text
+
+
+def test_malformed_userfills_does_not_block_account_attribute_updates() -> None:
+    feed = ArcusAccountFeed(ADDRESS, "SNDK-USD")
+
+    async def exercise() -> None:
+        await feed._handle_message({
+            "type": "subscribed",
+            "channel": "userFills",
+            "contents": {
+                "isSnapshot": True,
+                "fills": [{
+                    "side": "SELL",
+                    "fillPrice": None,
+                    "fillSize": "0.01",
+                }],
+            },
+        })
+        await feed._handle_message({
+            "type": "subscribed",
+            "channel": "accountAttributeUpdates",
+            "contents": {
+                "isSnapshot": True,
+                "entries": [{
+                    "type": "feeTier",
+                    "feeTierLevel": 2,
+                    "makerFeePpm": 200,
+                    "takerFeePpm": 500,
+                }],
+            },
+        })
+
+    asyncio.run(exercise())
+    assert feed.latest_fee_tier is not None
+    assert feed.latest_fee_tier.level == 2
+    assert feed.channel_health["userFills"] is False
+    assert feed.channel_health["accountAttributeUpdates"] is True
+    assert "userFills" in feed.channel_errors
+
+
+def test_required_account_channel_error_blocks_b0_market_health() -> None:
+    class HealthyBook:
+        ready = True
+        sequence_health = "OK"
+
+        @staticmethod
+        def is_fresh(_staleness: float) -> bool:
+            return True
+
+        @staticmethod
+        def best_bid() -> Decimal:
+            return Decimal("100")
+
+        @staticmethod
+        def best_ask() -> Decimal:
+            return Decimal("101")
+
+    ready = asyncio.Event()
+    ready.set()
+    controller = object.__new__(CalibrationController)
+    controller.account_feed = SimpleNamespace(
+        healthy=True,
+        ready=ready,
+        required_channels_healthy=False,
+    )
+    controller.arcus = SimpleNamespace(
+        book=HealthyBook(),
+        latest_attributes=SimpleNamespace(is_outside_rth=False),
+    )
+    controller.hedge = SimpleNamespace(
+        book=HealthyBook(),
+        ready_to_trade=lambda: True,
+    )
+    controller.metadata = SimpleNamespace(status="ONLINE")
+    controller.staleness_sec = 10.0
+
+    health = controller.market_health()
+    assert health.account_ws_healthy is False
+    assert health.can_quote is False
 
 
 def test_reconnect_snapshot_fill_after_session_watermark_is_actionable() -> None:

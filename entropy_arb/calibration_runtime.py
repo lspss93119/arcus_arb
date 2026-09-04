@@ -456,6 +456,14 @@ class CalibrationController:
                 rh_ready = bool(ready_to_trade())
             except Exception:
                 rh_ready = False
+        account_channels_healthy = getattr(
+            self.account_feed, "required_channels_healthy", True
+        )
+        if callable(account_channels_healthy):
+            try:
+                account_channels_healthy = bool(account_channels_healthy())
+            except Exception:
+                account_channels_healthy = False
         return MarketHealth(
             arcus_l2_healthy=(
                 bool(getattr(self.arcus.book, "ready", False))
@@ -471,6 +479,7 @@ class CalibrationController:
             account_ws_healthy=bool(
                 getattr(self.account_feed, "healthy", False)
                 and getattr(self.account_feed, "ready", asyncio.Event()).is_set()
+                and account_channels_healthy
             ),
             arcus_sequence_state=str(
                 getattr(self.arcus.book, "sequence_health", "STALE")
