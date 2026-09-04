@@ -57,6 +57,7 @@ try:
     from entropy_arb.calibration_runtime import (
         CalibrationController,
         CalibrationTelemetry,
+        fetch_lighter_open_orders,
         resolve_verified_rh_fee_bps,
     )
     from entropy_arb.book import OrderBook
@@ -242,6 +243,128 @@ def test_lighter_fee_tick_conversion_uses_official_fee_tick_scale() -> None:
     assert LIGHTER_FEE_TICK_SCALE == 1_000_000
     assert lighter_fee_tick_to_bps(100) == Decimal("1")
     assert lighter_fee_tick_to_bps(280) == Decimal("2.8")
+
+
+def _fake_rh_open_orders_venue(response: Any):
+    calls: list[dict[str, Any]] = []
+    rh_host = "https://api.rh.lighter.xyz"
+
+    class FakeOrderApi:
+        async def account_active_orders(
+            self,
+            authorization: str,
+            account_index: int,
+            market_id: int | None = None,
+            market_type: str | None = None,
+        ) -> Any:
+            calls.append({
+                "authorization": authorization,
+                "account_index": account_index,
+                "market_id": market_id,
+                "market_type": market_type,
+            })
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+    class FakeSigner:
+        account_index = 42
+        order_api = FakeOrderApi()
+        api_client = SimpleNamespace(
+            configuration=SimpleNamespace(host=rh_host),
+        )
+
+        def create_auth_token_with_expiry(self, **kwargs: Any):
+            assert kwargs == {"api_key_index": 3}
+            return "auth-token", None
+
+    venue = SimpleNamespace(
+        name="RH",
+        profile=SimpleNamespace(name="robinhood", api_url=rh_host),
+        signer=FakeSigner(),
+        conf=SimpleNamespace(
+            lighter_creds=SimpleNamespace(account_index=42, api_key_index=3),
+        ),
+        market_id=32,
+        # This must never be used by the RH preflight helper.
+        arcus_market_id=33,
+    )
+    return venue, calls
+
+
+def test_rh_open_orders_uses_authenticated_official_api_and_rh_market_id() -> None:
+    venue, calls = _fake_rh_open_orders_venue(
+        SimpleNamespace(orders=[]),
+    )
+
+    assert asyncio.run(fetch_lighter_open_orders(venue)) == []
+    assert calls == [{
+        "authorization": "auth-token",
+        "account_index": 42,
+        "market_id": 32,
+        "market_type": None,
+    }]
+
+
+def test_rh_open_orders_sndk_order_blocks_startup_gate() -> None:
+    venue, _ = _fake_rh_open_orders_venue({
+        "code": 200,
+        "orders": [{"market_index": 32, "order_id": "rh-sndk"}],
+    })
+
+    rows = asyncio.run(fetch_lighter_open_orders(venue))
+    assert len(rows) == 1
+    assert rows[0]["order_id"] == "rh-sndk"
+
+
+def test_rh_open_orders_ignores_unrelated_market_response_row() -> None:
+    venue, _ = _fake_rh_open_orders_venue({
+        "code": 200,
+        "orders": [{"market_index": 99, "order_id": "other-market"}],
+    })
+
+    assert asyncio.run(fetch_lighter_open_orders(venue)) == []
+
+
+def test_rh_open_orders_400_fails_closed_with_result_code() -> None:
+    class FakeApiError(Exception):
+        status = 400
+        body = '{"code": 20001, "message": "invalid active-order request"}'
+
+    venue, _ = _fake_rh_open_orders_venue(FakeApiError())
+    with pytest.raises(RuntimeError, match=r"status=400.*code=20001"):
+        asyncio.run(fetch_lighter_open_orders(venue))
+
+
+def test_rh_open_orders_account_index_mismatch_fails_closed() -> None:
+    venue, calls = _fake_rh_open_orders_venue(SimpleNamespace(orders=[]))
+    venue.signer.account_index = 43
+
+    with pytest.raises(RuntimeError, match="account index mismatch"):
+        asyncio.run(fetch_lighter_open_orders(venue))
+    assert calls == []
+
+
+def test_rh_open_orders_account_limits_identity_mismatch_fails_closed() -> None:
+    venue, calls = _fake_rh_open_orders_venue(SimpleNamespace(orders=[]))
+    venue.account_limits = SimpleNamespace(account_index=43)
+
+    with pytest.raises(RuntimeError, match="mismatch with accountLimits"):
+        asyncio.run(fetch_lighter_open_orders(venue))
+    assert calls == []
+
+
+def test_rh_open_orders_rejects_non_robinhood_or_standard_host() -> None:
+    venue, calls = _fake_rh_open_orders_venue(SimpleNamespace(orders=[]))
+    venue.profile = SimpleNamespace(
+        name="mainnet",
+        api_url="https://mainnet.zklighter.elliot.ai",
+    )
+    venue.signer.api_client.configuration.host = venue.profile.api_url
+
+    with pytest.raises(RuntimeError, match="Robinhood deployment host"):
+        asyncio.run(fetch_lighter_open_orders(venue))
+    assert calls == []
 
 
 def test_rh_fee_gate_never_falls_back_to_public_orderbook_fee() -> None:

@@ -8,6 +8,7 @@ Lighter execution is delegated to the existing :class:`LighterVenue`.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -45,6 +46,9 @@ from .storage import ArcusCalibrationEventRow, MarketHistoryStore
 from .venue_lighter import LighterAccountLimits
 
 log = logging.getLogger("arcus-calibration")
+
+RH_API_URL = "https://api.rh.lighter.xyz"
+RH_PROFILE_NAME = "robinhood"
 
 
 def _decimal(value: Any, field: str) -> Decimal:
@@ -1302,23 +1306,164 @@ class CalibrationController:
 
 
 async def fetch_lighter_open_orders(hedge: Any) -> list[Mapping[str, Any]]:
-    """Read RH active orders for the startup gate without changing its adapter."""
+    """Read RH active orders through the authenticated official SDK API.
+
+    The Lighter REST endpoint is account-scoped.  Keep this preflight on the
+    Robinhood deployment and use the same signer/token identity as the
+    preceding authenticated ``accountLimits`` request.  This helper remains
+    read-only and never uses the Lighter order mutation methods.
+    """
     creds = getattr(getattr(hedge, "conf", None), "lighter_creds", None)
     account_index = getattr(creds, "account_index", None)
-    if account_index is None:
+    api_key_index = getattr(creds, "api_key_index", None)
+    if account_index is None or api_key_index is None:
         raise RuntimeError("RH account index is required to verify open orders")
-    payload = await hedge._get(
-        "/api/v1/accountActiveOrders",
-        {
-            "account_index": account_index,
-            "market_id": int(hedge.market_id),
-        },
+    if isinstance(account_index, bool) or not isinstance(account_index, int):
+        raise RuntimeError("RH account index is invalid")
+    if isinstance(api_key_index, bool) or not isinstance(api_key_index, int):
+        raise RuntimeError("RH API key index is invalid")
+
+    profile = getattr(hedge, "profile", None)
+    if (
+        getattr(profile, "name", None) != RH_PROFILE_NAME
+        or getattr(profile, "api_url", None) != RH_API_URL
+    ):
+        raise RuntimeError(
+            "RH open-order verification requires the Robinhood deployment host"
+        )
+
+    signer = getattr(hedge, "signer", None)
+    if signer is None:
+        raise RuntimeError("RH open-order verification requires signer")
+    if getattr(signer, "account_index", None) != account_index:
+        raise RuntimeError("RH account index mismatch between signer and request")
+    signer_host = getattr(
+        getattr(getattr(signer, "api_client", None), "configuration", None),
+        "host",
+        None,
     )
-    if not isinstance(payload, Mapping):
-        raise RuntimeError("RH active-order response is not an object")
-    rows = payload.get("orders", payload.get("active_orders"))
+    if signer_host != RH_API_URL:
+        raise RuntimeError("RH signer deployment host mismatch")
+
+    account_limits = getattr(hedge, "account_limits", None)
+    limits_account_index = getattr(account_limits, "account_index", account_index)
+    if limits_account_index != account_index:
+        raise RuntimeError("RH account index mismatch with accountLimits")
+
+    market_id = getattr(hedge, "market_id", None)
+    if isinstance(market_id, bool) or not isinstance(market_id, int) or market_id < 0:
+        raise RuntimeError("RH SNDK market id is invalid")
+
+    order_api = getattr(signer, "order_api", None)
+    account_active_orders = getattr(order_api, "account_active_orders", None)
+    if not callable(account_active_orders):
+        raise RuntimeError("official Lighter OrderApi is unavailable")
+    try:
+        auth, auth_error = signer.create_auth_token_with_expiry(
+            api_key_index=api_key_index
+        )
+    except Exception:
+        raise RuntimeError(
+            "RH accountActiveOrders authentication failed"
+        ) from None
+    if auth_error is not None or not auth:
+        raise RuntimeError("RH accountActiveOrders authentication failed")
+
+    try:
+        response = await account_active_orders(
+            authorization=auth,
+            account_index=account_index,
+            market_id=market_id,
+            market_type=None,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "RH accountActiveOrders request failed "
+            + _lighter_api_error_detail(exc)
+        ) from None
+
+    rows = _lighter_active_order_rows(response)
+    result: list[Mapping[str, Any]] = []
+    for row in rows:
+        if _lighter_order_market_id(row) == market_id:
+            result.append(row)
+    return result
+
+
+def _lighter_active_order_rows(response: Any) -> list[Mapping[str, Any]]:
+    """Normalize an official ``Orders`` model or a test transport mapping."""
+    if isinstance(response, Mapping):
+        code = response.get("code")
+        rows = response.get("orders", response.get("active_orders"))
+    else:
+        code = getattr(response, "code", None)
+        rows = getattr(response, "orders", None)
+        if rows is None and hasattr(response, "to_dict"):
+            converted = response.to_dict()
+            if isinstance(converted, Mapping):
+                code = converted.get("code", code)
+                rows = converted.get(
+                    "orders", converted.get("active_orders")
+                )
+    if code is not None and code != 200:
+        raise RuntimeError(f"RH active-order response returned code={code}")
     if rows is None:
         raise RuntimeError("RH active-order response omitted its order array")
     if not isinstance(rows, list):
         raise RuntimeError("RH active-order response has an invalid order array")
-    return [row for row in rows if isinstance(row, Mapping)]
+
+    normalized: list[Mapping[str, Any]] = []
+    for row in rows:
+        if isinstance(row, Mapping):
+            normalized.append(row)
+            continue
+        converted = None
+        if hasattr(row, "to_dict"):
+            converted = row.to_dict()
+        elif hasattr(row, "model_dump"):
+            converted = row.model_dump(by_alias=True)
+        if not isinstance(converted, Mapping):
+            raise RuntimeError("RH active-order response has an invalid order")
+        normalized.append(converted)
+    return normalized
+
+
+def _lighter_order_market_id(row: Mapping[str, Any]) -> int:
+    for key in ("market_id", "marketId", "market_index", "marketIndex"):
+        if key not in row:
+            continue
+        value = row[key]
+        if isinstance(value, bool):
+            break
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            break
+    raise RuntimeError("RH active-order row omitted a valid market id")
+
+
+def _lighter_api_error_detail(exc: Exception) -> str:
+    """Keep status/ResultCode detail without echoing exception/token text."""
+    parts: list[str] = []
+    status = getattr(exc, "status", None)
+    if status is not None:
+        parts.append(f"status={status}")
+
+    body = getattr(exc, "body", None)
+    if body is not None and hasattr(body, "to_dict"):
+        body = body.to_dict()
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", errors="replace")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (TypeError, ValueError):
+            body = None
+    if isinstance(body, Mapping):
+        for key in ("code", "result_code", "resultCode", "message", "error", "msg"):
+            if key not in body:
+                continue
+            value = body[key]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                parts.append(f"{key}={value}")
+    return " ".join(parts) if parts else "status=unknown"
