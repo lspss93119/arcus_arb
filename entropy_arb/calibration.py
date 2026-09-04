@@ -371,10 +371,6 @@ class SessionRisk:
     def on_telemetry_failure(self, reason: str) -> None:
         self.halt(f"telemetry failure: {reason}")
 
-    def on_rth_transition(self, lifecycle: CalibrationLifecycle) -> None:
-        lifecycle.request_cancel()
-        self.halt("Arcus transitioned outside RTH")
-
     def on_arcus_disconnect(self, lifecycle: CalibrationLifecycle) -> None:
         lifecycle.request_cancel()
         self.halt("Arcus account websocket disconnected")
@@ -393,7 +389,7 @@ class MarketHealth:
     bbo_fresh: bool
     account_ws_healthy: bool
     arcus_sequence_state: str
-    outside_rth: bool
+    outside_rth: bool | None
     arcus_status: str = "ONLINE"
     active_resync: bool = False
 
@@ -406,7 +402,6 @@ class MarketHealth:
             and self.account_ws_healthy
             and self.arcus_sequence_state.upper() == "OK"
             and not self.active_resync
-            and not self.outside_rth
             and self.arcus_status.upper() == "ONLINE"
         )
 

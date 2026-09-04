@@ -121,6 +121,7 @@ class PreOrderState:
     rh_ask: Decimal | None
     premium_bps: Decimal | None
     center_bps: Decimal
+    center_source: str
     proposed_quote: QuoteCandidate | None
     outside_rth: bool | None
     limits: SessionLimits
@@ -159,6 +160,8 @@ class CalibrationTelemetry:
         "actual_usd", "remaining_arcus_qty", "unhedged_residual_qty",
         "halt_reason", "account_sequence_id", "rh_order_send_ts_ms",
         "rh_ack_ts_ms", "rh_fill_receive_ts_ms", "rh_realized_slippage_bps",
+        "is_outside_rth", "center_bps", "center_source",
+        "arcus_maker_fee_bps", "rh_taker_fee_bps",
     )
 
     def __init__(
@@ -171,6 +174,7 @@ class CalibrationTelemetry:
         pnl: CalibrationPnL,
         accumulator: FillAccumulator,
         session_limits: SessionLimits,
+        context_provider: Any | None = None,
     ) -> None:
         self.store = store
         self.session_id = session_id
@@ -179,33 +183,38 @@ class CalibrationTelemetry:
         self.pnl = pnl
         self.accumulator = accumulator
         self.session_limits = session_limits
+        self.context_provider = context_provider
         self.events_written = 0
 
     def record(self, event_type: str, **values: Any) -> None:
         row_values: dict[str, Any] = {field: None for field in self._FIELDS}
-        row_values.update(values)
-        lifecycle_state = values.get("lifecycle_state", self.lifecycle.state)
-        row_values.update({
-            "session_id": self.session_id,
-            "execution_id": values.get("execution_id") or self.session_id,
-            "event_type": event_type,
-            "event_ts_ms": int(values.get("event_ts_ms", time.time() * 1000)),
-            "event_local_receive_monotonic_ns": values.get(
-                "event_local_receive_monotonic_ns", time.monotonic_ns()
-            ),
-            "lifecycle_state": lifecycle_state,
-        })
-        if row_values["remaining_arcus_qty"] is None:
-            row_values["remaining_arcus_qty"] = _text(self.lifecycle.remaining_qty)
-        if row_values["unhedged_residual_qty"] is None:
-            row_values["unhedged_residual_qty"] = _text(
-                self.accumulator.residual_exposure
-            )
-        if row_values["actual_usd"] is None:
-            row_values["actual_usd"] = _text(self.pnl.actual_usd)
-        if row_values["halt_reason"] is None:
-            row_values["halt_reason"] = self.risk.halt_reason
         try:
+            if self.context_provider is not None:
+                row_values.update(self.context_provider())
+            row_values.update(values)
+            lifecycle_state = values.get("lifecycle_state", self.lifecycle.state)
+            row_values.update({
+                "session_id": self.session_id,
+                "execution_id": values.get("execution_id") or self.session_id,
+                "event_type": event_type,
+                "event_ts_ms": int(values.get("event_ts_ms", time.time() * 1000)),
+                "event_local_receive_monotonic_ns": values.get(
+                    "event_local_receive_monotonic_ns", time.monotonic_ns()
+                ),
+                "lifecycle_state": lifecycle_state,
+            })
+            if row_values["remaining_arcus_qty"] is None:
+                row_values["remaining_arcus_qty"] = _text(self.lifecycle.remaining_qty)
+            if row_values["unhedged_residual_qty"] is None:
+                row_values["unhedged_residual_qty"] = _text(
+                    self.accumulator.residual_exposure
+                )
+            if row_values["actual_usd"] is None:
+                row_values["actual_usd"] = _text(self.pnl.actual_usd)
+            if row_values["halt_reason"] is None:
+                row_values["halt_reason"] = self.risk.halt_reason
+            if row_values["arcus_fee_is_estimated"] is None:
+                row_values["arcus_fee_is_estimated"] = False
             self.store.append_arcus_calibration_event(
                 ArcusCalibrationEventRow(**row_values)
             )
@@ -298,6 +307,7 @@ class CalibrationController:
             pnl=self.pnl,
             accumulator=self.accumulator,
             session_limits=self.limits,
+            context_provider=self._telemetry_context,
         )
         self.calibration_prefix = f"b0-{self.session_id[-8:]}-"
         self.current_execution_id: str | None = None
@@ -316,6 +326,35 @@ class CalibrationController:
         # fills includes all of their Arcus proceeds/costs exactly once.
         self._matched_pnl_checkpoint = Decimal("0")
         self._last_hedge_matched = False
+
+    def center_source(self) -> str:
+        """Return the center provenance used by the current B0 calculation."""
+        mode = getattr(self.strategy, "center_mode", None)
+        if mode == "rolling":
+            return (
+                "rolling"
+                if bool(getattr(self.strategy, "_rolling_ready", False))
+                else "fallback"
+            )
+        if getattr(self.strategy, "requires_observations", False):
+            state = self.strategy.state()
+            return (
+                "rolling"
+                if getattr(state, "ready", False)
+                and getattr(state, "center_bps", None) is not None
+                else "fallback"
+            )
+        return "fallback"
+
+    def _telemetry_context(self) -> dict[str, Any]:
+        attributes = getattr(self.arcus, "latest_attributes", None)
+        return {
+            "is_outside_rth": getattr(attributes, "is_outside_rth", None),
+            "center_bps": _text(self.center_bps()),
+            "center_source": self.center_source(),
+            "arcus_maker_fee_bps": _text(self.arcus_maker_fee_bps),
+            "rh_taker_fee_bps": _text(self.rh_taker_fee_bps),
+        }
 
     @property
     def has_live_order(self) -> bool:
@@ -399,9 +438,13 @@ class CalibrationController:
 
     def market_health(self) -> MarketHealth:
         attributes = getattr(self.arcus, "latest_attributes", None)
-        # B0 requires an explicit false value.  Unknown is not equivalent to
-        # regular trading hours and therefore blocks quoting.
-        outside_rth = attributes is None or attributes.is_outside_rth is not False
+        # RTH state is recorded as regime telemetry.  It is intentionally not
+        # a quote gate in B0; market status, feed freshness, and sequence
+        # health remain strict gates below.
+        outside_rth = (
+            getattr(attributes, "is_outside_rth", None)
+            if attributes is not None else None
+        )
         rh_ready = True
         ready_to_trade = getattr(self.hedge, "ready_to_trade", None)
         if callable(ready_to_trade):
@@ -518,6 +561,7 @@ class CalibrationController:
             rh_ask=ra,
             premium_bps=self.current_premium_bps(),
             center_bps=self.center_bps(),
+            center_source=self.center_source(),
             proposed_quote=self.proposed_quote(),
             outside_rth=(
                 getattr(getattr(self.arcus, "latest_attributes", None),
@@ -1128,9 +1172,7 @@ class CalibrationController:
     async def step(self) -> QuoteCandidate | None:
         self.risk.check_runtime()
         health = self.market_health()
-        if health.outside_rth:
-            self.risk.on_rth_transition(self.lifecycle)
-        elif not health.can_quote and self.has_live_order:
+        if not health.can_quote and self.has_live_order:
             self.risk.halt("market health gate failed")
             self.lifecycle.request_cancel()
         if self._cancel_pending and self.account_feed.healthy:

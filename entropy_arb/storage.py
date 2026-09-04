@@ -265,6 +265,11 @@ class ArcusCalibrationEventRow:
     rh_fill_receive_ts_ms: int | None = None
     rh_realized_slippage_bps: str | None = None
     arcus_fee_is_estimated: bool = False
+    is_outside_rth: bool | None = None
+    center_bps: str | None = None
+    center_source: str | None = None
+    arcus_maker_fee_bps: str | None = None
+    rh_taker_fee_bps: str | None = None
     id: int | None = None
 
 
@@ -347,7 +352,8 @@ _SPECS = {
         "remaining_arcus_qty", "unhedged_residual_qty", "lifecycle_state",
         "halt_reason", "account_sequence_id", "rh_order_send_ts_ms",
         "rh_ack_ts_ms", "rh_fill_receive_ts_ms", "rh_realized_slippage_bps",
-        "arcus_fee_is_estimated")),
+        "arcus_fee_is_estimated", "is_outside_rth", "center_bps",
+        "center_source", "arcus_maker_fee_bps", "rh_taker_fee_bps")),
 }
 
 _CREATE = {
@@ -445,7 +451,9 @@ _CREATE = {
         halt_reason TEXT, account_sequence_id INTEGER,
         rh_order_send_ts_ms INTEGER, rh_ack_ts_ms INTEGER,
         rh_fill_receive_ts_ms INTEGER, rh_realized_slippage_bps TEXT,
-        arcus_fee_is_estimated INTEGER NOT NULL DEFAULT 0)""",
+        arcus_fee_is_estimated INTEGER NOT NULL DEFAULT 0,
+        is_outside_rth INTEGER, center_bps TEXT, center_source TEXT,
+        arcus_maker_fee_bps TEXT, rh_taker_fee_bps TEXT)""",
 }
 
 _CALIBRATION_MIGRATION_COLUMNS = {
@@ -454,6 +462,11 @@ _CALIBRATION_MIGRATION_COLUMNS = {
     "rh_fill_receive_ts_ms": "INTEGER",
     "rh_realized_slippage_bps": "TEXT",
     "arcus_fee_is_estimated": "INTEGER NOT NULL DEFAULT 0",
+    "is_outside_rth": "INTEGER",
+    "center_bps": "TEXT",
+    "center_source": "TEXT",
+    "arcus_maker_fee_bps": "TEXT",
+    "rh_taker_fee_bps": "TEXT",
 }
 
 

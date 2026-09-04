@@ -127,9 +127,13 @@ at a fixed `0.01` quantity, one side at a time, maximum 20 Arcus fill events,
 ALO only and wait when the modeled post-hedge edge is below 4 bps; the 1.5 bps
 cancel threshold is hysteretic. A fill is hedged on RH only after it is
 authoritatively received, with residual quantities below the RH minimum kept
-visible rather than rounded up. Any account disconnect, stale/resync market,
-RTH transition, unresolved RH hedge, telemetry failure, or hard limit halts
-new quoting and explicitly reconciles/cancels the known Arcus order.
+visible rather than rounded up. Outside-RTH state is recorded as regime
+telemetry and is not by itself a B0 quote blocker. Any account disconnect,
+stale/resync market, unresolved RH hedge, telemetry failure, or hard limit
+halts new quoting and explicitly reconciles/cancels the known Arcus order.
+When rolling-center history is insufficient, B0 uses the documented `0.0` bps
+fallback and records `center_source=fallback`; a warmed center records
+`center_source=rolling`.
 
 The Arcus identity is loaded from `ARCUS_ACCOUNT_ADDRESS`,
 `ARCUS_ACCOUNT_INDEX`, and `ARCUS_API_KEY`. The canonical direct-value private

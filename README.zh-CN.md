@@ -113,8 +113,11 @@ B0 是校准实验，不是生产策略：Arcus SNDK 固定每单 `0.01`，同�
 loss、运行 60 分钟。报价只能是 LIMIT ALO；模型 post-hedge edge 低于 4 bps
 就等待，1.5 bps 为 hysteresis cancel threshold。只有权威收到 Arcus fill
 后才会通过 RH 对冲；低于 RH minimum 的 residual 会明确保留，不会向上取整。
-断线、行情 stale/resync、RTH、RH hedge 未决、telemetry 失败或任一 hard
-limit 都会停止新报价并显式 reconcile/cancel 已知 Arcus 订单。
+Outside-RTH 状态只作为 regime telemetry 记录，本身不会阻挡 B0 报价。断线、
+行情 stale/resync、RH hedge 未决、telemetry 失败或任一 hard limit 都会停止
+新报价并显式 reconcile/cancel 已知 Arcus 订单。rolling center 历史不足时使用
+文档化的 `0.0` bps fallback，并记录 `center_source=fallback`；历史充分时记录
+`center_source=rolling`。
 
 Arcus 身份从 `ARCUS_ACCOUNT_ADDRESS`、`ARCUS_ACCOUNT_INDEX` 与
 `ARCUS_API_KEY` 读取。canonical 的 direct-value private key 来源是

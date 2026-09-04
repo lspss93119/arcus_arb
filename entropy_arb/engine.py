@@ -815,13 +815,14 @@ class Engine:
         )
         log.info(
             "[B0 pre-order] BBO ARCUS=%s/%s RH=%s/%s premium=%s center=%s "
-            "isOutsideRth=%s sequence=%s",
+            "center_source=%s isOutsideRth=%s sequence=%s",
             state.arcus_bid,
             state.arcus_ask,
             state.rh_bid,
             state.rh_ask,
             state.premium_bps,
             state.center_bps,
+            state.center_source,
             state.outside_rth,
             getattr(self.arcus.book, "sequence_health", "UNKNOWN"),
         )

@@ -56,9 +56,11 @@ try:
     )
     from entropy_arb.calibration_runtime import (
         CalibrationController,
+        CalibrationTelemetry,
         resolve_verified_rh_fee_bps,
     )
     from entropy_arb.book import OrderBook
+    from entropy_arb.strategy import StableBasisStrategy
     from entropy_arb.venue_lighter import (
         LighterAccountLimits,
         LighterVenue,
@@ -271,6 +273,61 @@ def test_verified_rh_fee_value_is_used_by_expected_edge_model() -> None:
         rh_slippage_allowance_bps=Decimal("2.00"),
     )
     assert edge == pytest.approx(95.79, abs=0.01)
+
+
+def test_rolling_center_warmup_uses_zero_fallback_and_can_quote() -> None:
+    strategy = StableBasisStrategy(
+        center_bps=0.0,
+        upper_bps=4.0,
+        lower_bps=4.0,
+        center_mode="rolling",
+        center_window_hours=1.0,
+        center_update_minutes=60,
+    )
+    controller = object.__new__(CalibrationController)
+    controller.strategy = strategy
+
+    assert controller.center_bps() == Decimal("0")
+    assert controller.center_source() == "fallback"
+    assert choose_quote(
+        build_quote_candidates(_quote_input(center_bps=controller.center_bps()))
+    ) is not None
+
+    strategy.bootstrap([(0.0, 1.0), (3_599.0, 3.0)], now=3_600.0)
+    assert controller.center_bps() == Decimal("2")
+    assert controller.center_source() == "rolling"
+
+
+def test_calibration_telemetry_records_rth_and_center_context(tmp_path) -> None:
+    store = MarketHistoryStore(tmp_path / "history.sqlite")
+    lifecycle = CalibrationLifecycle()
+    risk = SessionRisk(SessionLimits())
+    telemetry = CalibrationTelemetry(
+        store,
+        session_id="b0-session",
+        risk=risk,
+        lifecycle=lifecycle,
+        pnl=CalibrationPnL(),
+        accumulator=FillAccumulator(rh_min_qty=RH_HEDGE_MIN_QTY),
+        session_limits=SessionLimits(),
+        context_provider=lambda: {
+            "is_outside_rth": True,
+            "center_bps": "0.0",
+            "center_source": "fallback",
+            "arcus_maker_fee_bps": "0.2",
+            "rh_taker_fee_bps": "0.0",
+        },
+    )
+
+    telemetry.record("quote_created", client_id="b0-test")
+    assert store.flush().ok
+    row = store._conn.execute(
+        "SELECT is_outside_rth, center_bps, center_source, "
+        "arcus_maker_fee_bps, rh_taker_fee_bps "
+        "FROM arcus_calibration_events"
+    ).fetchone()
+    assert row == (1, "0.0", "fallback", "0.2", "0.0")
+    store.close()
 
 
 def test_record_only_does_not_require_arcus_private_credentials() -> None:
@@ -798,22 +855,41 @@ def test_rh_timeout_halts_new_arcus_quoting() -> None:
     assert risk.halted
 
 
-def test_market_health_blocks_stale_resync_offline_and_outside_rth() -> None:
+def test_market_health_blocks_stale_resync_and_offline_but_not_outside_rth() -> None:
     assert MarketHealth(False, True, True, True, "OK", False).can_quote is False
     assert MarketHealth(True, False, True, True, "OK", False).can_quote is False
     assert MarketHealth(True, True, False, True, "OK", False).can_quote is False
     assert MarketHealth(True, True, True, False, "OK", False).can_quote is False
     assert MarketHealth(True, True, True, True, "RESYNC", False).can_quote is False
-    assert MarketHealth(True, True, True, True, "OK", True).can_quote is False
+    assert MarketHealth(True, True, True, True, "OK", True).can_quote is True
 
 
-def test_rth_transition_halts_and_cancels_quote() -> None:
+def test_outside_rth_is_regime_telemetry_only() -> None:
     lifecycle = CalibrationLifecycle()
     lifecycle.mark_placed(expected_edge_bps=Decimal("4.2"))
     risk = SessionRisk(SessionLimits())
-    risk.on_rth_transition(lifecycle)
-    assert lifecycle.state == "CANCEL_SENT"
-    assert risk.halted
+    health = MarketHealth(True, True, True, True, "OK", True)
+    assert health.can_quote
+    assert lifecycle.state == "OPEN"
+    assert not risk.halted
+
+
+def test_b0_step_does_not_halt_on_outside_rth() -> None:
+    controller = object.__new__(CalibrationController)
+    controller.risk = SessionRisk(SessionLimits())
+    controller.lifecycle = CalibrationLifecycle()
+    controller.account_feed = SimpleNamespace(healthy=True)
+    controller._cancel_pending = False
+    controller._terminal_reconcile_pending = False
+    controller.current_candidate = None
+    controller.accumulator = FillAccumulator(rh_min_qty=RH_HEDGE_MIN_QTY)
+    controller.proposed_quote = lambda: None
+    controller.market_health = lambda: MarketHealth(
+        True, True, True, True, "OK", True
+    )
+
+    asyncio.run(controller.step())
+    assert not controller.risk.halted
 
 
 def test_session_limits_stop_at_fill_count_notional_loss_and_runtime() -> None:
