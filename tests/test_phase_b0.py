@@ -59,6 +59,13 @@ try:
         resolve_verified_rh_fee_bps,
     )
     from entropy_arb.book import OrderBook
+    from entropy_arb.venue_lighter import (
+        LighterAccountLimits,
+        LighterVenue,
+        LIGHTER_FEE_TICK_SCALE,
+        lighter_fee_tick_to_bps,
+        parse_lighter_account_limits,
+    )
     from entropy_arb.storage import ArcusCalibrationEventRow, MarketHistoryStore
 except ImportError as exc:  # RED phase: the new public API is not present yet.
     _IMPORT_ERROR = exc
@@ -122,31 +129,139 @@ def test_missing_arcus_credentials_fails_before_order_submission() -> None:
         ArcusCredentials.from_env({})
 
 
-@pytest.mark.parametrize(
-    ("fee_bps", "verified", "expected"),
-    (
-        (Decimal("0.0"), True, Decimal("0.0")),
-        (Decimal("1.25"), True, Decimal("1.25")),
-        (Decimal("0.0"), False, None),
-    ),
-)
-def test_rh_fee_gate_requires_verification_not_positive_value(
-    fee_bps: Decimal, verified: bool, expected: Decimal | None
-) -> None:
+def _account_limits_payload(
+    *,
+    user_tier: str = "standard",
+    user_tier_name: str = "Standard",
+    maker_tick: int = 0,
+    taker_tick: int = 0,
+) -> dict[str, Any]:
+    return {
+        "code": 200,
+        "user_tier": user_tier,
+        "user_tier_name": user_tier_name,
+        "current_maker_fee_tick": maker_tick,
+        "current_taker_fee_tick": taker_tick,
+        "max_llp_percentage": 100,
+        "can_create_public_pool": False,
+        "max_llp_amount": "0.000000",
+        "effective_lit_stakes": "0.00000000",
+        "leased_lit": "0.00000000",
+    }
+
+
+def test_lighter_standard_zero_fee_is_verified_from_account_limits() -> None:
+    limits = parse_lighter_account_limits(_account_limits_payload())
+    assert isinstance(limits, LighterAccountLimits)
     hedge = SimpleNamespace(
-        fee_bps=fee_bps,
-        fee_bps_verified=verified,
+        fee_bps=Decimal("123.45"),
+        fee_bps_verified=False,
     )
-    if expected is None:
-        with pytest.raises(RuntimeError, match="verified RH"):
-            resolve_verified_rh_fee_bps(hedge)
-    else:
-        assert resolve_verified_rh_fee_bps(hedge) == expected
+    assert resolve_verified_rh_fee_bps(hedge, limits) == Decimal("0")
+    assert hedge.fee_bps == Decimal("0")
+    assert hedge.fee_bps_verified is True
+    assert hedge.fee_source == "accountLimits"
+
+
+def test_lighter_premium_fee_uses_account_limits_ticks() -> None:
+    limits = parse_lighter_account_limits(_account_limits_payload(
+        user_tier="premium",
+        user_tier_name="Premium",
+        maker_tick=40,
+        taker_tick=280,
+    ))
+    hedge = SimpleNamespace(fee_bps=Decimal("0"), fee_bps_verified=False)
+    assert resolve_verified_rh_fee_bps(hedge, limits) == Decimal("2.8")
+    assert limits.maker_fee_bps == Decimal("0.4")
+    assert limits.taker_fee_bps == Decimal("2.8")
+
+
+def test_lighter_account_limits_malformed_fails_closed() -> None:
+    payload = _account_limits_payload()
+    del payload["current_taker_fee_tick"]
+    with pytest.raises(ValueError, match="current_taker_fee_tick"):
+        parse_lighter_account_limits(payload)
+
+
+def test_lighter_account_limits_auth_failure_fails_closed() -> None:
+    class FailedSigner:
+        def create_auth_token_with_expiry(self):
+            return None, "authentication failed"
+
+    venue = object.__new__(LighterVenue)
+    venue.name = "RH"
+    venue.signer = FailedSigner()
+    venue.conf = SimpleNamespace(
+        lighter_creds=SimpleNamespace(account_index=7, api_key_index=3),
+    )
+    with pytest.raises(RuntimeError, match="accountLimits authentication"):
+        asyncio.run(venue.fetch_account_limits())
+
+
+def test_lighter_account_limits_uses_authenticated_account_index() -> None:
+    class Signer:
+        def create_auth_token_with_expiry(self, **kwargs):
+            assert kwargs == {"api_key_index": 3}
+            return "auth-token", None
+
+    calls: list[tuple[str, dict, dict]] = []
+
+    async def fake_get(
+        path: str, params: dict | None = None, headers: dict | None = None
+    ) -> dict:
+        calls.append((path, params or {}, headers or {}))
+        return _account_limits_payload()
+
+    venue = object.__new__(LighterVenue)
+    venue.name = "RH"
+    venue.signer = Signer()
+    venue.conf = SimpleNamespace(
+        lighter_creds=SimpleNamespace(account_index=42, api_key_index=3),
+    )
+    venue._get = fake_get
+    limits = asyncio.run(venue.fetch_account_limits())
+    assert limits.user_tier == "standard"
+    assert calls == [(
+        "/api/v1/accountLimits",
+        {"account_index": 42},
+        {"Authorization": "auth-token"},
+    )]
+
+
+def test_lighter_unknown_account_tier_fails_closed() -> None:
+    with pytest.raises(ValueError, match="unknown Lighter account tier"):
+        parse_lighter_account_limits(_account_limits_payload(
+            user_tier="mystery",
+            user_tier_name="Mystery",
+        ))
+
+
+def test_lighter_fee_tick_conversion_uses_official_fee_tick_scale() -> None:
+    assert LIGHTER_FEE_TICK_SCALE == 1_000_000
+    assert lighter_fee_tick_to_bps(100) == Decimal("1")
+    assert lighter_fee_tick_to_bps(280) == Decimal("2.8")
+
+
+def test_rh_fee_gate_never_falls_back_to_public_orderbook_fee() -> None:
+    hedge = SimpleNamespace(
+        # This value could have come from orderBooks.taker_fee, but that is
+        # not account-specific and must never satisfy the B0 gate.
+        fee_bps=Decimal("0"),
+        fee_bps_verified=True,
+    )
+    with pytest.raises(RuntimeError, match="accountLimits"):
+        resolve_verified_rh_fee_bps(hedge, None)
 
 
 def test_verified_rh_fee_value_is_used_by_expected_edge_model() -> None:
-    hedge = SimpleNamespace(fee_bps=Decimal("1.25"), fee_bps_verified=True)
-    verified_fee = resolve_verified_rh_fee_bps(hedge)
+    hedge = SimpleNamespace(fee_bps=Decimal("1.25"), fee_bps_verified=False)
+    limits = parse_lighter_account_limits(_account_limits_payload(
+        user_tier="premium",
+        user_tier_name="Premium",
+        maker_tick=40,
+        taker_tick=125,
+    ))
+    verified_fee = resolve_verified_rh_fee_bps(hedge, limits)
     edge = expected_edge_bps(
         side="SELL",
         arcus_price=Decimal("101.00"),

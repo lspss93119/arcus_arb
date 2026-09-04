@@ -18,7 +18,9 @@ import logging
 import math
 import time
 from collections import OrderedDict
-from typing import Optional
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any, Mapping, Optional
 
 import aiohttp
 
@@ -36,6 +38,86 @@ log = logging.getLogger("lighter")
 OPEN_STATUSES = {"in-progress", "pending", "open"}
 AUTH_REFRESH_SEC = 8 * 60
 REST_TIMEOUT = 10.0
+
+# Lighter's protocol fee unit is the same ``FeeTick`` used by the official
+# lighter-go reference implementation: 1,000,000 fee ticks represent a 1.0
+# rate.  A basis point is 1/10,000 of a rate, hence 100 fee ticks = 1 bps.
+LIGHTER_FEE_TICK_SCALE = 1_000_000
+LIGHTER_ACCOUNT_TIERS = frozenset(("standard", "premium", "plus"))
+
+
+@dataclass(frozen=True)
+class LighterAccountLimits:
+    """Authenticated, account-specific fee state returned by accountLimits."""
+
+    user_tier: str
+    user_tier_name: str
+    current_maker_fee_tick: int
+    current_taker_fee_tick: int
+    maker_fee_bps: Decimal
+    taker_fee_bps: Decimal
+    source: str = "accountLimits"
+
+
+def lighter_fee_tick_to_bps(fee_tick: int) -> Decimal:
+    """Convert an official Lighter fee tick to basis points exactly."""
+    if isinstance(fee_tick, bool) or not isinstance(fee_tick, int):
+        raise ValueError("Lighter fee tick must be an integer")
+    if not 0 <= fee_tick <= LIGHTER_FEE_TICK_SCALE:
+        raise ValueError("Lighter fee tick is outside the valid range")
+    return (Decimal(fee_tick) * Decimal("10000") /
+            Decimal(LIGHTER_FEE_TICK_SCALE))
+
+
+def _required_account_limit_int(
+    payload: Mapping[str, Any], field: str
+) -> int:
+    value = payload.get(field)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"accountLimits.{field} must be an integer")
+    return value
+
+
+def parse_lighter_account_limits(
+    payload: Mapping[str, Any],
+) -> LighterAccountLimits:
+    """Validate and normalize an authenticated ``accountLimits`` response.
+
+    The public ``orderBooks.taker_fee`` is intentionally not accepted here:
+    only this account-scoped response can establish B0 fee verification.
+    """
+    if not isinstance(payload, Mapping):
+        raise ValueError("accountLimits response must be an object")
+
+    code = _required_account_limit_int(payload, "code")
+    if code != 200:
+        raise ValueError(f"accountLimits returned code={code}")
+
+    raw_tier = payload.get("user_tier")
+    raw_tier_name = payload.get("user_tier_name")
+    if not isinstance(raw_tier, str) or not raw_tier.strip():
+        raise ValueError("accountLimits.user_tier is missing")
+    if not isinstance(raw_tier_name, str) or not raw_tier_name.strip():
+        raise ValueError("accountLimits.user_tier_name is missing")
+
+    user_tier = raw_tier.strip().lower()
+    if user_tier not in LIGHTER_ACCOUNT_TIERS:
+        raise ValueError(f"unknown Lighter account tier: {raw_tier!r}")
+
+    maker_tick = _required_account_limit_int(
+        payload, "current_maker_fee_tick"
+    )
+    taker_tick = _required_account_limit_int(
+        payload, "current_taker_fee_tick"
+    )
+    return LighterAccountLimits(
+        user_tier=user_tier,
+        user_tier_name=raw_tier_name.strip(),
+        current_maker_fee_tick=maker_tick,
+        current_taker_fee_tick=taker_tick,
+        maker_fee_bps=lighter_fee_tick_to_bps(maker_tick),
+        taker_fee_bps=lighter_fee_tick_to_bps(taker_tick),
+    )
 
 
 class AccountOrdersFeed:
@@ -168,17 +250,26 @@ class LighterVenue:
         self.min_quote = 10.0
         self.signer = None
         # ``fee_bps`` is usable by B0 only when its account/venue source has
-        # been explicitly verified in configuration.  In particular, zero is
-        # a valid verified fee and must not be confused with the default.
+        # been explicitly verified from authenticated accountLimits.  In
+        # particular, zero is a valid verified fee and must not be confused
+        # with the configured default.
         self.fee_bps_verified = bool(getattr(conf, "fee_bps_verified", False))
+        self.fee_source: str | None = None
+        self.account_limits: LighterAccountLimits | None = None
         self.orders_feed: Optional[AccountOrdersFeed] = None
         self._coi = int(time.time() * 1000)
 
     # ------------------------------------------------------------------ REST
 
-    async def _get(self, path: str, params: Optional[dict] = None):
+    async def _get(
+        self,
+        path: str,
+        params: Optional[dict] = None,
+        headers: Optional[dict[str, str]] = None,
+    ):
         async with self.session.get(
                 self.profile.api_url + path, params=params,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=REST_TIMEOUT)) as r:
             r.raise_for_status()
             return await r.json()
@@ -198,7 +289,8 @@ class LighterVenue:
             self.min_base = float(ob["min_base_amount"])
             self.min_quote = float(ob["min_quote_amount"])
             log.info("[%s] %s market_id=%d px_dec=%d sz_dec=%d min_base=%s "
-                     "min_quote=%s taker_fee=%s", self.name, ob["symbol"],
+                     "min_quote=%s public_taker_fee_unverified=%s",
+                     self.name, ob["symbol"],
                      self.market_id, self.price_decimals, self.size_decimals,
                      ob["min_base_amount"], ob["min_quote_amount"],
                      ob.get("taker_fee"))
@@ -227,6 +319,56 @@ class LighterVenue:
             raise RuntimeError(f"[{self.name}] API key check failed: {err}")
         self.signer = signer
         log.info("[%s] signer ready (account %d)", self.name, c.account_index)
+
+    async def fetch_account_limits(self) -> LighterAccountLimits:
+        """Fetch and verify this account's current Lighter fee state.
+
+        ``accountLimits`` is authenticated with the official SDK auth token.
+        The public orderBooks fee is deliberately not used as a fallback,
+        because it is venue/market metadata rather than account state.
+        """
+        c = self.conf.lighter_creds
+        if (
+            c is None
+            or c.account_index is None
+            or c.api_key_index is None
+        ):
+            raise RuntimeError(
+                f"[{self.name}] accountLimits requires Lighter credentials"
+            )
+        if self.signer is None:
+            raise RuntimeError(
+                f"[{self.name}] accountLimits authentication requires signer"
+            )
+        try:
+            auth, err = self.signer.create_auth_token_with_expiry(
+                api_key_index=c.api_key_index
+            )
+        except Exception:
+            raise RuntimeError(
+                f"[{self.name}] accountLimits authentication failed"
+            ) from None
+        if err is not None or not auth:
+            raise RuntimeError(
+                f"[{self.name}] accountLimits authentication failed"
+            )
+        try:
+            payload = await self._get(
+                "/api/v1/accountLimits",
+                params={"account_index": c.account_index},
+                headers={"Authorization": auth},
+            )
+            limits = parse_lighter_account_limits(payload)
+        except ValueError:
+            raise
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            suffix = f" status={status}" if status is not None else ""
+            raise RuntimeError(
+                f"[{self.name}] accountLimits request failed{suffix}"
+            ) from None
+        self.account_limits = limits
+        return limits
 
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
         tasks = [asyncio.create_task(

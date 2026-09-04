@@ -122,7 +122,12 @@ Arcus 身份从 `ARCUS_ACCOUNT_ADDRESS`、`ARCUS_ACCOUNT_INDEX` 与
 `ARCUS_ED25519_PRIVATE_KEY_FILE`（最后一个仍然是文件名）。不会把凭证写进
 config 或日志；credential diagnostics 只显示 `PRESENT`/`MISSING`。费率必须
 由 `GET https://api.arcus.xyz/v1/feetiers` 与 account attribute stream 解析，
-无法确定时 B0 会停止。
+无法确定时 B0 会停止。RH 费率另外通过配置的 `LIGHTER_ACCOUNT_INDEX`，使用
+官方 API key auth token 请求 authenticated `GET /api/v1/accountLimits?account_index=...`
+解析；`current_maker_fee_tick` 与 `current_taker_fee_tick` 按官方
+`FeeTick=1_000_000` 换算（100 ticks = 1 bps），包括已验证的 0 bps。public
+`orderBooks.taker_fee` 与 YAML 兼容费率都不会作为 account-specific verification；
+`accountLimits` 无法认证、解析或安全换算时 B0 会停止。
 
 当前文档的 `userFills` 流可能不携带仅存储侧的 `createdAt` 与 `fee`。B0
 仍会在可执行填单后立即使用已解析的 maker tier 费率作临时核算并执行 RH

@@ -496,14 +496,22 @@ class Engine:
             # path.  No wallet generation or registration is attempted.
             credentials = ArcusCredentials.from_env()
             signer = ArcusSigner(credentials)
-            rh_fee_bps = resolve_verified_rh_fee_bps(self.hedge)
             if not cfg.creds_complete:
                 raise RuntimeError(
                     "B0 requires Lighter-RH credentials in .env: "
                     "LIGHTER_ACCOUNT_INDEX, LIGHTER_API_KEY_INDEX, and "
                     "LIGHTER_API_PRIVATE_KEY"
                 )
-            self.hedge.init_signer()
+            if not isinstance(self.hedge, LighterVenue):
+                raise RuntimeError(
+                    "B0 accountLimits fee verification requires Lighter-RH"
+                )
+            lighter_hedge = self.hedge
+            lighter_hedge.init_signer()
+            rh_account_limits = await lighter_hedge.fetch_account_limits()
+            rh_fee_bps = resolve_verified_rh_fee_bps(
+                lighter_hedge, rh_account_limits
+            )
             account_rest = ArcusAccountRest(
                 self.session, rest_url=cfg.arcus_rest_url
             )
@@ -773,9 +781,9 @@ class Engine:
     def _log_b0_pre_order_state(self, state, metadata) -> None:
         candidate = state.proposed_quote
         log.info(
-            "[B0 pre-order] fee tier=%s maker=%.4fbps taker=%.4fbps "
+            "[B0 pre-order] ARCUS fee tier=%s maker=%.4fbps taker=%.4fbps "
             "market id=%s symbol=%s tick=%s step=%s minOrderSize=%s "
-            "status=%s modeled RH taker=%.4fbps",
+            "status=%s",
             state.fee_tier,
             state.maker_fee_bps,
             state.taker_fee_bps,
@@ -785,7 +793,18 @@ class Engine:
             metadata.step_size,
             metadata.min_order_size,
             metadata.status,
-            self.hedge.fee_bps,
+        )
+        log.info(
+            "[B0 pre-order] RH account tier=%s name=%s "
+            "current_maker_fee_tick=%s current_taker_fee_tick=%s "
+            "verified_maker=%.4fbps verified_taker=%.4fbps source=%s",
+            state.rh_account_tier,
+            state.rh_account_tier_name,
+            state.rh_current_maker_fee_tick,
+            state.rh_current_taker_fee_tick,
+            state.rh_verified_maker_fee_bps,
+            state.rh_verified_taker_fee_bps,
+            state.rh_fee_source,
         )
         log.info(
             "[B0 pre-order] positions ARCUS=%s RH=%s open_orders ARCUS=%s RH=%s",

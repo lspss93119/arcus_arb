@@ -23,8 +23,9 @@ arcus:
   max_orders_per_min: 0
 
 hedge:
-  # Set the applicable current Lighter-RH taker fee without changing it just
-  # to pass B0. A verified 0.0 bps fee is valid; unknown values fail closed.
+  # Reserved compatibility/modeling values for non-B0 helpers. B0 ignores
+  # these fields and resolves the authenticated account-specific fee from
+  # GET /api/v1/accountLimits using LIGHTER_ACCOUNT_INDEX.
   taker_fee_bps: 0.0
   taker_fee_bps_verified: false
   max_position_usd: 1000.0

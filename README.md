@@ -138,7 +138,14 @@ key source is `ARCUS_PRIVATE_KEY`, followed for compatibility by
 one is still a filename). Credentials are never written to config or logged;
 credential diagnostics expose only `PRESENT`/`MISSING` status. Fee tier is
 resolved from `GET https://api.arcus.xyz/v1/feetiers` plus the account
-attribute stream; unknown fees abort B0.
+attribute stream; unknown fees abort B0. The RH fee is resolved separately
+from an authenticated `GET /api/v1/accountLimits?account_index=...` using the
+configured `LIGHTER_ACCOUNT_INDEX` and official API-key auth token. B0 converts
+`current_maker_fee_tick` and `current_taker_fee_tick` with the official
+`FeeTick=1_000_000` scale (`100` ticks = `1` bps), including a verified zero.
+The public `orderBooks.taker_fee` and the YAML compatibility fee are never
+used as account-specific verification; an unavailable or malformed
+`accountLimits` response aborts B0.
 
 The documented `userFills` stream can omit store-only `createdAt` and `fee`
 fields. B0 hedges an actionable fill immediately using the resolved maker-tier

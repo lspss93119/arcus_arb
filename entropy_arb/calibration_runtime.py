@@ -42,6 +42,7 @@ from .calibration import (
     expected_edge_bps,
 )
 from .storage import ArcusCalibrationEventRow, MarketHistoryStore
+from .venue_lighter import LighterAccountLimits
 
 log = logging.getLogger("arcus-calibration")
 
@@ -56,29 +57,35 @@ def _decimal(value: Any, field: str) -> Decimal:
     return result
 
 
-def resolve_verified_rh_fee_bps(hedge: Any) -> Decimal:
-    """Return the configured RH fee only when its source is verified.
+def resolve_verified_rh_fee_bps(
+    hedge: Any,
+    account_limits: LighterAccountLimits | None = None,
+) -> Decimal:
+    """Apply the authenticated account-specific RH fee to the B0 venue.
 
-    ``0`` is a valid Lighter-RH fee, so positivity cannot be used as the
-    verification signal.  The separate flag prevents an omitted/default
-    ``0.0`` model input from being treated as an account fee.  The engine
-    passes the returned value into the B0 controller so edge and PnL use the
-    same verified number.
+    The configured ``hedge.taker_fee_bps`` and public ``orderBooks.taker_fee``
+    are intentionally ignored here.  A zero fee is valid, but only when the
+    current authenticated ``accountLimits`` response proves it.
     """
-    verified = getattr(hedge, "fee_bps_verified", None)
-    if verified is None:
-        verified = getattr(
-            getattr(hedge, "conf", None), "fee_bps_verified", False
-        )
-    if not isinstance(verified, bool) or not verified:
+    if not isinstance(account_limits, LighterAccountLimits):
         raise RuntimeError(
-            "B0 requires a verified RH taker fee; set "
-            "hedge.taker_fee_bps_verified=true only when "
-            "hedge.taker_fee_bps comes from the applicable account/venue source"
+            "B0 requires authenticated Lighter accountLimits fee state; "
+            "public orderBooks.taker_fee is not account-specific"
         )
-    value = _decimal(getattr(hedge, "fee_bps", None), "RH fee")
+    if account_limits.source != "accountLimits":
+        raise RuntimeError(
+            "B0 requires RH fee source=accountLimits; refusing unverified fee"
+        )
+    value = _decimal(account_limits.taker_fee_bps, "verified RH fee")
     if value < 0:
         raise RuntimeError("verified RH taker fee must be non-negative")
+
+    # These are runtime observations.  The configured fee remains unchanged;
+    # all B0 edge/PnL calculations consume the returned account value.
+    hedge.fee_bps = value
+    hedge.fee_bps_verified = True
+    hedge.fee_source = account_limits.source
+    hedge.account_limits = account_limits
     return value
 
 
@@ -97,6 +104,13 @@ class PreOrderState:
     fee_tier: str
     maker_fee_bps: Decimal
     taker_fee_bps: Decimal
+    rh_account_tier: str | None
+    rh_account_tier_name: str | None
+    rh_current_maker_fee_tick: int | None
+    rh_current_taker_fee_tick: int | None
+    rh_verified_maker_fee_bps: Decimal | None
+    rh_verified_taker_fee_bps: Decimal | None
+    rh_fee_source: str | None
     arcus_position: Decimal
     rh_position: Decimal
     arcus_open_orders: tuple[str, ...]
@@ -257,6 +271,7 @@ class CalibrationController:
             if rh_fee_bps is not None
             else _decimal(getattr(hedge, "fee_bps", 0), "RH fee")
         )
+        self.rh_account_limits = getattr(hedge, "account_limits", None)
         self.session_id = session_id or f"b0-{uuid.uuid4().hex[:12]}"
         self.limits = session_limits or SessionLimits()
         self.risk = SessionRisk(self.limits)
@@ -467,10 +482,26 @@ class CalibrationController:
     ) -> PreOrderState:
         ab, aa = self._book_bbo(self.arcus)
         rb, ra = self._book_bbo(self.hedge)
+        rh_limits = self.rh_account_limits
         return PreOrderState(
             fee_tier=self.fee_tier.name,
             maker_fee_bps=self.arcus_maker_fee_bps,
             taker_fee_bps=self.fee_tier.taker_fee_bps,
+            rh_account_tier=getattr(rh_limits, "user_tier", None),
+            rh_account_tier_name=getattr(rh_limits, "user_tier_name", None),
+            rh_current_maker_fee_tick=getattr(
+                rh_limits, "current_maker_fee_tick", None
+            ),
+            rh_current_taker_fee_tick=getattr(
+                rh_limits, "current_taker_fee_tick", None
+            ),
+            rh_verified_maker_fee_bps=getattr(
+                rh_limits, "maker_fee_bps", None
+            ),
+            rh_verified_taker_fee_bps=getattr(
+                rh_limits, "taker_fee_bps", None
+            ),
+            rh_fee_source=getattr(rh_limits, "source", None),
             arcus_position=arcus_position,
             rh_position=rh_position,
             arcus_open_orders=tuple(
