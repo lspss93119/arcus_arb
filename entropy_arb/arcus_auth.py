@@ -20,6 +20,31 @@ class ArcusCredentialError(RuntimeError):
     """Raised when a complete, internally consistent Arcus identity is absent."""
 
 
+def format_credential_status(
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Return non-secret Arcus credential presence diagnostics.
+
+    The private-key line reports only whether the canonical direct-value
+    variable is populated.  It never includes key material or file contents.
+    Legacy sources remain accepted by :meth:`ArcusCredentials.from_env`, but
+    are deliberately not echoed by this diagnostic.
+    """
+    values = os.environ if env is None else env
+
+    def present(name: str) -> str:
+        value = values.get(name)
+        return "PRESENT" if isinstance(value, str) and value.strip() else "MISSING"
+
+    names = (
+        "ARCUS_ACCOUNT_ADDRESS",
+        "ARCUS_ACCOUNT_INDEX",
+        "ARCUS_API_KEY",
+        "ARCUS_PRIVATE_KEY",
+    )
+    return "\n".join(f"{name}: {present(name)}" for name in names)
+
+
 def canonical_json(value: Mapping[str, Any]) -> bytes:
     """Return Arcus's compact, key-sorted JSON signing bytes."""
     return json.dumps(
@@ -32,8 +57,9 @@ class ArcusCredentials:
     """Existing, user-provided Arcus API identity.
 
     ``private_key_text`` is intentionally excluded from repr/equality output.
-    It may be a PEM document or a 32-byte hexadecimal Ed25519 seed.  The
-    corresponding public key is verified against ``api_key`` by
+    It may be a PEM document or a 32-byte hexadecimal Ed25519 seed loaded from
+    the canonical direct-value environment variable or its legacy fallbacks.
+    The corresponding public key is verified against ``api_key`` by
     :class:`ArcusSigner` before a request can be signed.
     """
 
@@ -55,16 +81,19 @@ class ArcusCredentials:
 
         address = read("ARCUS_ACCOUNT_ADDRESS")
         api_key = read("ARCUS_API_KEY")
-        private_text = read("ARCUS_ED25519_PRIVATE_KEY")
-        private_file = read("ARCUS_ED25519_PRIVATE_KEY_FILE")
-        if private_text is None and private_file is not None:
-            try:
-                private_text = Path(private_file).read_text()
-            except OSError as exc:
-                raise ArcusCredentialError(
-                    "cannot read ARCUS_ED25519_PRIVATE_KEY_FILE"
-                ) from exc
-            private_text = private_text.strip()
+        private_text = read("ARCUS_PRIVATE_KEY")
+        if private_text is None:
+            private_text = read("ARCUS_ED25519_PRIVATE_KEY")
+        if private_text is None:
+            private_file = read("ARCUS_ED25519_PRIVATE_KEY_FILE")
+            if private_file is not None:
+                try:
+                    private_text = Path(private_file).read_text()
+                except OSError as exc:
+                    raise ArcusCredentialError(
+                        "cannot read ARCUS_ED25519_PRIVATE_KEY_FILE"
+                    ) from exc
+                private_text = private_text.strip()
 
         missing = []
         if address is None:
@@ -73,7 +102,8 @@ class ArcusCredentials:
             missing.append("ARCUS_API_KEY")
         if private_text is None:
             missing.append(
-                "ARCUS_ED25519_PRIVATE_KEY or ARCUS_ED25519_PRIVATE_KEY_FILE"
+                "ARCUS_PRIVATE_KEY, ARCUS_ED25519_PRIVATE_KEY, or "
+                "ARCUS_ED25519_PRIVATE_KEY_FILE"
             )
         if missing:
             raise ArcusCredentialError(
@@ -230,9 +260,9 @@ class ArcusSigner:
             if len(decoded) == 32:
                 return ed25519.Ed25519PrivateKey.from_private_bytes(decoded)
         except (ValueError, TypeError, InvalidOperation) as exc:
-            raise ArcusCredentialError("invalid ARCUS_ED25519_PRIVATE_KEY") from exc
+            raise ArcusCredentialError("invalid Arcus Ed25519 private key") from exc
         raise ArcusCredentialError(
-            "ARCUS_ED25519_PRIVATE_KEY must be an Ed25519 PEM or 32-byte hex seed"
+            "Arcus private key must be an Ed25519 PEM or 32-byte hex seed"
         )
 
     def sign_typed(self, payload: Mapping[str, Any]) -> str:

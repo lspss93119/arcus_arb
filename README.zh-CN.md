@@ -25,7 +25,10 @@ python3 main.py --config config.yaml --symbol SNDK \
 `data/market-history.sqlite`，不会读写 `entropy-arb` 的数据库。
 
 B0 预检才需要在本地、已被 Git 忽略的 `.env` 中配置现有 Arcus Ed25519 API
-身份与现有 Lighter-RH 凭证，然后运行：
+身份与现有 Lighter-RH 凭证，然后运行。Arcus 的 canonical 变量是
+`ARCUS_ACCOUNT_ADDRESS`、`ARCUS_ACCOUNT_INDEX`、`ARCUS_API_KEY` 与
+`ARCUS_PRIVATE_KEY`；`ARCUS_PRIVATE_KEY` 直接保存 Ed25519 key value，不是
+文件名。`LIGHTER_ACCOUNT_INDEX` 是独立的 Lighter 变量。
 
 ```bash
 python3 main.py --config config.yaml --symbol SNDK \
@@ -113,10 +116,13 @@ loss、运行 60 分钟。报价只能是 LIMIT ALO；模型 post-hedge edge 低
 断线、行情 stale/resync、RTH、RH hedge 未决、telemetry 失败或任一 hard
 limit 都会停止新报价并显式 reconcile/cancel 已知 Arcus 订单。
 
-Arcus 身份只从 `ARCUS_ACCOUNT_ADDRESS`、`ARCUS_API_KEY` 与
-`ARCUS_ED25519_PRIVATE_KEY` 或 `ARCUS_ED25519_PRIVATE_KEY_FILE` 读取；不会
-写进 config 或日志。费率必须由 `GET https://api.arcus.xyz/v1/feetiers` 与
-account attribute stream 解析，无法确定时 B0 会停止。
+Arcus 身份从 `ARCUS_ACCOUNT_ADDRESS`、`ARCUS_ACCOUNT_INDEX` 与
+`ARCUS_API_KEY` 读取。canonical 的 direct-value private key 来源是
+`ARCUS_PRIVATE_KEY`，然后按兼容性顺序使用 `ARCUS_ED25519_PRIVATE_KEY`、
+`ARCUS_ED25519_PRIVATE_KEY_FILE`（最后一个仍然是文件名）。不会把凭证写进
+config 或日志；credential diagnostics 只显示 `PRESENT`/`MISSING`。费率必须
+由 `GET https://api.arcus.xyz/v1/feetiers` 与 account attribute stream 解析，
+无法确定时 B0 会停止。
 
 当前文档的 `userFills` 流可能不携带仅存储侧的 `createdAt` 与 `fee`。B0
 仍会在可执行填单后立即使用已解析的 maker tier 费率作临时核算并执行 RH

@@ -26,7 +26,11 @@ Use `--no-dashboard` for plain logs. The recorder writes to the independent
 project's database.
 
 For B0 preflight only, configure the existing Arcus Ed25519 API identity and
-the existing Lighter-RH credentials in a local, ignored `.env`, then run:
+the existing Lighter-RH credentials in a local, ignored `.env`, then run. The
+canonical Arcus variables are `ARCUS_ACCOUNT_ADDRESS`, `ARCUS_ACCOUNT_INDEX`,
+`ARCUS_API_KEY`, and `ARCUS_PRIVATE_KEY`; `ARCUS_PRIVATE_KEY` contains the
+Ed25519 key value directly, not a filename. `LIGHTER_ACCOUNT_INDEX` is a
+separate Lighter value.
 
 ```bash
 python3 main.py --config config.yaml --symbol SNDK \
@@ -127,11 +131,14 @@ visible rather than rounded up. Any account disconnect, stale/resync market,
 RTH transition, unresolved RH hedge, telemetry failure, or hard limit halts
 new quoting and explicitly reconciles/cancels the known Arcus order.
 
-The Arcus identity is loaded only from `ARCUS_ACCOUNT_ADDRESS`,
-`ARCUS_API_KEY`, and `ARCUS_ED25519_PRIVATE_KEY` or
-`ARCUS_ED25519_PRIVATE_KEY_FILE`; credentials are never written to config or
-logged. Fee tier is resolved from `GET https://api.arcus.xyz/v1/feetiers` plus
-the account attribute stream; unknown fees abort B0.
+The Arcus identity is loaded from `ARCUS_ACCOUNT_ADDRESS`,
+`ARCUS_ACCOUNT_INDEX`, and `ARCUS_API_KEY`. The canonical direct-value private
+key source is `ARCUS_PRIVATE_KEY`, followed for compatibility by
+`ARCUS_ED25519_PRIVATE_KEY`, then `ARCUS_ED25519_PRIVATE_KEY_FILE` (the last
+one is still a filename). Credentials are never written to config or logged;
+credential diagnostics expose only `PRESENT`/`MISSING` status. Fee tier is
+resolved from `GET https://api.arcus.xyz/v1/feetiers` plus the account
+attribute stream; unknown fees abort B0.
 
 The documented `userFills` stream can omit store-only `createdAt` and `fee`
 fields. B0 hedges an actionable fill immediately using the resolved maker-tier
