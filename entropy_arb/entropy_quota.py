@@ -5,15 +5,15 @@ not change what the feeds subscribe to or provide a second supervisor socket;
 it only lets the trading-critical market feed take precedence over the
 secondary reference feed after a specific server quota rejection.
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
-
 
 QUOTA_COOLDOWN_SEC = 60.0
 MAIN_HEALTHY_REQUIRED_SEC = 10.0
@@ -125,8 +125,7 @@ class EntropyQuotaCoordinator:
         self._main_connected_since = resolved_now
         self._last_recovery_log_at = None
         self._log.info(
-            "[entropy-quota] main connected; waiting %.0fs before "
-            "reference recovery",
+            "[entropy-quota] main connected; waiting %.0fs before reference recovery",
             self.main_healthy_required_sec,
         )
         self._wake.set()
@@ -184,7 +183,7 @@ class EntropyQuotaCoordinator:
             return False
         try:
             await asyncio.wait_for(stop.wait(), timeout=max(0.0, delay))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return not stop.is_set()
         return False
 
@@ -247,8 +246,7 @@ class EntropyQuotaCoordinator:
                 deadline = self._cooldown_until
             if self._main_connected_since is not None:
                 healthy_deadline = (
-                    self._main_connected_since
-                    + self.main_healthy_required_sec
+                    self._main_connected_since + self.main_healthy_required_sec
                 )
                 deadline = (
                     healthy_deadline

@@ -1,4 +1,5 @@
 """Record-only Arcus × Lighter-RH market history."""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +7,6 @@ import json
 import logging
 import math
 import time
-from typing import Optional
 
 from .arcus import (
     ArcusL2Event,
@@ -17,8 +17,8 @@ from .arcus import (
 from .arcus_book import ArcusOrderBook
 from .premium import calculate_premiums
 from .storage import (
-    ArcusMarketAttributesRow,
     ArcusL2EventRow,
+    ArcusMarketAttributesRow,
     ArcusMarketMetadataRow,
     ArcusMinuteRow,
     ArcusSampleRow,
@@ -29,7 +29,7 @@ from .storage import (
 log = logging.getLogger("arcus-recorder")
 
 
-def _book_size(book, side: str, price: Optional[float]) -> float:
+def _book_size(book, side: str, price: float | None) -> float:
     if price is None:
         return 0.0
     value = getattr(book, f"best_{side}_size", None)
@@ -41,8 +41,18 @@ def _book_size(book, side: str, price: Optional[float]) -> float:
 
 class _ArcusMinuteAgg:
     __slots__ = (
-        "minute", "n", "p_open", "p_high", "p_low", "p_close", "p_sum",
-        "p_sumsq", "arcus_bid", "arcus_ask", "rh_bid", "rh_ask",
+        "minute",
+        "n",
+        "p_open",
+        "p_high",
+        "p_low",
+        "p_close",
+        "p_sum",
+        "p_sumsq",
+        "arcus_bid",
+        "arcus_ask",
+        "rh_bid",
+        "rh_ask",
     )
 
     def __init__(self, minute: int) -> None:
@@ -52,11 +62,10 @@ class _ArcusMinuteAgg:
         self.p_sum = self.p_sumsq = 0.0
         self.arcus_bid = self.arcus_ask = self.rh_bid = self.rh_ask = 0.0
 
-    def add(self, arcus_bid: float, arcus_ask: float,
-            rh_bid: float, rh_ask: float) -> float:
-        premium = calculate_premiums(
-            arcus_bid, arcus_ask, rh_bid, rh_ask
-        ).premium_bps
+    def add(
+        self, arcus_bid: float, arcus_ask: float, rh_bid: float, rh_ask: float
+    ) -> float:
+        premium = calculate_premiums(arcus_bid, arcus_ask, rh_bid, rh_ask).premium_bps
         if self.n == 0:
             self.p_open = self.p_high = self.p_low = premium
         self.n += 1
@@ -115,68 +124,76 @@ class ArcusMarketRecorder:
         self.minute_rows_written = 0
         self.trades_written = 0
         self.l2_events_written = 0
-        self._agg: Optional[_ArcusMinuteAgg] = None
-        self.attributes: Optional[ArcusMarketAttributes] = None
-        self.market_metadata: Optional[ArcusMarketMetadata] = None
+        self._agg: _ArcusMinuteAgg | None = None
+        self.attributes: ArcusMarketAttributes | None = None
+        self.market_metadata: ArcusMarketMetadata | None = None
 
     def record_metadata(
-        self, metadata: ArcusMarketMetadata, discovered_at_ms: Optional[int] = None
+        self, metadata: ArcusMarketMetadata, discovered_at_ms: int | None = None
     ) -> None:
         self.market_metadata = metadata
-        self.store.append_arcus_market_metadata(ArcusMarketMetadataRow(
-            discovered_at_ms=(int(time.time() * 1000)
-                              if discovered_at_ms is None else int(discovered_at_ms)),
-            symbol=self.symbol,
-            market_id=metadata.market_id,
-            market_display_name=metadata.symbol,
-            status=metadata.status,
-            tick_size=metadata.tick_size,
-            step_size=metadata.step_size,
-            min_order_size=metadata.min_order_size,
-            min_order_notional=metadata.min_order_notional,
-            max_order_size=metadata.max_order_size,
-            is_outside_rth=metadata.is_outside_rth,
-            current_settlement_price=metadata.current_settlement_price,
-            upper_trading_bound=metadata.upper_trading_bound,
-            lower_trading_bound=metadata.lower_trading_bound,
-            next_upper_trading_bound=metadata.next_upper_trading_bound,
-            next_lower_trading_bound=metadata.next_lower_trading_bound,
-            regular_trading_hours=(
-                json.dumps(metadata.regular_trading_hours, sort_keys=True)
-                if metadata.regular_trading_hours is not None else None
-            ),
-        ))
+        self.store.append_arcus_market_metadata(
+            ArcusMarketMetadataRow(
+                discovered_at_ms=(
+                    int(time.time() * 1000)
+                    if discovered_at_ms is None
+                    else int(discovered_at_ms)
+                ),
+                symbol=self.symbol,
+                market_id=metadata.market_id,
+                market_display_name=metadata.symbol,
+                status=metadata.status,
+                tick_size=metadata.tick_size,
+                step_size=metadata.step_size,
+                min_order_size=metadata.min_order_size,
+                min_order_notional=metadata.min_order_notional,
+                max_order_size=metadata.max_order_size,
+                is_outside_rth=metadata.is_outside_rth,
+                current_settlement_price=metadata.current_settlement_price,
+                upper_trading_bound=metadata.upper_trading_bound,
+                lower_trading_bound=metadata.lower_trading_bound,
+                next_upper_trading_bound=metadata.next_upper_trading_bound,
+                next_lower_trading_bound=metadata.next_lower_trading_bound,
+                regular_trading_hours=(
+                    json.dumps(metadata.regular_trading_hours, sort_keys=True)
+                    if metadata.regular_trading_hours is not None
+                    else None
+                ),
+            )
+        )
 
     def record_attributes(
         self,
         attributes: ArcusMarketAttributes,
         local_receive_ts_ms: int,
-        local_receive_monotonic_ns: Optional[int],
+        local_receive_monotonic_ns: int | None,
         market_status: str = "UNKNOWN",
     ) -> None:
         self.attributes = attributes
-        self.store.append_arcus_market_attributes(ArcusMarketAttributesRow(
-            symbol=self.symbol,
-            market_id=attributes.market_id,
-            market_display_name=attributes.market_display_name,
-            market_status=market_status,
-            local_receive_ts_ms=int(local_receive_ts_ms),
-            local_receive_monotonic_ns=local_receive_monotonic_ns,
-            event_timestamp_us=attributes.event_timestamp_us,
-            market_sequence_num=attributes.market_sequence_num,
-            is_outside_rth=attributes.is_outside_rth,
-            current_settlement_price=attributes.current_settlement_price,
-            upper_trading_bound=attributes.upper_trading_bound,
-            lower_trading_bound=attributes.lower_trading_bound,
-            next_upper_trading_bound=attributes.next_upper_trading_bound,
-            next_lower_trading_bound=attributes.next_lower_trading_bound,
-        ))
+        self.store.append_arcus_market_attributes(
+            ArcusMarketAttributesRow(
+                symbol=self.symbol,
+                market_id=attributes.market_id,
+                market_display_name=attributes.market_display_name,
+                market_status=market_status,
+                local_receive_ts_ms=int(local_receive_ts_ms),
+                local_receive_monotonic_ns=local_receive_monotonic_ns,
+                event_timestamp_us=attributes.event_timestamp_us,
+                market_sequence_num=attributes.market_sequence_num,
+                is_outside_rth=attributes.is_outside_rth,
+                current_settlement_price=attributes.current_settlement_price,
+                upper_trading_bound=attributes.upper_trading_bound,
+                lower_trading_bound=attributes.lower_trading_bound,
+                next_upper_trading_bound=attributes.next_upper_trading_bound,
+                next_lower_trading_bound=attributes.next_lower_trading_bound,
+            )
+        )
 
     def record_trade(
         self,
         trade: ArcusTrade,
         local_receive_ts_ms: int,
-        local_receive_monotonic_ns: Optional[int],
+        local_receive_monotonic_ns: int | None,
     ) -> None:
         market_id = trade.market_id
         if market_id is None and self.market_metadata is not None:
@@ -184,21 +201,22 @@ class ArcusMarketRecorder:
         if market_id is None:
             log.warning("[ARCUS] dropping trade without a market id")
             return
-        self.store.append_arcus_trade(ArcusTradeRow(
-            symbol=self.symbol,
-            market_id=market_id,
-            market_display_name=trade.market_display_name or (
-                self.market_metadata.symbol if self.market_metadata else ""
-            ),
-            trade_id=trade.trade_id or "",
-            exchange_timestamp_us=trade.exchange_timestamp_us,
-            local_receive_ts_ms=int(local_receive_ts_ms),
-            local_receive_monotonic_ns=local_receive_monotonic_ns,
-            price=trade.price,
-            quantity=trade.quantity,
-            aggressor_side=trade.aggressor_side,
-            sequence_number=trade.sequence_number,
-        ))
+        self.store.append_arcus_trade(
+            ArcusTradeRow(
+                symbol=self.symbol,
+                market_id=market_id,
+                market_display_name=trade.market_display_name
+                or (self.market_metadata.symbol if self.market_metadata else ""),
+                trade_id=trade.trade_id or "",
+                exchange_timestamp_us=trade.exchange_timestamp_us,
+                local_receive_ts_ms=int(local_receive_ts_ms),
+                local_receive_monotonic_ns=local_receive_monotonic_ns,
+                price=trade.price,
+                quantity=trade.quantity,
+                aggressor_side=trade.aggressor_side,
+                sequence_number=trade.sequence_number,
+            )
+        )
         self.trades_written += 1
 
     def record_l2_event(self, event: ArcusL2Event) -> None:
@@ -212,21 +230,23 @@ class ArcusMarketRecorder:
             # losing an otherwise replayable event.
             market_id = -1
             log.warning("[ARCUS] L2 event has no market id; storing -1")
-        self.store.append_arcus_l2_event(ArcusL2EventRow(
-            symbol=self.symbol,
-            market_id=int(market_id),
-            event_type=event.event_type,
-            book_epoch=event.book_epoch,
-            local_receive_ts_ms=int(event.local_receive_ts_ms),
-            local_receive_monotonic_ns=int(event.local_receive_monotonic_ns),
-            last_sequence_id=event.last_sequence_id,
-            global_sequence_id=event.global_sequence_id,
-            side=event.side,
-            price=event.price,
-            absolute_size=event.absolute_size,
-            event_index=event.event_index,
-            exchange_timestamp_us=event.exchange_timestamp_us,
-        ))
+        self.store.append_arcus_l2_event(
+            ArcusL2EventRow(
+                symbol=self.symbol,
+                market_id=int(market_id),
+                event_type=event.event_type,
+                book_epoch=event.book_epoch,
+                local_receive_ts_ms=int(event.local_receive_ts_ms),
+                local_receive_monotonic_ns=int(event.local_receive_monotonic_ns),
+                last_sequence_id=event.last_sequence_id,
+                global_sequence_id=event.global_sequence_id,
+                side=event.side,
+                price=event.price,
+                absolute_size=event.absolute_size,
+                event_index=event.event_index,
+                exchange_timestamp_us=event.exchange_timestamp_us,
+            )
+        )
         self.l2_events_written += 1
 
     def _flush_minute(self) -> None:
@@ -240,8 +260,8 @@ class ArcusMarketRecorder:
     def record_sample(
         self,
         *,
-        timestamp_ms: Optional[int] = None,
-        monotonic_ns: Optional[int] = None,
+        timestamp_ms: int | None = None,
+        monotonic_ns: int | None = None,
     ) -> bool:
         now_ms = int(time.time() * 1000) if timestamp_ms is None else int(timestamp_ms)
         now_s = now_ms / 1000.0
@@ -267,34 +287,42 @@ class ArcusMarketRecorder:
             arcus_receive_ms = int(self.arcus_book.last_update_ts * 1000)
         rh_receive_ms = int(getattr(self.rh_book, "last_update_ts", now_s) * 1000)
         attrs = self.attributes
-        self.store.append_arcus_sample(ArcusSampleRow(
-            timestamp_ms=now_ms,
-            symbol=self.symbol,
-            arcus_bid=arcus_bid,
-            arcus_ask=arcus_ask,
-            arcus_bid_size=_book_size(self.arcus_book, "bid", arcus_bid),
-            arcus_ask_size=_book_size(self.arcus_book, "ask", arcus_ask),
-            arcus_mid=(arcus_bid + arcus_ask) / 2.0,
-            rh_bid=rh_bid,
-            rh_ask=rh_ask,
-            rh_bid_size=_book_size(self.rh_book, "bid", rh_bid),
-            rh_ask_size=_book_size(self.rh_book, "ask", rh_ask),
-            rh_mid=(rh_bid + rh_ask) / 2.0,
-            premium_bps=premium,
-            arcus_book_sequence_id=self.arcus_book.sequence_id,
-            arcus_global_sequence_id=self.arcus_book.global_sequence_id,
-            arcus_exchange_timestamp_us=self.arcus_book.exchange_timestamp_us,
-            arcus_local_receive_ts_ms=arcus_receive_ms,
-            arcus_local_receive_monotonic_ns=self.arcus_book.local_receive_monotonic_ns,
-            rh_local_receive_ts_ms=rh_receive_ms,
-            is_outside_rth=attrs.is_outside_rth if attrs else None,
-            current_settlement_price=(attrs.current_settlement_price if attrs else None),
-            upper_trading_bound=attrs.upper_trading_bound if attrs else None,
-            lower_trading_bound=attrs.lower_trading_bound if attrs else None,
-            next_upper_trading_bound=attrs.next_upper_trading_bound if attrs else None,
-            next_lower_trading_bound=attrs.next_lower_trading_bound if attrs else None,
-            hedge=self.hedge,
-        ))
+        self.store.append_arcus_sample(
+            ArcusSampleRow(
+                timestamp_ms=now_ms,
+                symbol=self.symbol,
+                arcus_bid=arcus_bid,
+                arcus_ask=arcus_ask,
+                arcus_bid_size=_book_size(self.arcus_book, "bid", arcus_bid),
+                arcus_ask_size=_book_size(self.arcus_book, "ask", arcus_ask),
+                arcus_mid=(arcus_bid + arcus_ask) / 2.0,
+                rh_bid=rh_bid,
+                rh_ask=rh_ask,
+                rh_bid_size=_book_size(self.rh_book, "bid", rh_bid),
+                rh_ask_size=_book_size(self.rh_book, "ask", rh_ask),
+                rh_mid=(rh_bid + rh_ask) / 2.0,
+                premium_bps=premium,
+                arcus_book_sequence_id=self.arcus_book.sequence_id,
+                arcus_global_sequence_id=self.arcus_book.global_sequence_id,
+                arcus_exchange_timestamp_us=self.arcus_book.exchange_timestamp_us,
+                arcus_local_receive_ts_ms=arcus_receive_ms,
+                arcus_local_receive_monotonic_ns=self.arcus_book.local_receive_monotonic_ns,
+                rh_local_receive_ts_ms=rh_receive_ms,
+                is_outside_rth=attrs.is_outside_rth if attrs else None,
+                current_settlement_price=(
+                    attrs.current_settlement_price if attrs else None
+                ),
+                upper_trading_bound=attrs.upper_trading_bound if attrs else None,
+                lower_trading_bound=attrs.lower_trading_bound if attrs else None,
+                next_upper_trading_bound=attrs.next_upper_trading_bound
+                if attrs
+                else None,
+                next_lower_trading_bound=attrs.next_lower_trading_bound
+                if attrs
+                else None,
+                hedge=self.hedge,
+            )
+        )
         self.rows_written += 1
         return True
 
@@ -310,7 +338,7 @@ class ArcusMarketRecorder:
                     log.exception("Arcus recorder sample failed")
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=self.interval_sec)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         finally:
             self.close()

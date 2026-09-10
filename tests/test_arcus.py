@@ -14,9 +14,9 @@ import pytest
 
 from entropy_arb.arcus import (
     ARCUS_PUBLIC_SUBSCRIPTIONS,
+    ArcusL2Event,
     ArcusMarketAttributes,
     ArcusMarketMetadata,
-    ArcusL2Event,
     ArcusTrade,
     parse_arcus_book_snapshot,
     parse_arcus_book_update,
@@ -38,7 +38,6 @@ from entropy_arb.storage import (
     MarketHistoryStore,
 )
 from entropy_arb.venue_arcus import ArcusVenue
-
 
 MARKET = {
     "marketDisplayName": "SNDK-USD",
@@ -319,8 +318,7 @@ def test_sqlite_arcus_sample_and_public_trade_persistence_is_restart_safe(
             "FROM arcus_samples"
         ).fetchone() == (1788425525850030, 123)
         assert conn.execute(
-            "SELECT local_receive_ts_ms, local_receive_monotonic_ns "
-            "FROM arcus_trades"
+            "SELECT local_receive_ts_ms, local_receive_monotonic_ns FROM arcus_trades"
         ).fetchone() == (1788425525851001, 456)
     reopened.close()
 
@@ -392,9 +390,13 @@ def test_arcus_book_staleness_is_fail_closed() -> None:
 def test_arcus_order_attempt_fails_locally() -> None:
     venue = ArcusVenue()
 
-    with pytest.raises(RuntimeError, match="Arcus trading is not implemented in Phase A"):
+    with pytest.raises(
+        RuntimeError, match="Arcus trading is not implemented in Phase A"
+    ):
         venue.send_taker("buy", 1, 1)
-    with pytest.raises(RuntimeError, match="Arcus trading is not implemented in Phase A"):
+    with pytest.raises(
+        RuntimeError, match="Arcus trading is not implemented in Phase A"
+    ):
         venue.init_signer()
 
 
@@ -436,10 +438,18 @@ def test_arcus_feed_gap_requests_book_resync_without_extra_channels() -> None:
 
     async def exercise() -> None:
         await feed.handle_message(websocket, SNAPSHOT, 1000, 10)
-        await feed.handle_message(websocket, {**UPDATE, "contents": {
-            **UPDATE["contents"],
-            "lastSequenceId": 91051781,
-        }}, 1001, 11)
+        await feed.handle_message(
+            websocket,
+            {
+                **UPDATE,
+                "contents": {
+                    **UPDATE["contents"],
+                    "lastSequenceId": 91051781,
+                },
+            },
+            1001,
+            11,
+        )
 
     asyncio.run(exercise())
     requests = [json.loads(message) for message in websocket.sent]
@@ -580,8 +590,10 @@ def test_arcus_l2_event_order_is_stable_inside_one_message() -> None:
 
     asyncio.run(deliver())
     assert all(isinstance(event, ArcusL2Event) for event in events)
-    assert [(event.event_type, event.event_index, event.side, event.price)
-            for event in events] == [
+    assert [
+        (event.event_type, event.event_index, event.side, event.price)
+        for event in events
+    ] == [
         ("snapshot", 0, "bid", "1540.35"),
         ("snapshot", 1, "bid", "1540.16"),
         ("snapshot", 2, "ask", "1540.67"),
@@ -591,10 +603,13 @@ def test_arcus_l2_event_order_is_stable_inside_one_message() -> None:
         ("delta", 2, "ask", "1540.67"),
         ("delta", 3, "ask", "1540.92"),
     ]
-    assert [(event.last_sequence_id, event.global_sequence_id)
-            for event in events[4:]] == [(91051779, 1789133353)] * 4
-    assert [(event.local_receive_ts_ms, event.local_receive_monotonic_ns)
-            for event in events[4:]] == [(1001, 11)] * 4
+    assert [
+        (event.last_sequence_id, event.global_sequence_id) for event in events[4:]
+    ] == [(91051779, 1789133353)] * 4
+    assert [
+        (event.local_receive_ts_ms, event.local_receive_monotonic_ns)
+        for event in events[4:]
+    ] == [(1001, 11)] * 4
     recorder.store.close()
 
 
@@ -623,10 +638,10 @@ def test_arcus_l2_gap_rows_and_new_snapshot_epoch_are_distinguishable(
     rows = _stored_l2_rows(store)
     assert len(rows) == 12
     assert [(row[3], row[4], row[7]) for row in rows] == [
-        *( [("snapshot", 1, 91051778)] * 4),
-        *( [("delta", 1, 91051779)] * 2),
-        *( [("delta", 1, 91051781)] * 2),
-        *( [("snapshot", 2, 91051790)] * 4),
+        *([("snapshot", 1, 91051778)] * 4),
+        *([("delta", 1, 91051779)] * 2),
+        *([("delta", 1, 91051781)] * 2),
+        *([("snapshot", 2, 91051790)] * 4),
     ]
     assert 91051780 not in {row[7] for row in rows}
     assert feed.book.health == "OK"
@@ -747,8 +762,10 @@ def test_rolling_center_consumes_arcus_rh_midpoint_premium(tmp_path: Path) -> No
         "    lower_bps: 4\n"
     )
     cfg = load_config(
-        str(config_path), "/tmp/arcus-arb-no-such.env",
-        symbol="SNDK", hedge_venue="lighter-rh",
+        str(config_path),
+        "/tmp/arcus-arb-no-such.env",
+        symbol="SNDK",
+        hedge_venue="lighter-rh",
     )
     engine = Engine(cfg, record_only=True)
     engine.market_history = store
@@ -814,8 +831,10 @@ def test_record_only_startup_uses_mocked_public_arcus_and_rh_feeds(
         "  database: " + str(tmp_path / "market-history.sqlite") + "\n"
     )
     cfg = load_config(
-        str(config_path), "/tmp/arcus-arb-no-such.env",
-        symbol="SNDK", hedge_venue="lighter-rh",
+        str(config_path),
+        "/tmp/arcus-arb-no-such.env",
+        symbol="SNDK",
+        hedge_venue="lighter-rh",
     )
     metadata = parse_arcus_market(MARKET)
     arcus = ArcusVenue(cfg.arcus)
@@ -903,8 +922,10 @@ def test_arcus_non_record_only_startup_fails_before_market_network_call(
         "    lower_bps: 4\n"
     )
     cfg = load_config(
-        str(config_path), "/tmp/arcus-arb-no-such.env",
-        symbol="SNDK", hedge_venue="lighter-rh",
+        str(config_path),
+        "/tmp/arcus-arb-no-such.env",
+        symbol="SNDK",
+        hedge_venue="lighter-rh",
     )
     arcus = ArcusVenue(cfg.arcus)
     loaded = False
@@ -953,7 +974,7 @@ def test_record_only_dashboard_mentions_arcus_and_rh() -> None:
                 best_ask=1540.0,
                 is_fresh=lambda max_age: True,
                 alive_ts=time.time(),
-            )
+            ),
         ),
         rolling_center_bps=None,
         latest_sample_ts=1000,

@@ -1,9 +1,9 @@
 """Fail-closed local L2 state for Arcus ``l2OrderbookUpdates``."""
+
 from __future__ import annotations
 
 import math
 import time
-from typing import Optional
 
 from .arcus import ArcusBookSnapshot, ArcusBookUpdate
 from .book import OrderBook
@@ -22,11 +22,11 @@ class ArcusOrderBook(OrderBook):
         super().__init__()
         self.health = "STALE"
         self.book_epoch = 0
-        self.sequence_id: Optional[int] = None
-        self.global_sequence_id: Optional[int] = None
-        self.exchange_timestamp_us: Optional[int] = None
-        self.local_receive_ts_ms: Optional[int] = None
-        self.local_receive_monotonic_ns: Optional[int] = None
+        self.sequence_id: int | None = None
+        self.global_sequence_id: int | None = None
+        self.exchange_timestamp_us: int | None = None
+        self.local_receive_ts_ms: int | None = None
+        self.local_receive_monotonic_ns: int | None = None
         self.sequence_gap_count = 0
 
     @property
@@ -34,12 +34,12 @@ class ArcusOrderBook(OrderBook):
         return self.health
 
     @property
-    def best_bid_size(self) -> Optional[float]:
+    def best_bid_size(self) -> float | None:
         price = self.best_bid()
         return self.bids.get(price) if price is not None else None
 
     @property
-    def best_ask_size(self) -> Optional[float]:
+    def best_ask_size(self) -> float | None:
         price = self.best_ask()
         return self.asks.get(price) if price is not None else None
 
@@ -59,7 +59,7 @@ class ArcusOrderBook(OrderBook):
         self.clear()
         self.health = "RESYNC"
 
-    def _receive(self, wall_ms: Optional[int], monotonic_ns: Optional[int]) -> None:
+    def _receive(self, wall_ms: int | None, monotonic_ns: int | None) -> None:
         now_ms = int(time.time() * 1000) if wall_ms is None else int(wall_ms)
         self.local_receive_ts_ms = now_ms
         self.local_receive_monotonic_ns = monotonic_ns
@@ -67,7 +67,9 @@ class ArcusOrderBook(OrderBook):
         self.alive_ts = self.last_update_ts
 
     @staticmethod
-    def _apply_levels(target: dict[float, float], levels: tuple[tuple[str, str], ...]) -> None:
+    def _apply_levels(
+        target: dict[float, float], levels: tuple[tuple[str, str], ...]
+    ) -> None:
         for price_text, size_text in levels:
             price = float(price_text)
             size = float(size_text)
@@ -81,8 +83,8 @@ class ArcusOrderBook(OrderBook):
     def apply_snapshot(
         self,
         snapshot: ArcusBookSnapshot,
-        local_receive_ts_ms: Optional[int] = None,
-        local_receive_monotonic_ns: Optional[int] = None,
+        local_receive_ts_ms: int | None = None,
+        local_receive_monotonic_ns: int | None = None,
     ) -> None:
         # Every subscribe-time snapshot starts a new replayable continuous
         # segment, including the first snapshot after startup/reconnect or a
@@ -105,8 +107,8 @@ class ArcusOrderBook(OrderBook):
     def apply_update(
         self,
         update: ArcusBookUpdate,
-        local_receive_ts_ms: Optional[int] = None,
-        local_receive_monotonic_ns: Optional[int] = None,
+        local_receive_ts_ms: int | None = None,
+        local_receive_monotonic_ns: int | None = None,
     ) -> bool:
         if not self.ready or self.health != "OK" or self.sequence_id is None:
             return False

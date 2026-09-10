@@ -4,18 +4,17 @@ import csv
 import inspect
 import json
 import logging
-import os
 import sqlite3
 
 import pytest
 
 from entropy_arb.reference import (
     ENTROPY_REFERENCE_HEADER,
-    HLReferenceFeed,
     LIGHTER_REFERENCE_HEADER,
-    LighterReferenceFeed,
     EntropyReferenceStoreWriter,
     HedgeReferenceStoreWriter,
+    HLReferenceFeed,
+    LighterReferenceFeed,
     ReferenceParseError,
     ReferenceRecorder,
     parse_hl_reference,
@@ -332,13 +331,15 @@ def test_hl_non_object_frames_are_silent_and_connection_continues(raw, caplog):
 
 
 @pytest.mark.parametrize("raw", [json.dumps([]), json.dumps("noise")])
-def test_lighter_non_object_frames_are_silent_and_connection_continues(
-    raw, caplog
-):
+def test_lighter_non_object_frames_are_silent_and_connection_continues(raw, caplog):
     async def scenario():
         stop = asyncio.Event()
         ws = FakeWebSocket(
-            [raw, json.dumps({"type": "connected"}), json.dumps(LIGHTER_REFERENCE_FRAME)],
+            [
+                raw,
+                json.dumps({"type": "connected"}),
+                json.dumps(LIGHTER_REFERENCE_FRAME),
+            ],
             stop,
         )
         connector = FakeConnect(ws)
@@ -494,9 +495,7 @@ def test_reference_feed_reconnect_backoff_resets_after_successful_connection():
 
 
 def test_parse_hl_reference_from_probe_shape():
-    assert parse_hl_reference(
-        HL_REFERENCE_FRAME, coin="io:SNDK"
-    ) == (1485.0, 1485.0)
+    assert parse_hl_reference(HL_REFERENCE_FRAME, coin="io:SNDK") == (1485.0, 1485.0)
 
 
 @pytest.mark.parametrize(
@@ -555,9 +554,10 @@ def test_lighter_wrong_market_returns_none():
 
 
 def test_lighter_control_ack_without_market_payload_is_irrelevant():
-    assert parse_lighter_reference(
-        {"type": "subscribed/market_stats"}, market_id=139
-    ) is None
+    assert (
+        parse_lighter_reference({"type": "subscribed/market_stats"}, market_id=139)
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -601,9 +601,7 @@ def test_lighter_relevant_invalid_required_field_raises(field, value):
 )
 def test_missing_required_field_raises(parser, kwargs, path):
     source = (
-        HL_REFERENCE_FRAME
-        if parser is parse_hl_reference
-        else LIGHTER_REFERENCE_FRAME
+        HL_REFERENCE_FRAME if parser is parse_hl_reference else LIGHTER_REFERENCE_FRAME
     )
     msg = copy.deepcopy(source)
     parent = msg
@@ -616,10 +614,15 @@ def test_missing_required_field_raises(parser, kwargs, path):
 
 def test_reference_headers_are_exact():
     assert ENTROPY_REFERENCE_HEADER == (
-        "recv_ms", "oracle_px", "mark_px",
+        "recv_ms",
+        "oracle_px",
+        "mark_px",
     )
     assert LIGHTER_REFERENCE_HEADER == (
-        "recv_ms", "server_ms", "index_px", "mark_px",
+        "recv_ms",
+        "server_ms",
+        "index_px",
+        "mark_px",
     )
 
 
@@ -670,8 +673,9 @@ def test_entropy_store_writer_buffers_canonical_rows(tmp_path):
     writer.close()
     store.flush()
     with sqlite3.connect(store.path) as conn:
-        assert conn.execute("SELECT symbol, hedge, recv_ms, oracle_px, mark_px FROM entropy_reference").fetchall() == [
-            ("SNDK", "lighter", *row)]
+        assert conn.execute(
+            "SELECT symbol, hedge, recv_ms, oracle_px, mark_px FROM entropy_reference"
+        ).fetchall() == [("SNDK", "lighter", *row)]
     store.close()
 
 
@@ -681,8 +685,9 @@ def test_hedge_store_writer_buffers_canonical_rows(tmp_path):
     writer.write((1, 2, 100.0, 101.0))
     store.flush()
     with sqlite3.connect(store.path) as conn:
-        assert conn.execute("SELECT symbol, hedge, recv_ms, server_ms, index_px, mark_px FROM hedge_reference").fetchall() == [
-            ("SNDK", "lighter-rh", 1, 2, 100.0, 101.0)]
+        assert conn.execute(
+            "SELECT symbol, hedge, recv_ms, server_ms, index_px, mark_px FROM hedge_reference"
+        ).fetchall() == [("SNDK", "lighter-rh", 1, 2, 100.0, 101.0)]
     store.close()
 
 
@@ -695,13 +700,13 @@ def test_stop_accepting_rejects_late_rows_but_close_flushes_prior_rows(tmp_path)
     writer.close()
     store.flush()
     with sqlite3.connect(store.path) as conn:
-        assert conn.execute("SELECT recv_ms FROM entropy_reference").fetchall() == [(1,)]
+        assert conn.execute("SELECT recv_ms FROM entropy_reference").fetchall() == [
+            (1,)
+        ]
     store.close()
 
 
-def test_reference_recorder_shutdown_flushes_both_final_buffers(
-    tmp_path, monkeypatch
-):
+def test_reference_recorder_shutdown_flushes_both_final_buffers(tmp_path, monkeypatch):
     async def scenario():
         from entropy_arb import reference
 
@@ -751,8 +756,12 @@ def test_reference_recorder_shutdown_flushes_both_final_buffers(
         await task
         store.flush()
         with sqlite3.connect(store.path) as conn:
-            assert conn.execute("SELECT COUNT(*) FROM entropy_reference").fetchone() == (1,)
-            assert conn.execute("SELECT COUNT(*) FROM hedge_reference").fetchone() == (1,)
+            assert conn.execute(
+                "SELECT COUNT(*) FROM entropy_reference"
+            ).fetchone() == (1,)
+            assert conn.execute("SELECT COUNT(*) FROM hedge_reference").fetchone() == (
+                1,
+            )
         store.close()
 
     asyncio.run(scenario())
@@ -816,12 +825,10 @@ def test_shutdown_stops_feeds_before_idempotent_writer_close(monkeypatch):
         stop.set()
         await task
         first_close = min(
-            index for index, event in enumerate(events)
-            if event.startswith("close:")
+            index for index, event in enumerate(events) if event.startswith("close:")
         )
         last_feed_stop = max(
-            index for index, event in enumerate(events)
-            if event == "feed-stopped"
+            index for index, event in enumerate(events) if event == "feed-stopped"
         )
         assert last_feed_stop < first_close
         recorder.entropy_writer.close()
@@ -892,12 +899,12 @@ def test_stuck_feed_is_cancelled_and_awaited_before_close(monkeypatch):
         await task
 
         cancel_positions = [
-            index for index, event in enumerate(events)
+            index
+            for index, event in enumerate(events)
             if event.startswith("feed-cancelled:")
         ]
         close_positions = [
-            index for index, event in enumerate(events)
-            if event.startswith("close:")
+            index for index, event in enumerate(events) if event.startswith("close:")
         ]
         assert len(cancel_positions) == 2
         assert len(close_positions) == 2
@@ -946,7 +953,9 @@ def test_feed_failure_preserves_sibling_writer(tmp_path, monkeypatch):
         await task
         recorder.hedge_writer.store.flush()
         with sqlite3.connect(recorder.hedge_writer.store.path) as conn:
-            assert conn.execute("SELECT COUNT(*) FROM hedge_reference").fetchone() == (1,)
+            assert conn.execute("SELECT COUNT(*) FROM hedge_reference").fetchone() == (
+                1,
+            )
         recorder.hedge_writer.store.close()
 
     asyncio.run(scenario())
@@ -956,9 +965,7 @@ def test_bad_header_disables_only_one_sibling_writer(tmp_path, monkeypatch):
     async def scenario():
         from entropy_arb import reference
 
-        entropy_path, hedge_path = reference_paths(
-            "SNDK", "lighter", str(tmp_path)
-        )
+        entropy_path, hedge_path = reference_paths("SNDK", "lighter", str(tmp_path))
         original = b"wrong,header\n1,2\n"
         with open(entropy_path, "wb") as fh:
             fh.write(original)
@@ -1008,16 +1015,18 @@ def test_bad_header_disables_only_one_sibling_writer(tmp_path, monkeypatch):
         assert open(entropy_path, "rb").read() == original
         recorder.hedge_writer.store.flush()
         with sqlite3.connect(recorder.hedge_writer.store.path) as conn:
-            assert conn.execute("SELECT COUNT(*) FROM entropy_reference").fetchone() == (1,)
-            assert conn.execute("SELECT COUNT(*) FROM hedge_reference").fetchone() == (1,)
+            assert conn.execute(
+                "SELECT COUNT(*) FROM entropy_reference"
+            ).fetchone() == (1,)
+            assert conn.execute("SELECT COUNT(*) FROM hedge_reference").fetchone() == (
+                1,
+            )
         recorder.hedge_writer.store.close()
 
     asyncio.run(scenario())
 
 
-def test_sibling_isolation_prevents_write_after_stop_accepting(
-    tmp_path, monkeypatch
-):
+def test_sibling_isolation_prevents_write_after_stop_accepting(tmp_path, monkeypatch):
     async def scenario():
         from entropy_arb import reference
 
@@ -1080,12 +1089,10 @@ def test_sibling_isolation_prevents_write_after_stop_accepting(
         stop.set()
         await task
         first_close = min(
-            index for index, event in enumerate(events)
-            if event.startswith("close:")
+            index for index, event in enumerate(events) if event.startswith("close:")
         )
         assert all(
-            not event.startswith("write:")
-            for event in events[first_close + 1:]
+            not event.startswith("write:") for event in events[first_close + 1 :]
         )
         assert all(
             events.index(event) < first_close

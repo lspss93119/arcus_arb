@@ -17,7 +17,6 @@ import pytest
 
 _IMPORT_ERROR = None
 try:
-    from main import validate_runtime_gates
     from entropy_arb.arcus_auth import (
         ArcusCredentialError,
         ArcusCredentials,
@@ -39,6 +38,7 @@ try:
         parse_arcus_user_fill,
         parse_arcus_user_fills,
     )
+    from entropy_arb.book import OrderBook
     from entropy_arb.calibration import (
         ARCUS_CALIBRATION_QTY,
         CANCEL_EDGE_BPS,
@@ -61,16 +61,16 @@ try:
         fetch_lighter_open_orders,
         resolve_verified_rh_fee_bps,
     )
-    from entropy_arb.book import OrderBook
+    from entropy_arb.storage import ArcusCalibrationEventRow, MarketHistoryStore
     from entropy_arb.strategy import StableBasisStrategy
     from entropy_arb.venue_lighter import (
+        LIGHTER_FEE_TICK_SCALE,
         LighterAccountLimits,
         LighterVenue,
-        LIGHTER_FEE_TICK_SCALE,
         lighter_fee_tick_to_bps,
         parse_lighter_account_limits,
     )
-    from entropy_arb.storage import ArcusCalibrationEventRow, MarketHistoryStore
+    from main import validate_runtime_gates
 except ImportError as exc:  # RED phase: the new public API is not present yet.
     _IMPORT_ERROR = exc
 
@@ -168,12 +168,14 @@ def test_lighter_standard_zero_fee_is_verified_from_account_limits() -> None:
 
 
 def test_lighter_premium_fee_uses_account_limits_ticks() -> None:
-    limits = parse_lighter_account_limits(_account_limits_payload(
-        user_tier="premium",
-        user_tier_name="Premium",
-        maker_tick=40,
-        taker_tick=280,
-    ))
+    limits = parse_lighter_account_limits(
+        _account_limits_payload(
+            user_tier="premium",
+            user_tier_name="Premium",
+            maker_tick=40,
+            taker_tick=280,
+        )
+    )
     hedge = SimpleNamespace(fee_bps=Decimal("0"), fee_bps_verified=False)
     assert resolve_verified_rh_fee_bps(hedge, limits) == Decimal("2.8")
     assert limits.maker_fee_bps == Decimal("0.4")
@@ -225,19 +227,23 @@ def test_lighter_account_limits_uses_authenticated_account_index() -> None:
     venue._get = fake_get
     limits = asyncio.run(venue.fetch_account_limits())
     assert limits.user_tier == "standard"
-    assert calls == [(
-        "/api/v1/accountLimits",
-        {"account_index": 42},
-        {"Authorization": "auth-token"},
-    )]
+    assert calls == [
+        (
+            "/api/v1/accountLimits",
+            {"account_index": 42},
+            {"Authorization": "auth-token"},
+        )
+    ]
 
 
 def test_lighter_unknown_account_tier_fails_closed() -> None:
     with pytest.raises(ValueError, match="unknown Lighter account tier"):
-        parse_lighter_account_limits(_account_limits_payload(
-            user_tier="mystery",
-            user_tier_name="Mystery",
-        ))
+        parse_lighter_account_limits(
+            _account_limits_payload(
+                user_tier="mystery",
+                user_tier_name="Mystery",
+            )
+        )
 
 
 def test_lighter_fee_tick_conversion_uses_official_fee_tick_scale() -> None:
@@ -258,12 +264,14 @@ def _fake_rh_open_orders_venue(response: Any):
             market_id: int | None = None,
             market_type: str | None = None,
         ) -> Any:
-            calls.append({
-                "authorization": authorization,
-                "account_index": account_index,
-                "market_id": market_id,
-                "market_type": market_type,
-            })
+            calls.append(
+                {
+                    "authorization": authorization,
+                    "account_index": account_index,
+                    "market_id": market_id,
+                    "market_type": market_type,
+                }
+            )
             if isinstance(response, BaseException):
                 raise response
             return response
@@ -299,19 +307,23 @@ def test_rh_open_orders_uses_authenticated_official_api_and_rh_market_id() -> No
     )
 
     assert asyncio.run(fetch_lighter_open_orders(venue)) == []
-    assert calls == [{
-        "authorization": "auth-token",
-        "account_index": 42,
-        "market_id": 32,
-        "market_type": None,
-    }]
+    assert calls == [
+        {
+            "authorization": "auth-token",
+            "account_index": 42,
+            "market_id": 32,
+            "market_type": None,
+        }
+    ]
 
 
 def test_rh_open_orders_sndk_order_blocks_startup_gate() -> None:
-    venue, _ = _fake_rh_open_orders_venue({
-        "code": 200,
-        "orders": [{"market_index": 32, "order_id": "rh-sndk"}],
-    })
+    venue, _ = _fake_rh_open_orders_venue(
+        {
+            "code": 200,
+            "orders": [{"market_index": 32, "order_id": "rh-sndk"}],
+        }
+    )
 
     rows = asyncio.run(fetch_lighter_open_orders(venue))
     assert len(rows) == 1
@@ -319,10 +331,12 @@ def test_rh_open_orders_sndk_order_blocks_startup_gate() -> None:
 
 
 def test_rh_open_orders_ignores_unrelated_market_response_row() -> None:
-    venue, _ = _fake_rh_open_orders_venue({
-        "code": 200,
-        "orders": [{"market_index": 99, "order_id": "other-market"}],
-    })
+    venue, _ = _fake_rh_open_orders_venue(
+        {
+            "code": 200,
+            "orders": [{"market_index": 99, "order_id": "other-market"}],
+        }
+    )
 
     assert asyncio.run(fetch_lighter_open_orders(venue)) == []
 
@@ -381,12 +395,14 @@ def test_rh_fee_gate_never_falls_back_to_public_orderbook_fee() -> None:
 
 def test_verified_rh_fee_value_is_used_by_expected_edge_model() -> None:
     hedge = SimpleNamespace(fee_bps=Decimal("1.25"), fee_bps_verified=False)
-    limits = parse_lighter_account_limits(_account_limits_payload(
-        user_tier="premium",
-        user_tier_name="Premium",
-        maker_tick=40,
-        taker_tick=125,
-    ))
+    limits = parse_lighter_account_limits(
+        _account_limits_payload(
+            user_tier="premium",
+            user_tier_name="Premium",
+            maker_tick=40,
+            taker_tick=125,
+        )
+    )
     verified_fee = resolve_verified_rh_fee_bps(hedge, limits)
     edge = expected_edge_bps(
         side="SELL",
@@ -413,9 +429,12 @@ def test_rolling_center_warmup_uses_zero_fallback_and_can_quote() -> None:
 
     assert controller.center_bps() == Decimal("0")
     assert controller.center_source() == "fallback"
-    assert choose_quote(
-        build_quote_candidates(_quote_input(center_bps=controller.center_bps()))
-    ) is not None
+    assert (
+        choose_quote(
+            build_quote_candidates(_quote_input(center_bps=controller.center_bps()))
+        )
+        is not None
+    )
 
     strategy.bootstrap([(0.0, 1.0), (3_599.0, 3.0)], now=3_600.0)
     assert controller.center_bps() == Decimal("2")
@@ -498,9 +517,15 @@ def test_alo_is_the_only_calibration_tif() -> None:
 
 
 def test_alo_would_cross_is_rejected_without_taker_fallback() -> None:
-    assert ArcusMakerClient.would_cross("BUY", Decimal("100.20"), Decimal("100.10"), Decimal("100.20"))
-    assert ArcusMakerClient.would_cross("SELL", Decimal("100.00"), Decimal("100.00"), Decimal("100.10"))
-    assert not ArcusMakerClient.would_cross("BUY", Decimal("100.09"), Decimal("100.10"), Decimal("100.20"))
+    assert ArcusMakerClient.would_cross(
+        "BUY", Decimal("100.20"), Decimal("100.10"), Decimal("100.20")
+    )
+    assert ArcusMakerClient.would_cross(
+        "SELL", Decimal("100.00"), Decimal("100.00"), Decimal("100.10")
+    )
+    assert not ArcusMakerClient.would_cross(
+        "BUY", Decimal("100.09"), Decimal("100.10"), Decimal("100.20")
+    )
 
 
 def test_signer_never_prints_private_key_and_signs_typed_payload() -> None:
@@ -679,42 +704,46 @@ def test_controller_retains_old_context_through_cancel_fill_race(tmp_path) -> No
         old_client_id = old_lifecycle.client_id
         old_order_id = old_lifecycle.order_id
         await controller.cancel_outstanding()
-        await controller.on_order(ArcusOrderUpdate(
-            order_id=old_order_id or "",
-            client_id=old_client_id,
-            market_id=33,
-            market_display_name="SNDK-USD",
-            side="SELL",
-            status="CANCELED",
-            state="CANCELED",
-            price=Decimal("100"),
-            original_size=Decimal("0.01"),
-            remaining_size=Decimal("0.01"),
-            avg_fill_price=None,
-            created_at_us=1,
-            updated_at_us=2,
-            sequence_number=1,
-            is_snapshot=False,
-        ))
+        await controller.on_order(
+            ArcusOrderUpdate(
+                order_id=old_order_id or "",
+                client_id=old_client_id,
+                market_id=33,
+                market_display_name="SNDK-USD",
+                side="SELL",
+                status="CANCELED",
+                state="CANCELED",
+                price=Decimal("100"),
+                original_size=Decimal("0.01"),
+                remaining_size=Decimal("0.01"),
+                avg_fill_price=None,
+                created_at_us=1,
+                updated_at_us=2,
+                sequence_number=1,
+                is_snapshot=False,
+            )
+        )
         await controller.reconcile()
         await controller._place_quote(candidate)
         assert controller.lifecycle is not old_lifecycle
-        await controller.on_fill(ArcusUserFill(
-            trade_id="late-old-fill",
-            order_id=old_order_id or "",
-            client_id=old_client_id,
-            market_id=33,
-            market_display_name="SNDK-USD",
-            side="SELL",
-            price=Decimal("100"),
-            quantity=Decimal("0.01"),
-            fee=Decimal("0.01"),
-            created_at_us=1_001,
-            sequence_number=2,
-            is_snapshot=False,
-            local_receive_ts_ms=10,
-            local_receive_monotonic_ns=10,
-        ))
+        await controller.on_fill(
+            ArcusUserFill(
+                trade_id="late-old-fill",
+                order_id=old_order_id or "",
+                client_id=old_client_id,
+                market_id=33,
+                market_display_name="SNDK-USD",
+                side="SELL",
+                price=Decimal("100"),
+                quantity=Decimal("0.01"),
+                fee=Decimal("0.01"),
+                created_at_us=1_001,
+                sequence_number=2,
+                is_snapshot=False,
+                local_receive_ts_ms=10,
+                local_receive_monotonic_ns=10,
+            )
+        )
         assert old_lifecycle.state == "CANCELED"
         assert old_lifecycle.filled_qty == Decimal("0.01")
         assert controller.lifecycle.state == "OPEN"
@@ -775,58 +804,66 @@ def test_cancel_fill_race_still_accounts_and_hedges_fill() -> None:
 
 def test_historical_userfills_snapshot_is_not_rehedged() -> None:
     state = ArcusAccountState(startup_watermark_us=1_000)
-    historical = parse_arcus_user_fill({
-        "type": "subscribed",
-        "channel": "userFills",
-        "contents": {
-            "isSnapshot": True,
-            "tradeId": "old",
-            "orderId": "old-order",
-            "market": "SNDK-USD",
-            "side": "SELL",
-            "fillPrice": "100",
-            "fillSize": "0.01",
-            "createdAt": 999,
-        },
-    })
+    historical = parse_arcus_user_fill(
+        {
+            "type": "subscribed",
+            "channel": "userFills",
+            "contents": {
+                "isSnapshot": True,
+                "tradeId": "old",
+                "orderId": "old-order",
+                "market": "SNDK-USD",
+                "side": "SELL",
+                "fillPrice": "100",
+                "fillSize": "0.01",
+                "createdAt": 999,
+            },
+        }
+    )
     assert historical is not None
     assert state.should_hedge_fill(historical) is False
-    live = parse_arcus_user_fill({
-        "type": "channel_data",
-        "channel": "userFills",
-        "contents": {
-            "isSnapshot": False,
-            "tradeId": "new",
-            "orderId": "new-order",
-            "market": "SNDK-USD",
-            "side": "SELL",
-            "fillPrice": "100",
-            "fillSize": "0.01",
-            "createdAt": 1_001,
-        },
-    })
+    live = parse_arcus_user_fill(
+        {
+            "type": "channel_data",
+            "channel": "userFills",
+            "contents": {
+                "isSnapshot": False,
+                "tradeId": "new",
+                "orderId": "new-order",
+                "market": "SNDK-USD",
+                "side": "SELL",
+                "fillPrice": "100",
+                "fillSize": "0.01",
+                "createdAt": 1_001,
+            },
+        }
+    )
     assert live is not None
     state.calibration_client_ids.add("new-order")
     assert state.should_hedge_fill(live) is True
 
 
 def test_arcus_userfills_snapshot_unwraps_current_fills_wrapper() -> None:
-    fills = parse_arcus_user_fills({
-        "type": "subscribed",
-        "channel": "userFills",
-        "contents": {
-            "isSnapshot": True,
-            "fills": [{
-                "tradeId": "snapshot-fill",
-                "orderId": "snapshot-order",
-                "market": "SNDK-USD",
-                "side": "SELL",
-                "fillPrice": "100.25",
-                "fillSize": "0.01",
-                "createdAt": 1_001,
-            }],
-        },
-    })
+    fills = parse_arcus_user_fills(
+        {
+            "type": "subscribed",
+            "channel": "userFills",
+            "contents": {
+                "isSnapshot": True,
+                "fills": [
+                    {
+                        "tradeId": "snapshot-fill",
+                        "orderId": "snapshot-order",
+                        "market": "SNDK-USD",
+                        "side": "SELL",
+                        "fillPrice": "100.25",
+                        "fillSize": "0.01",
+                        "createdAt": 1_001,
+                    }
+                ],
+            },
+        }
+    )
     assert len(fills) == 1
     assert fills[0].price == Decimal("100.25")
     assert fills[0].quantity == Decimal("0.01")
@@ -834,17 +871,19 @@ def test_arcus_userfills_snapshot_unwraps_current_fills_wrapper() -> None:
 
 
 def test_arcus_userfills_snapshot_preserves_each_fill_row() -> None:
-    fills = parse_arcus_user_fills({
-        "type": "subscribed",
-        "channel": "userFills",
-        "contents": {
-            "isSnapshot": True,
-            "fills": [
-                {"side": "BUY", "fillPrice": "100", "fillSize": "0.01"},
-                {"side": "SELL", "fillPrice": "101", "fillSize": "0.02"},
-            ],
-        },
-    })
+    fills = parse_arcus_user_fills(
+        {
+            "type": "subscribed",
+            "channel": "userFills",
+            "contents": {
+                "isSnapshot": True,
+                "fills": [
+                    {"side": "BUY", "fillPrice": "100", "fillSize": "0.01"},
+                    {"side": "SELL", "fillPrice": "101", "fillSize": "0.02"},
+                ],
+            },
+        }
+    )
     assert [(fill.price, fill.quantity) for fill in fills] == [
         (Decimal("100"), Decimal("0.01")),
         (Decimal("101"), Decimal("0.02")),
@@ -854,15 +893,17 @@ def test_arcus_userfills_snapshot_preserves_each_fill_row() -> None:
 def test_new_arcus_userfill_with_missing_or_nonfinite_price_fails_closed() -> None:
     for price in (None, "NaN", "Infinity"):
         with pytest.raises(ValueError, match="fill.price must be a finite decimal"):
-            parse_arcus_user_fills({
-                "type": "channel_data",
-                "channel": "userFills",
-                "contents": {
-                    "side": "BUY",
-                    "fillPrice": price,
-                    "fillSize": "0.01",
-                },
-            })
+            parse_arcus_user_fills(
+                {
+                    "type": "channel_data",
+                    "channel": "userFills",
+                    "contents": {
+                        "side": "BUY",
+                        "fillPrice": price,
+                        "fillSize": "0.01",
+                    },
+                }
+            )
 
 
 def test_malformed_historical_userfill_is_skipped_without_losing_valid_rows(
@@ -892,31 +933,39 @@ def test_malformed_userfills_does_not_block_account_attribute_updates() -> None:
     feed = ArcusAccountFeed(ADDRESS, "SNDK-USD")
 
     async def exercise() -> None:
-        await feed._handle_message({
-            "type": "subscribed",
-            "channel": "userFills",
-            "contents": {
-                "isSnapshot": True,
-                "fills": [{
-                    "side": "SELL",
-                    "fillPrice": None,
-                    "fillSize": "0.01",
-                }],
-            },
-        })
-        await feed._handle_message({
-            "type": "subscribed",
-            "channel": "accountAttributeUpdates",
-            "contents": {
-                "isSnapshot": True,
-                "entries": [{
-                    "type": "feeTier",
-                    "feeTierLevel": 2,
-                    "makerFeePpm": 200,
-                    "takerFeePpm": 500,
-                }],
-            },
-        })
+        await feed._handle_message(
+            {
+                "type": "subscribed",
+                "channel": "userFills",
+                "contents": {
+                    "isSnapshot": True,
+                    "fills": [
+                        {
+                            "side": "SELL",
+                            "fillPrice": None,
+                            "fillSize": "0.01",
+                        }
+                    ],
+                },
+            }
+        )
+        await feed._handle_message(
+            {
+                "type": "subscribed",
+                "channel": "accountAttributeUpdates",
+                "contents": {
+                    "isSnapshot": True,
+                    "entries": [
+                        {
+                            "type": "feeTier",
+                            "feeTierLevel": 2,
+                            "makerFeePpm": 200,
+                            "takerFeePpm": 500,
+                        }
+                    ],
+                },
+            }
+        )
 
     asyncio.run(exercise())
     assert feed.latest_fee_tier is not None
@@ -970,19 +1019,21 @@ def test_required_account_channel_error_blocks_b0_market_health() -> None:
 def test_reconnect_snapshot_fill_after_session_watermark_is_actionable() -> None:
     state = ArcusAccountState(startup_watermark_us=1_000)
     state.calibration_client_ids.add("b0-current")
-    fill = parse_arcus_user_fill({
-        "type": "subscribed",
-        "channel": "userFills",
-        "contents": {
-            "tradeId": "new-snapshot-fill",
-            "orderId": "o-current",
-            "clientId": "b0-current",
-            "side": "SELL",
-            "fillPrice": "100",
-            "fillSize": "0.01",
-            "createdAt": 1_001,
-        },
-    })
+    fill = parse_arcus_user_fill(
+        {
+            "type": "subscribed",
+            "channel": "userFills",
+            "contents": {
+                "tradeId": "new-snapshot-fill",
+                "orderId": "o-current",
+                "clientId": "b0-current",
+                "side": "SELL",
+                "fillPrice": "100",
+                "fillSize": "0.01",
+                "createdAt": 1_001,
+            },
+        }
+    )
     assert fill is not None and fill.is_snapshot
     assert state.should_hedge_fill(fill) is True
 
@@ -990,50 +1041,56 @@ def test_reconnect_snapshot_fill_after_session_watermark_is_actionable() -> None
 def test_untimestamped_snapshot_is_not_rehedged_before_rest_backfill() -> None:
     state = ArcusAccountState(startup_watermark_us=1_000)
     state.calibration_client_ids.add("b0-current")
-    fill = parse_arcus_user_fill({
-        "type": "subscribed",
-        "channel": "userFills",
-        "contents": {
-            "tradeId": "snapshot-without-time",
-            "orderId": "o-current",
-            "clientId": "b0-current",
-            "side": "SELL",
-            "fillPrice": "100",
-            "fillSize": "0.01",
-        },
-    })
+    fill = parse_arcus_user_fill(
+        {
+            "type": "subscribed",
+            "channel": "userFills",
+            "contents": {
+                "tradeId": "snapshot-without-time",
+                "orderId": "o-current",
+                "clientId": "b0-current",
+                "side": "SELL",
+                "fillPrice": "100",
+                "fillSize": "0.01",
+            },
+        }
+    )
     assert fill is not None and fill.is_snapshot
     assert state.should_hedge_fill(fill) is False
 
 
 def test_userfill_store_only_fee_and_timestamp_are_optional() -> None:
-    fill = parse_arcus_user_fill({
-        "type": "channel_data",
-        "channel": "userFills",
-        "contents": {
-            "tradeId": "trade-live",
-            "orderId": "order-live",
-            "market": "SNDK-USD",
-            "side": "BUY",
-            "fillPrice": "100",
-            "fillSize": "0.01",
-        },
-    })
+    fill = parse_arcus_user_fill(
+        {
+            "type": "channel_data",
+            "channel": "userFills",
+            "contents": {
+                "tradeId": "trade-live",
+                "orderId": "order-live",
+                "market": "SNDK-USD",
+                "side": "BUY",
+                "fillPrice": "100",
+                "fillSize": "0.01",
+            },
+        }
+    )
     assert fill is not None
     assert fill.created_at_us is None
     assert fill.fee is None
 
 
 def test_arcus_order_snapshot_keeps_open_and_recent_closed_separate() -> None:
-    open_orders, closed_orders = parse_arcus_order_snapshot({
-        "type": "subscribed",
-        "channel": "orders",
-        "contents": {
-            "isSnapshot": True,
-            "openOrders": [{"orderId": "o1", "clientId": "b0-1", "status": "OPEN"}],
-            "recentClosedOrders": [{"orderId": "o0", "status": "FILLED"}],
-        },
-    })
+    open_orders, closed_orders = parse_arcus_order_snapshot(
+        {
+            "type": "subscribed",
+            "channel": "orders",
+            "contents": {
+                "isSnapshot": True,
+                "openOrders": [{"orderId": "o1", "clientId": "b0-1", "status": "OPEN"}],
+                "recentClosedOrders": [{"orderId": "o0", "status": "FILLED"}],
+            },
+        }
+    )
     assert [o.order_id for o in open_orders] == ["o1"]
     assert [o.order_id for o in closed_orders] == ["o0"]
 
@@ -1053,71 +1110,90 @@ def test_b0_account_stream_uses_exactly_four_lifecycle_subscriptions() -> None:
 
     messages = [json.loads(message) for message in websocket.sent]
     assert [message["channel"] for message in messages] == [
-        "userFills", "orders", "positions", "accountAttributeUpdates"
+        "userFills",
+        "orders",
+        "positions",
+        "accountAttributeUpdates",
     ]
 
 
 def test_account_fee_tier_uses_current_fee_tier_level_field() -> None:
-    tier = parse_arcus_account_fee_tier({
-        "channel": "accountAttributeUpdates",
-        "contents": {"entries": [{
-            "type": "feeTier",
-            "feeTierLevel": 3,
-            "makerFeePpm": 250,
-            "takerFeePpm": 750,
-        }]},
-    })
+    tier = parse_arcus_account_fee_tier(
+        {
+            "channel": "accountAttributeUpdates",
+            "contents": {
+                "entries": [
+                    {
+                        "type": "feeTier",
+                        "feeTierLevel": 3,
+                        "makerFeePpm": 250,
+                        "takerFeePpm": 750,
+                    }
+                ]
+            },
+        }
+    )
     assert tier is not None
     assert (tier.level, tier.maker_fee_bps, tier.taker_fee_bps) == (
-        3, Decimal("2.5"), Decimal("7.5")
+        3,
+        Decimal("2.5"),
+        Decimal("7.5"),
     )
 
 
 def test_arcus_fee_table_preserves_negative_maker_rebate() -> None:
-    tiers = parse_arcus_fee_tiers({
-        "tiers": [{
-            "level": 0,
-            "name": "maker-rebate",
-            "makerFeePpm": -25,
-            "takerFeePpm": 100,
-        }],
-    })
+    tiers = parse_arcus_fee_tiers(
+        {
+            "tiers": [
+                {
+                    "level": 0,
+                    "name": "maker-rebate",
+                    "makerFeePpm": -25,
+                    "takerFeePpm": 100,
+                }
+            ],
+        }
+    )
     assert tiers[0].maker_fee_ppm == -25
     assert tiers[0].maker_fee_bps == Decimal("-0.25")
 
 
 def test_order_snapshot_propagates_account_last_sequence_id() -> None:
-    open_orders, _ = parse_arcus_order_snapshot({
-        "type": "subscribed",
-        "channel": "orders",
-        "contents": {
-            "lastSequenceId": 77,
-            "openOrders": [{"orderId": "o1", "status": "OPEN"}],
-            "recentClosedOrders": [],
-        },
-    })
+    open_orders, _ = parse_arcus_order_snapshot(
+        {
+            "type": "subscribed",
+            "channel": "orders",
+            "contents": {
+                "lastSequenceId": 77,
+                "openOrders": [{"orderId": "o1", "status": "OPEN"}],
+                "recentClosedOrders": [],
+            },
+        }
+    )
     assert open_orders[0].last_sequence_id == 77
 
 
 def test_arcus_order_update_supports_cancel_fill_race_states() -> None:
-    update = parse_arcus_order_update({
-        "type": "channel_data",
-        "channel": "orders",
-        "contents": {
-            "orderId": "o1",
-            "clientId": "b0-1",
-            "marketId": 33,
-            "marketDisplayName": "SNDK-USD",
-            "side": "SELL",
-            "status": "CANCELED",
-            "state": "CANCELED",
-            "price": "100",
-            "originalSize": "0.01",
-            "remainingSize": "0.005",
-            "updatedAt": 1_002,
-            "sequenceNumber": 8,
-        },
-    })
+    update = parse_arcus_order_update(
+        {
+            "type": "channel_data",
+            "channel": "orders",
+            "contents": {
+                "orderId": "o1",
+                "clientId": "b0-1",
+                "marketId": 33,
+                "marketDisplayName": "SNDK-USD",
+                "side": "SELL",
+                "status": "CANCELED",
+                "state": "CANCELED",
+                "price": "100",
+                "originalSize": "0.01",
+                "remainingSize": "0.005",
+                "updatedAt": 1_002,
+                "sequenceNumber": 8,
+            },
+        }
+    )
     assert update.status == "CANCELED"
     assert update.remaining_size == Decimal("0.005")
     assert update.sequence_number == 8
@@ -1165,9 +1241,7 @@ def test_b0_step_does_not_halt_on_outside_rth() -> None:
     controller.current_candidate = None
     controller.accumulator = FillAccumulator(rh_min_qty=RH_HEDGE_MIN_QTY)
     controller.proposed_quote = lambda: None
-    controller.market_health = lambda: MarketHealth(
-        True, True, True, True, "OK", True
-    )
+    controller.market_health = lambda: MarketHealth(True, True, True, True, "OK", True)
 
     asyncio.run(controller.step())
     assert not controller.risk.halted
@@ -1195,8 +1269,15 @@ def test_session_limits_stop_at_fill_count_notional_loss_and_runtime() -> None:
 
 def test_actual_arcus_fee_is_included_in_pnl() -> None:
     pnl = CalibrationPnL()
-    pnl.add_arcus_fill(side="SELL", price=Decimal("100"), quantity=Decimal("0.01"), fee=Decimal("0.02"))
-    pnl.add_rh_hedge(side="BUY", price=Decimal("99.90"), quantity=Decimal("0.01"), fee=Decimal("0.01"))
+    pnl.add_arcus_fill(
+        side="SELL", price=Decimal("100"), quantity=Decimal("0.01"), fee=Decimal("0.02")
+    )
+    pnl.add_rh_hedge(
+        side="BUY",
+        price=Decimal("99.90"),
+        quantity=Decimal("0.01"),
+        fee=Decimal("0.01"),
+    )
     assert pnl.actual_usd == Decimal("-0.029")
 
 
@@ -1219,11 +1300,17 @@ def test_arcus_disconnect_halts_and_requests_cancel() -> None:
 def test_unknown_open_arcus_order_aborts_without_cancel() -> None:
     state = ArcusAccountState(startup_watermark_us=0)
     with pytest.raises(RuntimeError, match="unknown Arcus"):
-        state.validate_startup_orders([
-            cast(ArcusOrderUpdate, SimpleNamespace(
-                client_id="someone-elses-order", market_id=33, status="OPEN"
-            ))
-        ], calibration_prefix="b0-")
+        state.validate_startup_orders(
+            [
+                cast(
+                    ArcusOrderUpdate,
+                    SimpleNamespace(
+                        client_id="someone-elses-order", market_id=33, status="OPEN"
+                    ),
+                )
+            ],
+            calibration_prefix="b0-",
+        )
 
 
 def test_nonzero_starting_inventory_aborts() -> None:
@@ -1400,10 +1487,15 @@ def test_account_rpc_rejects_unsupported_mutations_locally() -> None:
 
 def test_startup_open_order_gate_does_not_ignore_untriggered_status() -> None:
     state = ArcusAccountState(startup_watermark_us=0)
-    order = cast(ArcusOrderUpdate, SimpleNamespace(
-        client_id="someone-elses-order", market_id=33,
-        status="UNTRIGGERED", state=None,
-    ))
+    order = cast(
+        ArcusOrderUpdate,
+        SimpleNamespace(
+            client_id="someone-elses-order",
+            market_id=33,
+            status="UNTRIGGERED",
+            state=None,
+        ),
+    )
     with pytest.raises(RuntimeError, match="unknown Arcus"):
         state.validate_startup_orders([order], calibration_prefix="b0-")
 

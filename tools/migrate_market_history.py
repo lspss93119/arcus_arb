@@ -9,7 +9,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from entropy_arb.migration import MigrationFileReport, SUPPORTED_HEDGES, migrate_directory
+from entropy_arb.migration import (
+    SUPPORTED_HEDGES,
+    MigrationFileReport,
+    migrate_directory,
+)
 
 
 def _mapping(value: str) -> tuple[str, tuple[str, str]]:
@@ -22,7 +26,9 @@ def _mapping(value: str) -> tuple[str, tuple[str, str]]:
     symbol = symbol.strip()
     hedge = hedge.strip()
     if not filename or not symbol or hedge not in SUPPORTED_HEDGES:
-        raise argparse.ArgumentTypeError("mapping must name a symbol and supported hedge")
+        raise argparse.ArgumentTypeError(
+            "mapping must name a symbol and supported hedge"
+        )
     return filename, (symbol, hedge)
 
 
@@ -38,8 +44,12 @@ def _print_report(report: MigrationFileReport) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path("logs"))
-    parser.add_argument("--database", type=Path, default=Path("data/market-history.sqlite"))
-    parser.add_argument("--map", dest="mappings", action="append", type=_mapping, default=[])
+    parser.add_argument(
+        "--database", type=Path, default=Path("data/market-history.sqlite")
+    )
+    parser.add_argument(
+        "--map", dest="mappings", action="append", type=_mapping, default=[]
+    )
     args = parser.parse_args(argv)
     mappings = dict(args.mappings)
 

@@ -65,8 +65,12 @@ def test_rolling_center_excludes_future_bootstrap_samples():
     strategy = _rolling_stable()
 
     strategy.bootstrap(
-        [(1.0, -10.0), (6 * 3600.0, -2.0), (12 * 3600.0, -6.0),
-         (12 * 3600.0 + 2.0, 1000.0)],
+        [
+            (1.0, -10.0),
+            (6 * 3600.0, -2.0),
+            (12 * 3600.0, -6.0),
+            (12 * 3600.0 + 2.0, 1000.0),
+        ],
         now=12 * 3600.0 + 1.0,
     )
 
@@ -75,12 +79,13 @@ def test_rolling_center_excludes_future_bootstrap_samples():
 
 def test_rolling_center_updates_at_most_once_per_hour():
     strategy = _rolling_stable()
-    history = ([
-        (1.0, -10.0),
-    ] + [
-        (3601.0 + i * 3600.0, float(i))
-        for i in range(9)
-    ] + [(12 * 3600.0, -6.0)])
+    history = (
+        [
+            (1.0, -10.0),
+        ]
+        + [(3601.0 + i * 3600.0, float(i)) for i in range(9)]
+        + [(12 * 3600.0, -6.0)]
+    )
     strategy.bootstrap(
         history,
         now=12 * 3600.0 + 1.0,
@@ -207,17 +212,10 @@ def test_new_drifting_instance_never_restores_old_state():
 
 
 def test_same_observation_stream_produces_deterministic_replay_state_sequence():
-    observations = [
-        (1000.0 + i, -2.0 if i < 30 else 2.0)
-        for i in range(61)
-    ]
+    observations = [(1000.0 + i, -2.0 if i < 30 else 2.0) for i in range(61)]
 
-    live_style = DriftingBasisStrategy(
-        window_minutes=1, upper_bps=3.0, lower_bps=3.5
-    )
-    replay_style = DriftingBasisStrategy(
-        window_minutes=1, upper_bps=3.0, lower_bps=3.5
-    )
+    live_style = DriftingBasisStrategy(window_minutes=1, upper_bps=3.0, lower_bps=3.5)
+    replay_style = DriftingBasisStrategy(window_minutes=1, upper_bps=3.0, lower_bps=3.5)
 
     live_states = []
     replay_states = []

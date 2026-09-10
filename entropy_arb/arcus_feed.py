@@ -3,6 +3,7 @@
 One multiplexed public socket carries exactly three Phase A subscriptions:
 the incremental L2 book, public trades, and global market attributes.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +11,8 @@ import inspect
 import json
 import logging
 import time
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 try:
     from websockets.asyncio.client import connect as ws_connect
@@ -45,11 +47,11 @@ class ArcusBookFeed:
         book: ArcusOrderBook,
         *,
         ws_url: str = ARCUS_WS_URL,
-        market_id: Optional[int] = None,
-        notify: Optional[Callable[[], None]] = None,
-        l2_event_sink: Optional[Callback] = None,
-        trade_sink: Optional[Callback] = None,
-        attribute_sink: Optional[Callback] = None,
+        market_id: int | None = None,
+        notify: Callable[[], None] | None = None,
+        l2_event_sink: Callback | None = None,
+        trade_sink: Callback | None = None,
+        attribute_sink: Callback | None = None,
         n_levels: int = ARCUS_BOOK_LEVELS,
     ) -> None:
         if not 1 <= n_levels <= 100:
@@ -63,11 +65,11 @@ class ArcusBookFeed:
         self.trade_sink = trade_sink
         self.attribute_sink = attribute_sink
         self.n_levels = n_levels
-        self.latest_attributes: Optional[ArcusMarketAttributes] = None
+        self.latest_attributes: ArcusMarketAttributes | None = None
         self._resync_requested = False
         self.l2_event_rows = 0
 
-    async def _call(self, callback: Optional[Callback], *args: Any) -> None:
+    async def _call(self, callback: Callback | None, *args: Any) -> None:
         if callback is None:
             return
         result = callback(*args)
@@ -95,17 +97,27 @@ class ArcusBookFeed:
             await websocket.send(json.dumps(message, separators=(",", ":")))
 
     async def _resubscribe_book(self, websocket) -> None:
-        await websocket.send(json.dumps({
-            "type": "unsubscribe",
-            "channel": "l2OrderbookUpdates",
-            "id": self.market_display_name,
-        }, separators=(",", ":")))
-        await websocket.send(json.dumps({
-            "type": "subscribe",
-            "channel": "l2OrderbookUpdates",
-            "id": self.market_display_name,
-            "nLevels": self.n_levels,
-        }, separators=(",", ":")))
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "unsubscribe",
+                    "channel": "l2OrderbookUpdates",
+                    "id": self.market_display_name,
+                },
+                separators=(",", ":"),
+            )
+        )
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "subscribe",
+                    "channel": "l2OrderbookUpdates",
+                    "id": self.market_display_name,
+                    "nLevels": self.n_levels,
+                },
+                separators=(",", ":"),
+            )
+        )
 
     async def _emit_l2_events(
         self,
@@ -114,8 +126,8 @@ class ArcusBookFeed:
         bids: tuple[tuple[str, str], ...],
         asks: tuple[tuple[str, str], ...],
         last_sequence_id: int,
-        global_sequence_id: Optional[int],
-        exchange_timestamp_us: Optional[int],
+        global_sequence_id: int | None,
+        exchange_timestamp_us: int | None,
         local_receive_ts_ms: int,
         local_receive_monotonic_ns: int,
     ) -> None:
@@ -145,30 +157,36 @@ class ArcusBookFeed:
 
     def _is_target(self, message: dict) -> bool:
         identifier = message.get("id")
-        return identifier is None or str(identifier).upper() == self.market_display_name.upper()
+        return (
+            identifier is None
+            or str(identifier).upper() == self.market_display_name.upper()
+        )
 
     async def handle_message(
         self,
         websocket,
         message: dict,
-        local_receive_ts_ms: Optional[int] = None,
-        local_receive_monotonic_ns: Optional[int] = None,
+        local_receive_ts_ms: int | None = None,
+        local_receive_monotonic_ns: int | None = None,
     ) -> None:
         channel = message.get("channel")
         if channel in ("l2OrderbookUpdates", "trades") and not self._is_target(message):
             return
-        wall_ms = (int(time.time() * 1000)
-                   if local_receive_ts_ms is None else int(local_receive_ts_ms))
-        mono_ns = (time.monotonic_ns()
-                   if local_receive_monotonic_ns is None
-                   else int(local_receive_monotonic_ns))
+        wall_ms = (
+            int(time.time() * 1000)
+            if local_receive_ts_ms is None
+            else int(local_receive_ts_ms)
+        )
+        mono_ns = (
+            time.monotonic_ns()
+            if local_receive_monotonic_ns is None
+            else int(local_receive_monotonic_ns)
+        )
 
         if channel == "l2OrderbookUpdates":
             if message.get("type") == "subscribed":
                 snapshot = parse_arcus_book_snapshot(message)
-                self.book.apply_snapshot(
-                    snapshot, wall_ms, mono_ns
-                )
+                self.book.apply_snapshot(snapshot, wall_ms, mono_ns)
                 await self._emit_l2_events(
                     event_type="snapshot",
                     bids=snapshot.bids,
@@ -267,15 +285,15 @@ class ArcusBookFeed:
                         wall_ms = int(time.time() * 1000)
                         mono_ns = time.monotonic_ns()
                         message = json.loads(raw)
-                        await self.handle_message(
-                            websocket, message, wall_ms, mono_ns
-                        )
+                        await self.handle_message(websocket, message, wall_ms, mono_ns)
                         if stop.is_set():
                             break
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("[ARCUS] public ws error: %s; reconnect in %.0fs", exc, backoff)
+                log.warning(
+                    "[ARCUS] public ws error: %s; reconnect in %.0fs", exc, backoff
+                )
             self.book.mark_stale()
             self.notify()
             if stop.is_set():

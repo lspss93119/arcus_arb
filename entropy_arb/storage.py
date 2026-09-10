@@ -7,10 +7,10 @@ import math
 import sqlite3
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Sequence
 
 SCHEMA_VERSION = "1"
 FLUSH_INTERVAL_SEC = 10.0
@@ -287,73 +287,246 @@ class FlushReport:
 
 
 _SPECS = {
-    "samples": (SampleRow, ("symbol", "hedge", "timestamp_ms"), (
-        "timestamp_ms", "symbol", "hedge", "premium_bps", "sell_edge_bps", "buy_edge_bps",
-        "entropy_bid", "entropy_ask", "hedge_bid", "hedge_ask", "entropy_book_update_ms", "hedge_book_update_ms")),
-    "minutes": (MinuteRow, ("symbol", "hedge", "minute_ts"), (
-        "minute_ts", "symbol", "hedge", "entropy_bid", "entropy_ask", "hedge_bid", "hedge_ask",
-        "premium_open_bps", "premium_high_bps", "premium_low_bps", "premium_close_bps", "premium_mean_bps",
-        "premium_std_bps", "sell_edge_mean_bps", "sell_edge_max_bps", "buy_edge_mean_bps", "buy_edge_max_bps", "samples")),
-    "entropy_reference": (EntropyReferenceRow, ("symbol", "hedge", "recv_ms", "oracle_px", "mark_px"),
-                           ("symbol", "hedge", "recv_ms", "oracle_px", "mark_px")),
-    "hedge_reference": (HedgeReferenceRow, ("symbol", "hedge", "recv_ms", "server_ms", "index_px", "mark_px"),
-                         ("symbol", "hedge", "recv_ms", "server_ms", "index_px", "mark_px")),
-    "arcus_samples": (ArcusSampleRow, ("symbol", "hedge", "timestamp_ms"), (
-        "timestamp_ms", "symbol", "hedge", "arcus_bid", "arcus_ask",
-        "arcus_bid_size", "arcus_ask_size", "arcus_mid", "rh_bid", "rh_ask",
-        "rh_bid_size", "rh_ask_size", "rh_mid", "premium_bps",
-        "arcus_book_sequence_id", "arcus_global_sequence_id",
-        "arcus_exchange_timestamp_us", "arcus_local_receive_ts_ms",
-        "arcus_local_receive_monotonic_ns", "rh_local_receive_ts_ms",
-        "is_outside_rth", "current_settlement_price", "upper_trading_bound",
-        "lower_trading_bound", "next_upper_trading_bound",
-        "next_lower_trading_bound")),
-    "arcus_minutes": (ArcusMinuteRow, ("symbol", "hedge", "minute_ts"), (
-        "minute_ts", "symbol", "hedge", "arcus_bid", "arcus_ask", "rh_bid",
-        "rh_ask", "premium_open_bps", "premium_high_bps", "premium_low_bps",
-        "premium_close_bps", "premium_mean_bps", "premium_std_bps", "samples")),
-    "arcus_trades": (ArcusTradeRow, (
-        "symbol", "market_id", "trade_id", "exchange_timestamp_us", "price",
-        "quantity"), (
-        "symbol", "market_id", "market_display_name", "trade_id",
-        "exchange_timestamp_us", "local_receive_ts_ms",
-        "local_receive_monotonic_ns", "price", "quantity", "aggressor_side",
-        "sequence_number")),
-    "arcus_market_attributes": (ArcusMarketAttributesRow, (
-        "symbol", "market_id", "local_receive_ts_ms", "local_receive_monotonic_ns"), (
-        "symbol", "market_id", "market_display_name", "market_status",
-        "local_receive_ts_ms", "local_receive_monotonic_ns", "event_timestamp_us",
-        "market_sequence_num", "is_outside_rth", "current_settlement_price",
-        "upper_trading_bound", "lower_trading_bound", "next_upper_trading_bound",
-        "next_lower_trading_bound")),
-    "arcus_market_metadata": (ArcusMarketMetadataRow, (
-        "market_id", "discovered_at_ms"), (
-        "discovered_at_ms", "symbol", "market_id", "market_display_name",
-        "status", "tick_size", "step_size", "min_order_size",
-        "min_order_notional", "max_order_size", "is_outside_rth",
-        "current_settlement_price", "upper_trading_bound", "lower_trading_bound",
-        "next_upper_trading_bound", "next_lower_trading_bound",
-        "regular_trading_hours")),
-    "arcus_l2_events": (ArcusL2EventRow, ("id",), (
-        "symbol", "market_id", "event_type", "book_epoch",
-        "local_receive_ts_ms", "local_receive_monotonic_ns",
-        "last_sequence_id", "global_sequence_id", "side", "price",
-        "absolute_size", "event_index", "exchange_timestamp_us")),
-    "arcus_calibration_events": (ArcusCalibrationEventRow, ("id",), (
-        "session_id", "execution_id", "event_type", "event_ts_ms",
-        "event_local_receive_monotonic_ns", "client_id", "order_id",
-        "arcus_side", "arcus_quote_price", "quote_qty",
-        "quote_created_ts_ms", "expected_edge_bps",
-        "expected_edge_at_fill_bps", "expected_usd", "fill_trade_id",
-        "fill_ts_us", "arcus_fill_price", "arcus_fill_qty", "arcus_fee",
-        "fill_to_hedge_send_ms", "fill_to_rh_fill_ms", "rh_signal_bid",
-        "rh_signal_ask", "rh_hedge_side", "rh_hedge_qty",
-        "rh_hedge_avg_fill", "rh_fee", "matched_edge_usd", "actual_usd",
-        "remaining_arcus_qty", "unhedged_residual_qty", "lifecycle_state",
-        "halt_reason", "account_sequence_id", "rh_order_send_ts_ms",
-        "rh_ack_ts_ms", "rh_fill_receive_ts_ms", "rh_realized_slippage_bps",
-        "arcus_fee_is_estimated", "is_outside_rth", "center_bps",
-        "center_source", "arcus_maker_fee_bps", "rh_taker_fee_bps")),
+    "samples": (
+        SampleRow,
+        ("symbol", "hedge", "timestamp_ms"),
+        (
+            "timestamp_ms",
+            "symbol",
+            "hedge",
+            "premium_bps",
+            "sell_edge_bps",
+            "buy_edge_bps",
+            "entropy_bid",
+            "entropy_ask",
+            "hedge_bid",
+            "hedge_ask",
+            "entropy_book_update_ms",
+            "hedge_book_update_ms",
+        ),
+    ),
+    "minutes": (
+        MinuteRow,
+        ("symbol", "hedge", "minute_ts"),
+        (
+            "minute_ts",
+            "symbol",
+            "hedge",
+            "entropy_bid",
+            "entropy_ask",
+            "hedge_bid",
+            "hedge_ask",
+            "premium_open_bps",
+            "premium_high_bps",
+            "premium_low_bps",
+            "premium_close_bps",
+            "premium_mean_bps",
+            "premium_std_bps",
+            "sell_edge_mean_bps",
+            "sell_edge_max_bps",
+            "buy_edge_mean_bps",
+            "buy_edge_max_bps",
+            "samples",
+        ),
+    ),
+    "entropy_reference": (
+        EntropyReferenceRow,
+        ("symbol", "hedge", "recv_ms", "oracle_px", "mark_px"),
+        ("symbol", "hedge", "recv_ms", "oracle_px", "mark_px"),
+    ),
+    "hedge_reference": (
+        HedgeReferenceRow,
+        ("symbol", "hedge", "recv_ms", "server_ms", "index_px", "mark_px"),
+        ("symbol", "hedge", "recv_ms", "server_ms", "index_px", "mark_px"),
+    ),
+    "arcus_samples": (
+        ArcusSampleRow,
+        ("symbol", "hedge", "timestamp_ms"),
+        (
+            "timestamp_ms",
+            "symbol",
+            "hedge",
+            "arcus_bid",
+            "arcus_ask",
+            "arcus_bid_size",
+            "arcus_ask_size",
+            "arcus_mid",
+            "rh_bid",
+            "rh_ask",
+            "rh_bid_size",
+            "rh_ask_size",
+            "rh_mid",
+            "premium_bps",
+            "arcus_book_sequence_id",
+            "arcus_global_sequence_id",
+            "arcus_exchange_timestamp_us",
+            "arcus_local_receive_ts_ms",
+            "arcus_local_receive_monotonic_ns",
+            "rh_local_receive_ts_ms",
+            "is_outside_rth",
+            "current_settlement_price",
+            "upper_trading_bound",
+            "lower_trading_bound",
+            "next_upper_trading_bound",
+            "next_lower_trading_bound",
+        ),
+    ),
+    "arcus_minutes": (
+        ArcusMinuteRow,
+        ("symbol", "hedge", "minute_ts"),
+        (
+            "minute_ts",
+            "symbol",
+            "hedge",
+            "arcus_bid",
+            "arcus_ask",
+            "rh_bid",
+            "rh_ask",
+            "premium_open_bps",
+            "premium_high_bps",
+            "premium_low_bps",
+            "premium_close_bps",
+            "premium_mean_bps",
+            "premium_std_bps",
+            "samples",
+        ),
+    ),
+    "arcus_trades": (
+        ArcusTradeRow,
+        (
+            "symbol",
+            "market_id",
+            "trade_id",
+            "exchange_timestamp_us",
+            "price",
+            "quantity",
+        ),
+        (
+            "symbol",
+            "market_id",
+            "market_display_name",
+            "trade_id",
+            "exchange_timestamp_us",
+            "local_receive_ts_ms",
+            "local_receive_monotonic_ns",
+            "price",
+            "quantity",
+            "aggressor_side",
+            "sequence_number",
+        ),
+    ),
+    "arcus_market_attributes": (
+        ArcusMarketAttributesRow,
+        ("symbol", "market_id", "local_receive_ts_ms", "local_receive_monotonic_ns"),
+        (
+            "symbol",
+            "market_id",
+            "market_display_name",
+            "market_status",
+            "local_receive_ts_ms",
+            "local_receive_monotonic_ns",
+            "event_timestamp_us",
+            "market_sequence_num",
+            "is_outside_rth",
+            "current_settlement_price",
+            "upper_trading_bound",
+            "lower_trading_bound",
+            "next_upper_trading_bound",
+            "next_lower_trading_bound",
+        ),
+    ),
+    "arcus_market_metadata": (
+        ArcusMarketMetadataRow,
+        ("market_id", "discovered_at_ms"),
+        (
+            "discovered_at_ms",
+            "symbol",
+            "market_id",
+            "market_display_name",
+            "status",
+            "tick_size",
+            "step_size",
+            "min_order_size",
+            "min_order_notional",
+            "max_order_size",
+            "is_outside_rth",
+            "current_settlement_price",
+            "upper_trading_bound",
+            "lower_trading_bound",
+            "next_upper_trading_bound",
+            "next_lower_trading_bound",
+            "regular_trading_hours",
+        ),
+    ),
+    "arcus_l2_events": (
+        ArcusL2EventRow,
+        ("id",),
+        (
+            "symbol",
+            "market_id",
+            "event_type",
+            "book_epoch",
+            "local_receive_ts_ms",
+            "local_receive_monotonic_ns",
+            "last_sequence_id",
+            "global_sequence_id",
+            "side",
+            "price",
+            "absolute_size",
+            "event_index",
+            "exchange_timestamp_us",
+        ),
+    ),
+    "arcus_calibration_events": (
+        ArcusCalibrationEventRow,
+        ("id",),
+        (
+            "session_id",
+            "execution_id",
+            "event_type",
+            "event_ts_ms",
+            "event_local_receive_monotonic_ns",
+            "client_id",
+            "order_id",
+            "arcus_side",
+            "arcus_quote_price",
+            "quote_qty",
+            "quote_created_ts_ms",
+            "expected_edge_bps",
+            "expected_edge_at_fill_bps",
+            "expected_usd",
+            "fill_trade_id",
+            "fill_ts_us",
+            "arcus_fill_price",
+            "arcus_fill_qty",
+            "arcus_fee",
+            "fill_to_hedge_send_ms",
+            "fill_to_rh_fill_ms",
+            "rh_signal_bid",
+            "rh_signal_ask",
+            "rh_hedge_side",
+            "rh_hedge_qty",
+            "rh_hedge_avg_fill",
+            "rh_fee",
+            "matched_edge_usd",
+            "actual_usd",
+            "remaining_arcus_qty",
+            "unhedged_residual_qty",
+            "lifecycle_state",
+            "halt_reason",
+            "account_sequence_id",
+            "rh_order_send_ts_ms",
+            "rh_ack_ts_ms",
+            "rh_fill_receive_ts_ms",
+            "rh_realized_slippage_bps",
+            "arcus_fee_is_estimated",
+            "is_outside_rth",
+            "center_bps",
+            "center_source",
+            "arcus_maker_fee_bps",
+            "rh_taker_fee_bps",
+        ),
+    ),
 }
 
 _CREATE = {
@@ -511,8 +684,13 @@ class MarketHistoryStore:
                 delay_s = min(delay_s * 2.0, 0.25)
         self._conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
 
-    def __init__(self, path: str | Path, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
-                 max_pending_rows_per_dataset: int = MAX_PENDING_ROWS_PER_DATASET):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        max_pending_rows_per_dataset: int = MAX_PENDING_ROWS_PER_DATASET,
+    ):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._max_pending = max_pending_rows_per_dataset
@@ -546,13 +724,23 @@ class MarketHistoryStore:
                                 f"ALTER TABLE arcus_calibration_events "
                                 f"ADD COLUMN {column} {column_type}"
                             )
-                    current = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+                    current = self._conn.execute(
+                        "SELECT value FROM meta WHERE key='schema_version'"
+                    ).fetchone()
                     if current and current[0] != SCHEMA_VERSION:
-                        raise RuntimeError(f"unsupported market-history schema version: {current[0]}")
+                        raise RuntimeError(
+                            f"unsupported market-history schema version: {current[0]}"
+                        )
                     if current is None:
-                        now = datetime.now(timezone.utc).isoformat()
-                        self._conn.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)", (SCHEMA_VERSION,))
-                        self._conn.execute("INSERT INTO meta(key,value) VALUES('created_at_utc',?)", (now,))
+                        now = datetime.now(UTC).isoformat()
+                        self._conn.execute(
+                            "INSERT INTO meta(key,value) VALUES('schema_version',?)",
+                            (SCHEMA_VERSION,),
+                        )
+                        self._conn.execute(
+                            "INSERT INTO meta(key,value) VALUES('created_at_utc',?)",
+                            (now,),
+                        )
                     self._conn.commit()
                 except Exception:
                     self._conn.rollback()
@@ -578,27 +766,43 @@ class MarketHistoryStore:
                 self._dropped_rows[dataset] += 1
                 dropped = self._dropped_rows[dataset]
                 if dropped == 1 or dropped % 1000 == 0:
-                    logger.critical("dropped %d pending %s row(s) at buffer cap", dropped, dataset)
+                    logger.critical(
+                        "dropped %d pending %s row(s) at buffer cap", dropped, dataset
+                    )
                 return
             buf.append(row)
 
-    def append_sample(self, row: SampleRow) -> None: self._append("samples", row)
-    def append_minute(self, row: MinuteRow) -> None: self._append("minutes", row)
-    def append_entropy_reference(self, row: EntropyReferenceRow) -> None: self._append("entropy_reference", row)
-    def append_hedge_reference(self, row: HedgeReferenceRow) -> None: self._append("hedge_reference", row)
-    def append_arcus_sample(self, row: ArcusSampleRow) -> None: self._append("arcus_samples", row)
-    def append_arcus_minute(self, row: ArcusMinuteRow) -> None: self._append("arcus_minutes", row)
-    def append_arcus_trade(self, row: ArcusTradeRow) -> None: self._append("arcus_trades", row)
+    def append_sample(self, row: SampleRow) -> None:
+        self._append("samples", row)
+
+    def append_minute(self, row: MinuteRow) -> None:
+        self._append("minutes", row)
+
+    def append_entropy_reference(self, row: EntropyReferenceRow) -> None:
+        self._append("entropy_reference", row)
+
+    def append_hedge_reference(self, row: HedgeReferenceRow) -> None:
+        self._append("hedge_reference", row)
+
+    def append_arcus_sample(self, row: ArcusSampleRow) -> None:
+        self._append("arcus_samples", row)
+
+    def append_arcus_minute(self, row: ArcusMinuteRow) -> None:
+        self._append("arcus_minutes", row)
+
+    def append_arcus_trade(self, row: ArcusTradeRow) -> None:
+        self._append("arcus_trades", row)
+
     def append_arcus_market_attributes(self, row: ArcusMarketAttributesRow) -> None:
         self._append("arcus_market_attributes", row)
+
     def append_arcus_market_metadata(self, row: ArcusMarketMetadataRow) -> None:
         self._append("arcus_market_metadata", row)
+
     def append_arcus_l2_event(self, row: ArcusL2EventRow) -> None:
         self._append("arcus_l2_events", row)
 
-    def append_arcus_calibration_event(
-        self, row: ArcusCalibrationEventRow
-    ) -> None:
+    def append_arcus_calibration_event(self, row: ArcusCalibrationEventRow) -> None:
         self._append("arcus_calibration_events", row)
 
     def arcus_l2_stats(self) -> ArcusL2Stats:
@@ -613,12 +817,12 @@ class MarketHistoryStore:
                 "SELECT COUNT(*), MIN(local_receive_ts_ms), "
                 "MAX(local_receive_ts_ms) FROM arcus_l2_events"
             ).fetchone()
-        span_ms = (int(last_ts) - int(first_ts)) if (
-            first_ts is not None and last_ts is not None
-        ) else 0
-        events_per_sec = (
-            int(rows) / (span_ms / 1000.0) if span_ms > 0 else 0.0
+        span_ms = (
+            (int(last_ts) - int(first_ts))
+            if (first_ts is not None and last_ts is not None)
+            else 0
         )
+        events_per_sec = int(rows) / (span_ms / 1000.0) if span_ms > 0 else 0.0
         if str(self.path) == ":memory:":
             database_bytes = wal_bytes = 0
         else:
@@ -660,9 +864,9 @@ class MarketHistoryStore:
             if not rows:
                 rows = self._conn.execute(
                     "SELECT timestamp_ms, premium_bps FROM samples "
-                "WHERE symbol=? AND hedge=? AND timestamp_ms>=? "
-                "AND timestamp_ms<? ORDER BY timestamp_ms",
-                (symbol, hedge, int(start_ms), int(end_ms)),
+                    "WHERE symbol=? AND hedge=? AND timestamp_ms>=? "
+                    "AND timestamp_ms<? ORDER BY timestamp_ms",
+                    (symbol, hedge, int(start_ms), int(end_ms)),
                 ).fetchall()
             if not rows:
                 rows = self._conn.execute(
@@ -689,9 +893,9 @@ class MarketHistoryStore:
         if dataset not in _SPECS:
             raise ValueError(f"unknown dataset: {dataset}")
         with self._db_lock:
-            return int(self._conn.execute(
-                f"SELECT COUNT(*) FROM {dataset}"
-            ).fetchone()[0])
+            return int(
+                self._conn.execute(f"SELECT COUNT(*) FROM {dataset}").fetchone()[0]
+            )
 
     def _write(self, dataset: str, rows: Sequence[object]) -> InsertCounts:
         _, keys, fields = _SPECS[dataset]
@@ -706,26 +910,38 @@ class MarketHistoryStore:
                 counts[0] += 1
                 continue
             where = " AND ".join(f"{key}=?" for key in keys)
-            existing = self._conn.execute(f"SELECT {quoted} FROM {dataset} WHERE {where}", tuple(getattr(row, key) for key in keys)).fetchone()
+            existing = self._conn.execute(
+                f"SELECT {quoted} FROM {dataset} WHERE {where}",
+                tuple(getattr(row, key) for key in keys),
+            ).fetchone()
             if existing == values:
                 counts[1] += 1
             else:
                 counts[2] += 1
-                logger.error("conflicting %s row for key %s", dataset, tuple(getattr(row, key) for key in keys))
+                logger.error(
+                    "conflicting %s row for key %s",
+                    dataset,
+                    tuple(getattr(row, key) for key in keys),
+                )
         return InsertCounts(*counts)
 
     def flush(self) -> FlushReport:
         # Serialize flushes, but never hold the buffer lock over SQLite I/O.
         with self._flush_lock:
             with self._buffer_lock:
-                snapshot = {name: tuple(rows) for name, rows in self._buffers.items() if rows}
+                snapshot = {
+                    name: tuple(rows) for name, rows in self._buffers.items() if rows
+                }
             if not snapshot:
                 return FlushReport(True, {})
             try:
                 with self._db_lock:
                     self._conn.execute("BEGIN")
                     try:
-                        results = {name: self._write(name, rows) for name, rows in snapshot.items()}
+                        results = {
+                            name: self._write(name, rows)
+                            for name, rows in snapshot.items()
+                        }
                         self._conn.commit()
                     except Exception:
                         self._conn.rollback()
@@ -733,16 +949,20 @@ class MarketHistoryStore:
                 with self._buffer_lock:
                     for name, rows in snapshot.items():
                         current = self._buffers[name]
-                        if tuple(current[:len(rows)]) != rows:
-                            raise RuntimeError(f"pending {name} prefix changed during flush")
+                        if tuple(current[: len(rows)]) != rows:
+                            raise RuntimeError(
+                                f"pending {name} prefix changed during flush"
+                            )
                     for name, rows in snapshot.items():
-                        del self._buffers[name][:len(rows)]
+                        del self._buffers[name][: len(rows)]
                 return FlushReport(True, results)
             except sqlite3.Error:
                 logger.exception("market-history flush failed")
                 return FlushReport(False, {})
             except Exception:
-                logger.exception("market-history flush committed but buffer removal failed")
+                logger.exception(
+                    "market-history flush committed but buffer removal failed"
+                )
                 return FlushReport(False, {})
 
     def import_rows(self, dataset: str, rows: Sequence[object]) -> InsertCounts:
@@ -760,7 +980,10 @@ class MarketHistoryStore:
 
     def set_meta(self, key: str, value: str) -> None:
         with self._db_lock:
-            self._conn.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            self._conn.execute(
+                "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
             self._conn.commit()
 
     def close(self) -> None:

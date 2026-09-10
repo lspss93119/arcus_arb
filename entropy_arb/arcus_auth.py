@@ -4,16 +4,18 @@ This module deliberately does not generate wallets, register API keys, or
 expose an order-capable client to the record-only venue.  Credentials are
 loaded only when the explicitly gated Phase B0 runtime asks for them.
 """
+
 from __future__ import annotations
 
 import base64
 import json
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 
 class ArcusCredentialError(RuntimeError):
@@ -69,7 +71,7 @@ class ArcusCredentials:
     account_index: int = 0
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "ArcusCredentials":
+    def from_env(cls, env: Mapping[str, str] | None = None) -> ArcusCredentials:
         values = os.environ if env is None else env
 
         def read(name: str) -> str | None:
@@ -118,7 +120,9 @@ class ArcusCredentials:
         try:
             account_index = int(account_index_text)
         except ValueError as exc:
-            raise ArcusCredentialError("ARCUS_ACCOUNT_INDEX must be an integer") from exc
+            raise ArcusCredentialError(
+                "ARCUS_ACCOUNT_INDEX must be an integer"
+            ) from exc
         if not 0 <= account_index <= 9:
             raise ArcusCredentialError("ARCUS_ACCOUNT_INDEX must be between 0 and 9")
 
@@ -227,7 +231,9 @@ class ArcusSigner:
                 "ARCUS_API_KEY does not match the supplied Ed25519 private key"
             )
         if not re.fullmatch(r"0x[0-9a-fA-F]{40}", credentials.account_address):
-            raise ArcusCredentialError("ARCUS_ACCOUNT_ADDRESS must be a 20-byte 0x address")
+            raise ArcusCredentialError(
+                "ARCUS_ACCOUNT_ADDRESS must be a 20-byte 0x address"
+            )
 
     @staticmethod
     def _load_private_key(value: str):

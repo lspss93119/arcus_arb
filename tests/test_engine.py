@@ -2,6 +2,7 @@
 
 Run:  python3 -m pytest tests/  (or  python3 tests/test_engine.py)
 """
+
 import asyncio
 import csv
 import logging
@@ -18,8 +19,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from entropy_arb.book import OrderBook  # noqa: E402
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
-from entropy_arb.storage import MarketHistoryStore  # noqa: E402
 from entropy_arb.premium import calculate_premiums  # noqa: E402
+from entropy_arb.storage import MarketHistoryStore  # noqa: E402
 
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
 
@@ -65,16 +66,18 @@ strategy:
         raise ValueError(strategy_name)
 
     f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
-    f.write(strategy_yaml + f"""
+    f.write(
+        strategy_yaml
+        + f"""
 execution:
   premium_persist_sec: 0.0
 recorder:
   enabled: {str(recorder_enabled).lower()}
   database: {os.path.join(tempfile.gettempdir(), "engine-market-history.sqlite")}
-""")
+"""
+    )
     f.close()
-    return load_config(f.name, NO_ENV,
-                       symbol="SNDK", hedge_venue=hedge_venue)
+    return load_config(f.name, NO_ENV, symbol="SNDK", hedge_venue=hedge_venue)
 
 
 class StubVenue:
@@ -91,8 +94,9 @@ class StubVenue:
         return True
 
     def set_book(self, bid, ask, sz=50.0):
-        self.book.apply_hl([[{"px": str(bid), "sz": str(sz)}],
-                            [{"px": str(ask), "sz": str(sz)}]])
+        self.book.apply_hl(
+            [[{"px": str(bid), "sz": str(sz)}], [{"px": str(ask), "sz": str(sz)}]]
+        )
 
 
 class SettlementVenue(StubVenue):
@@ -109,8 +113,7 @@ class SettlementVenue(StubVenue):
         return self.responses.pop(0)
 
 
-def execution_plan(qty=1.0, buy_px=100.0, sell_px=101.0,
-                   buy_fee=0.001, sell_fee=0.002):
+def execution_plan(qty=1.0, buy_px=100.0, sell_px=101.0, buy_fee=0.001, sell_fee=0.002):
     return SimpleNamespace(
         qty=qty,
         buy_limit=buy_px,
@@ -122,14 +125,14 @@ def execution_plan(qty=1.0, buy_px=100.0, sell_px=101.0,
         marginal_premium_bps=(sell_px / buy_px - 1.0) * 1e4,
         buy_fee=buy_fee,
         sell_fee=sell_fee,
-        exp_edge_usd=(qty * sell_px * (1.0 - sell_fee)
-                      - qty * buy_px * (1.0 + buy_fee)),
+        exp_edge_usd=(
+            qty * sell_px * (1.0 - sell_fee) - qty * buy_px * (1.0 + buy_fee)
+        ),
         gross_edge_usd=qty * (sell_px - buy_px),
     )
 
 
-def settlement_info(status, filled_base, avg_px=None, *, unresolved=False,
-                    err=None):
+def settlement_info(status, filled_base, avg_px=None, *, unresolved=False, err=None):
     return {
         "status": status,
         "filled_base": filled_base,
@@ -139,14 +142,14 @@ def settlement_info(status, filled_base, avg_px=None, *, unresolved=False,
     }
 
 
-def make_settlement_engine(buy_responses, sell_responses, *, buy_fee=10.0,
-                           sell_fee=20.0, telemetry_path=None):
+def make_settlement_engine(
+    buy_responses, sell_responses, *, buy_fee=10.0, sell_fee=20.0, telemetry_path=None
+):
     eng = Engine(make_cfg())
     if telemetry_path is not None:
         eng.execution_telemetry_csv = str(telemetry_path)
     eng.hedge = SettlementVenue("hedge", "RH", buy_responses, fee=buy_fee)
-    eng.entropy = SettlementVenue("entropy", "ENTROPY", sell_responses,
-                                  fee=sell_fee)
+    eng.entropy = SettlementVenue("entropy", "ENTROPY", sell_responses, fee=sell_fee)
     eng.venues = {"entropy": eng.entropy, "hedge": eng.hedge}
     eng._step, eng._min_base, eng._min_notional = 1e-4, 1e-4, 10.0
     eng.hedge.set_book(99.0, 100.0)
@@ -187,10 +190,9 @@ def test_eff_threshold_directions():
     for m in (-7.0, 0.0, 12.5):
         eng = make_engine(midline=m, upper=4.0, lower=3.0)
         state = eng.strategy.state()
-        total = (
-            eng._eff_threshold(buy=eng.hedge, sell=eng.entropy, state=state)
-            + eng._eff_threshold(buy=eng.entropy, sell=eng.hedge, state=state)
-        )
+        total = eng._eff_threshold(
+            buy=eng.hedge, sell=eng.entropy, state=state
+        ) + eng._eff_threshold(buy=eng.entropy, sell=eng.hedge, state=state)
         approx(total, 7.0)
 
 
@@ -201,8 +203,7 @@ def test_stable_strategy_preserves_legacy_hurdle_math():
     approx(eng._eff_threshold(h, e, state), 9.0)
     approx(eng._eff_threshold(e, h, state), -2.0)
     approx(
-        eng._eff_threshold(h, e, state)
-        + eng._eff_threshold(e, h, state),
+        eng._eff_threshold(h, e, state) + eng._eff_threshold(e, h, state),
         7.0,
     )
 
@@ -211,16 +212,16 @@ def test_inventory_ladder():
     eng = make_engine()
     eng.cfg.inventory_scale_bps, eng.cfg.inventory_floor_frac = 10.0, 0.5
     e, h = eng.entropy, eng.hedge
-    e.set_book(99.9, 100.1)   # mid 100
+    e.set_book(99.9, 100.1)  # mid 100
     h.set_book(99.9, 100.1)
-    approx(eng._inv_add_bps(e, h), 0.0)          # flat: dead zone
-    e.position = 90.0                             # long $9k of $10k cap
-    v = eng._inv_add_bps(e, h)                    # buying entropy adds long
-    assert 7.5 < v < 8.5, v                       # u=0.9 -> ~+8
-    approx(eng._inv_add_bps(h, e), 0.0)           # selling entropy reduces
-    h.position = -90.0                            # hedge short $9k too
-    v2 = eng._inv_add_bps(e, h)                   # both legs add -> max()
-    assert abs(v2 - v) < 0.6, (v, v2)             # max, not sum
+    approx(eng._inv_add_bps(e, h), 0.0)  # flat: dead zone
+    e.position = 90.0  # long $9k of $10k cap
+    v = eng._inv_add_bps(e, h)  # buying entropy adds long
+    assert 7.5 < v < 8.5, v  # u=0.9 -> ~+8
+    approx(eng._inv_add_bps(h, e), 0.0)  # selling entropy reduces
+    h.position = -90.0  # hedge short $9k too
+    v2 = eng._inv_add_bps(e, h)  # both legs add -> max()
+    assert abs(v2 - v) < 0.6, (v, v2)  # max, not sum
 
 
 def run_scan(eng):
@@ -229,6 +230,7 @@ def run_scan(eng):
         # (premium_persist_sec is 0 in the test config)
         eng._scan(time.time())
         return eng._scan(time.time())
+
     return asyncio.run(go())
 
 
@@ -277,7 +279,7 @@ def test_scan_respects_position_caps():
     eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
     eng.entropy.set_book(100.14, 100.16)
     eng.hedge.set_book(99.99, 100.01)
-    eng.entropy.position = -100.0   # entropy already short at its cap
+    eng.entropy.position = -100.0  # entropy already short at its cap
     eng.entropy.cap_usd = 10000.0
     eng.hedge.position = 100.0
     eng.hedge.cap_usd = 10000.0
@@ -428,9 +430,7 @@ def test_rolling_center_thresholds_keep_existing_inventory_surcharge():
     assert buy_surcharge > 0
     assert buy_eng._eff_threshold(
         buy_eng.entropy, buy_eng.hedge, buy_state
-    ) == pytest.approx(
-        buy_state.lower_bps - buy_state.center_bps + buy_surcharge
-    )
+    ) == pytest.approx(buy_state.lower_bps - buy_state.center_bps + buy_surcharge)
 
 
 def test_rolling_center_status_exposes_effective_center(caplog):
@@ -515,8 +515,7 @@ def test_strategy_observation_loop_cancels_cleanly():
 
 
 def test_status_reports_stable_strategy(caplog):
-    eng = make_engine(strategy_name="stable_basis", midline=-1.0,
-                      upper=3.0, lower=3.5)
+    eng = make_engine(strategy_name="stable_basis", midline=-1.0, upper=3.0, lower=3.5)
     eng.entropy.set_book(100.0, 100.1)
     eng.hedge.set_book(100.0, 100.1)
 
@@ -593,8 +592,9 @@ def test_execution_actual_full_fill_equals_realized_fill_result():
     plan = execution_plan()
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, plan,
-                           eng.strategy.state(), execution_id="exec-full")
+        await eng._execute(
+            eng.hedge, eng.entropy, plan, eng.strategy.state(), execution_id="exec-full"
+        )
 
     asyncio.run(scenario())
     trade = eng.recent_trades[-1]
@@ -614,8 +614,13 @@ def test_execution_telemetry_persists_filled_filled_actual(tmp_path):
     )
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, execution_plan(),
-                           eng.strategy.state(), execution_id="exec-persist")
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            execution_plan(),
+            eng.strategy.state(),
+            execution_id="exec-persist",
+        )
 
     asyncio.run(scenario())
     rows = execution_rows(telemetry)
@@ -623,8 +628,7 @@ def test_execution_telemetry_persists_filled_filled_actual(tmp_path):
     row = rows[-1]
     assert row["event_type"] == "execution_finalized"
     assert row["execution_id"] == "exec-persist"
-    assert float(row["actual_usd"]) == pytest.approx(
-        101.0 * 0.998 - 100.0 * 1.001)
+    assert float(row["actual_usd"]) == pytest.approx(101.0 * 0.998 - 100.0 * 1.001)
     assert row["lifecycle_status"] == "filled/filled"
     assert row["buy_venue"] == "RH"
     assert row["sell_venue"] == "ENTROPY"
@@ -645,8 +649,13 @@ def test_execution_actual_no_fill_is_zero(tmp_path):
     )
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, execution_plan(),
-                           eng.strategy.state(), execution_id="exec-none")
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            execution_plan(),
+            eng.strategy.state(),
+            execution_id="exec-none",
+        )
 
     asyncio.run(scenario())
     trade = eng.recent_trades[-1]
@@ -667,8 +676,13 @@ def test_execution_telemetry_one_leg_is_pending_not_zero_before_hedge(tmp_path):
     )
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, execution_plan(),
-                           eng.strategy.state(), execution_id="exec-open")
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            execution_plan(),
+            eng.strategy.state(),
+            execution_id="exec-open",
+        )
 
     asyncio.run(scenario())
     row = execution_rows(telemetry)[-1]
@@ -680,16 +694,20 @@ def test_execution_telemetry_one_leg_is_pending_not_zero_before_hedge(tmp_path):
 
 def test_execution_actual_pending_then_includes_successful_hedge():
     eng = make_settlement_engine(
-        [settlement_info("filled", 1.0, 100.0),
-         settlement_info("filled", 1.0, 99.0)],
+        [settlement_info("filled", 1.0, 100.0), settlement_info("filled", 1.0, 99.0)],
         [settlement_info("canceled", 0.0)],
     )
     plan = execution_plan()
     execution_id = "exec-hedge"
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, plan,
-                           eng.strategy.state(), execution_id=execution_id)
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            plan,
+            eng.strategy.state(),
+            execution_id=execution_id,
+        )
         initial = eng.recent_trades[-1]
         assert initial["execution_id"] == execution_id
         assert initial["actual"] is None
@@ -712,15 +730,19 @@ def test_execution_actual_pending_then_includes_successful_hedge():
 def test_execution_telemetry_hedge_finalizes_same_execution_id(tmp_path):
     telemetry = tmp_path / "executions.csv"
     eng = make_settlement_engine(
-        [settlement_info("filled", 1.0, 100.0),
-         settlement_info("filled", 1.0, 99.0)],
+        [settlement_info("filled", 1.0, 100.0), settlement_info("filled", 1.0, 99.0)],
         [settlement_info("canceled", 0.0)],
         telemetry_path=telemetry,
     )
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, execution_plan(),
-                           eng.strategy.state(), execution_id="exec-hedged")
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            execution_plan(),
+            eng.strategy.state(),
+            execution_id="exec-hedged",
+        )
         await eng._maybe_hedge("exec-hedged")
 
     asyncio.run(scenario())
@@ -728,8 +750,7 @@ def test_execution_telemetry_hedge_finalizes_same_execution_id(tmp_path):
     assert {row["execution_id"] for row in rows} == {"exec-hedged"}
     final = rows[-1]
     assert final["event_type"] == "execution_finalized"
-    assert float(final["actual_usd"]) == pytest.approx(
-        -100.0 * 1.001 + 99.0 * 0.999)
+    assert float(final["actual_usd"]) == pytest.approx(-100.0 * 1.001 + 99.0 * 0.999)
     assert final["lifecycle_status"] == "hedged"
     assert final["hedge_venue"] == "RH"
     assert final["hedge_side"] == "SELL"
@@ -740,16 +761,20 @@ def test_execution_telemetry_hedge_finalizes_same_execution_id(tmp_path):
 
 def test_execution_actual_partial_fill_includes_residual_hedge():
     eng = make_settlement_engine(
-        [settlement_info("filled", 2.0, 100.0),
-         settlement_info("filled", 1.0, 98.0)],
+        [settlement_info("filled", 2.0, 100.0), settlement_info("filled", 1.0, 98.0)],
         [settlement_info("filled", 1.0, 101.0)],
     )
     plan = execution_plan(qty=2.0)
     execution_id = "exec-partial"
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, plan,
-                           eng.strategy.state(), execution_id=execution_id)
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            plan,
+            eng.strategy.state(),
+            execution_id=execution_id,
+        )
         assert eng.recent_trades[-1]["actual"] is None
         await eng._maybe_hedge(execution_id)
 
@@ -766,22 +791,24 @@ def test_execution_actual_partial_fill_includes_residual_hedge():
 def test_execution_telemetry_partial_hedge_persists_all_in_result(tmp_path):
     telemetry = tmp_path / "executions.csv"
     eng = make_settlement_engine(
-        [settlement_info("filled", 2.0, 100.0),
-         settlement_info("filled", 1.0, 98.0)],
+        [settlement_info("filled", 2.0, 100.0), settlement_info("filled", 1.0, 98.0)],
         [settlement_info("filled", 1.0, 101.0)],
         telemetry_path=telemetry,
     )
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy,
-                           execution_plan(qty=2.0), eng.strategy.state(),
-                           execution_id="exec-partial")
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            execution_plan(qty=2.0),
+            eng.strategy.state(),
+            execution_id="exec-partial",
+        )
         await eng._maybe_hedge("exec-partial")
 
     asyncio.run(scenario())
     final = execution_rows(telemetry)[-1]
-    expected = (101.0 * 0.998 - 100.0 * 1.001
-                - 100.0 * 1.001 + 98.0 * 0.999)
+    expected = 101.0 * 0.998 - 100.0 * 1.001 - 100.0 * 1.001 + 98.0 * 0.999
     assert float(final["actual_usd"]) == pytest.approx(expected)
     assert float(final["buy_filled_qty"]) == pytest.approx(2.0)
     assert float(final["sell_filled_qty"]) == pytest.approx(1.0)
@@ -798,9 +825,13 @@ def test_finalized_execution_telemetry_survives_shutdown(tmp_path):
     )
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, execution_plan(),
-                           eng.strategy.state(),
-                           execution_id="exec-shutdown")
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            execution_plan(),
+            eng.strategy.state(),
+            execution_id="exec-shutdown",
+        )
 
     asyncio.run(scenario())
     eng.request_stop()
@@ -809,15 +840,22 @@ def test_finalized_execution_telemetry_survives_shutdown(tmp_path):
 
 def test_execution_actual_stays_pending_when_hedge_unresolved():
     eng = make_settlement_engine(
-        [settlement_info("filled", 1.0, 100.0),
-         settlement_info("timeout", 0.0, unresolved=True)],
+        [
+            settlement_info("filled", 1.0, 100.0),
+            settlement_info("timeout", 0.0, unresolved=True),
+        ],
         [settlement_info("canceled", 0.0)],
     )
     execution_id = "exec-unresolved"
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, execution_plan(),
-                           eng.strategy.state(), execution_id=execution_id)
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            execution_plan(),
+            eng.strategy.state(),
+            execution_id=execution_id,
+        )
         await eng._maybe_hedge(execution_id)
 
     asyncio.run(scenario())
@@ -831,16 +869,22 @@ def test_execution_actual_stays_pending_when_hedge_unresolved():
 def test_execution_telemetry_unresolved_hedge_is_not_zero(tmp_path):
     telemetry = tmp_path / "executions.csv"
     eng = make_settlement_engine(
-        [settlement_info("filled", 1.0, 100.0),
-         settlement_info("timeout", 0.0, unresolved=True)],
+        [
+            settlement_info("filled", 1.0, 100.0),
+            settlement_info("timeout", 0.0, unresolved=True),
+        ],
         [settlement_info("canceled", 0.0)],
         telemetry_path=telemetry,
     )
 
     async def scenario():
-        await eng._execute(eng.hedge, eng.entropy, execution_plan(),
-                           eng.strategy.state(),
-                           execution_id="exec-unresolved")
+        await eng._execute(
+            eng.hedge,
+            eng.entropy,
+            execution_plan(),
+            eng.strategy.state(),
+            execution_id="exec-unresolved",
+        )
         await eng._maybe_hedge("exec-unresolved")
 
     asyncio.run(scenario())
@@ -852,7 +896,8 @@ def test_execution_telemetry_unresolved_hedge_is_not_zero(tmp_path):
 
 
 def test_run_inner_logs_selected_stable_strategy_and_no_auto_selection(
-        monkeypatch, caplog):
+    monkeypatch, caplog
+):
     from entropy_arb import engine as engine_module
 
     class LifecycleVenue:
@@ -899,10 +944,12 @@ def test_run_inner_logs_selected_stable_strategy_and_no_auto_selection(
             recorder_enabled=False,
         )
         eng = Engine(cfg, record_only=True)
-        venues = iter([
-            LifecycleVenue("entropy", "ENTROPY"),
-            LifecycleVenue("hedge", "XYZ"),
-        ])
+        venues = iter(
+            [
+                LifecycleVenue("entropy", "ENTROPY"),
+                LifecycleVenue("hedge", "XYZ"),
+            ]
+        )
         monkeypatch.setattr(eng, "_make_venue", lambda conf: next(venues))
         monkeypatch.setattr(engine_module, "MinuteRecorder", QuietMinuteRecorder)
         run_task = asyncio.create_task(eng._run_inner())
@@ -917,7 +964,8 @@ def test_run_inner_logs_selected_stable_strategy_and_no_auto_selection(
 
 
 def test_run_inner_logs_drifting_warmup_strategy_and_no_auto_selection(
-        monkeypatch, caplog):
+    monkeypatch, caplog
+):
     from entropy_arb import engine as engine_module
 
     class LifecycleVenue:
@@ -965,10 +1013,12 @@ def test_run_inner_logs_drifting_warmup_strategy_and_no_auto_selection(
             window_minutes=60,
         )
         eng = Engine(cfg, record_only=True)
-        venues = iter([
-            LifecycleVenue("entropy", "ENTROPY"),
-            LifecycleVenue("hedge", "XYZ"),
-        ])
+        venues = iter(
+            [
+                LifecycleVenue("entropy", "ENTROPY"),
+                LifecycleVenue("hedge", "XYZ"),
+            ]
+        )
         monkeypatch.setattr(eng, "_make_venue", lambda conf: next(venues))
         monkeypatch.setattr(engine_module, "MinuteRecorder", QuietMinuteRecorder)
         run_task = asyncio.create_task(eng._run_inner())
@@ -978,8 +1028,9 @@ def test_run_inner_logs_drifting_warmup_strategy_and_no_auto_selection(
 
     caplog.set_level(logging.INFO, logger="engine")
     asyncio.run(scenario())
-    assert ("strategy=drifting_basis window=60m center=WARMING_UP "
-            "band-offset=[-3.50,+3.00]") in caplog.text
+    assert (
+        "strategy=drifting_basis window=60m center=WARMING_UP band-offset=[-3.50,+3.00]"
+    ) in caplog.text
     assert "No automatic strategy selection." in caplog.text
 
 
@@ -1034,10 +1085,12 @@ async def run_strategy_wiring_scenario(
     for key, value in (execution_overrides or {}).items():
         setattr(cfg, key, value)
     eng = Engine(cfg, record_only=record_only)
-    venues = iter([
-        LifecycleVenue("entropy", "ENTROPY"),
-        LifecycleVenue("hedge", "XYZ"),
-    ])
+    venues = iter(
+        [
+            LifecycleVenue("entropy", "ENTROPY"),
+            LifecycleVenue("hedge", "XYZ"),
+        ]
+    )
     monkeypatch.setattr(eng, "_make_venue", lambda conf: next(venues))
 
     started = {
@@ -1075,7 +1128,11 @@ async def run_strategy_wiring_scenario(
     run_task = asyncio.create_task(eng._run_inner())
     for _ in range(20):
         await asyncio.sleep(0.01)
-        if run_task.done() or started["strategy"].is_set() or started["observer"].is_set():
+        if (
+            run_task.done()
+            or started["strategy"].is_set()
+            or started["observer"].is_set()
+        ):
             break
     snapshot = {
         "strategy": started["strategy"].is_set(),
@@ -1177,7 +1234,8 @@ def attach_reference_venues(
     ],
 )
 def test_reference_lifecycle_matrix(
-        monkeypatch, record_only, recorder_enabled, expected):
+    monkeypatch, record_only, recorder_enabled, expected
+):
     from entropy_arb import engine as engine_module
 
     captured = []
@@ -1186,9 +1244,7 @@ def test_reference_lifecycle_matrix(
         def __init__(self, **kwargs):
             captured.append(kwargs)
 
-    monkeypatch.setattr(
-        engine_module, "ReferenceRecorder", SpyReferenceRecorder
-    )
+    monkeypatch.setattr(engine_module, "ReferenceRecorder", SpyReferenceRecorder)
     eng = Engine(
         make_cfg(recorder_enabled=recorder_enabled),
         record_only=record_only,
@@ -1198,11 +1254,13 @@ def test_reference_lifecycle_matrix(
     assert (recorder is not None) is expected
     if expected:
         assert captured[0] == {
-            "symbol": "SNDK", "hedge_key": "lighter-rh",
+            "symbol": "SNDK",
+            "hedge_key": "lighter-rh",
             "entropy_ws_url": "wss://api.hyperliquid.xyz/ws",
             "entropy_coin": "io:SNDK",
             "hedge_ws_url": "wss://api.rh.lighter.xyz/stream",
-            "hedge_market_id": 32, "store": eng.market_history,
+            "hedge_market_id": 32,
+            "store": eng.market_history,
             "quota_coordinator": eng.entropy_quota,
         }
 
@@ -1223,7 +1281,8 @@ def test_reference_lifecycle_matrix(
     ],
 )
 def test_reference_factory_uses_runtime_resolved_metadata(
-        monkeypatch, hedge_key, hedge_ws_url, market_id):
+    monkeypatch, hedge_key, hedge_ws_url, market_id
+):
     from entropy_arb import engine as engine_module
 
     captured = []
@@ -1232,12 +1291,8 @@ def test_reference_factory_uses_runtime_resolved_metadata(
         def __init__(self, **kwargs):
             captured.append(kwargs)
 
-    monkeypatch.setattr(
-        engine_module, "ReferenceRecorder", SpyReferenceRecorder
-    )
-    eng = Engine(
-        make_cfg(hedge_venue=hedge_key, recorder_enabled=True)
-    )
+    monkeypatch.setattr(engine_module, "ReferenceRecorder", SpyReferenceRecorder)
+    eng = Engine(make_cfg(hedge_venue=hedge_key, recorder_enabled=True))
     attach_reference_venues(
         eng,
         market_id=market_id,
@@ -1272,9 +1327,7 @@ def test_reference_factory_has_no_strategy_wakeup_dependency(monkeypatch):
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr(
-        engine_module, "ReferenceRecorder", SpyReferenceRecorder
-    )
+    monkeypatch.setattr(engine_module, "ReferenceRecorder", SpyReferenceRecorder)
     eng = Engine(make_cfg(), record_only=True)
     attach_reference_venues(eng)
     eng.reference = eng._build_reference_recorder()
@@ -1388,25 +1441,23 @@ def test_engine_awaits_reference_shutdown_without_cancelling_it(monkeypatch):
 
         cfg = make_cfg(recorder_enabled=False)
         eng = Engine(cfg, record_only=True)
-        venues = iter([
-            LifecycleVenue(
-                "hl",
-                coin="io:SNDK",
-                ws_url="wss://api.hyperliquid.xyz/ws",
-            ),
-            LifecycleVenue(
-                "lighter",
-                market_id=32,
-                ws_url="wss://api.rh.lighter.xyz/stream",
-            ),
-        ])
+        venues = iter(
+            [
+                LifecycleVenue(
+                    "hl",
+                    coin="io:SNDK",
+                    ws_url="wss://api.hyperliquid.xyz/ws",
+                ),
+                LifecycleVenue(
+                    "lighter",
+                    market_id=32,
+                    ws_url="wss://api.rh.lighter.xyz/stream",
+                ),
+            ]
+        )
         monkeypatch.setattr(eng, "_make_venue", lambda conf: next(venues))
-        monkeypatch.setattr(
-            engine_module, "ReferenceRecorder", SpyReferenceRecorder
-        )
-        monkeypatch.setattr(
-            engine_module, "MinuteRecorder", QuietMinuteRecorder
-        )
+        monkeypatch.setattr(engine_module, "ReferenceRecorder", SpyReferenceRecorder)
+        monkeypatch.setattr(engine_module, "MinuteRecorder", QuietMinuteRecorder)
         run_task = asyncio.create_task(eng._run_inner())
         await asyncio.wait_for(started.wait(), timeout=0.2)
         assert eng.market_history is not None

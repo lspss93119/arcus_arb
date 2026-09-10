@@ -5,20 +5,20 @@ diffs (dict maintenance), Hyperliquid's l2Book sends full snapshots.
 Freshness is connection-based (any inbound ws frame touches alive_ts): a quiet
 market is not stale, only a dead feed is.
 """
+
 from __future__ import annotations
 
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
-Level = Tuple[float, float]
+Level = tuple[float, float]
 
 
 class OrderBook:
     def __init__(self) -> None:
-        self.bids: Dict[float, float] = {}
-        self.asks: Dict[float, float] = {}
+        self.bids: dict[float, float] = {}
+        self.asks: dict[float, float] = {}
         self.ready = False
         self.last_update_ts = 0.0
         self.alive_ts = 0.0
@@ -49,42 +49,57 @@ class OrderBook:
 
     # ---- Hyperliquid full snapshot ----
     def apply_hl(self, levels: list) -> None:
-        self.bids = {float(l["px"]): float(l["sz"])
-                     for l in levels[0] if float(l["sz"]) > 0}
-        self.asks = {float(l["px"]): float(l["sz"])
-                     for l in levels[1] if float(l["sz"]) > 0}
+        self.bids = {
+            float(level["px"]): float(level["sz"])
+            for level in levels[0]
+            if float(level["sz"]) > 0
+        }
+        self.asks = {
+            float(level["px"]): float(level["sz"])
+            for level in levels[1]
+            if float(level["sz"]) > 0
+        }
         self.ready = True
         self.last_update_ts = time.time()
         self.touch()
 
-    def sorted_bids(self) -> List[Level]:
+    def sorted_bids(self) -> list[Level]:
         return sorted(self.bids.items(), key=lambda kv: -kv[0])
 
-    def sorted_asks(self) -> List[Level]:
+    def sorted_asks(self) -> list[Level]:
         return sorted(self.asks.items())
 
-    def best_bid(self) -> Optional[float]:
+    def best_bid(self) -> float | None:
         return max(self.bids) if self.bids else None
 
-    def best_ask(self) -> Optional[float]:
+    def best_ask(self) -> float | None:
         return min(self.asks) if self.asks else None
 
-    def mid(self) -> Optional[float]:
+    def mid(self) -> float | None:
         if not (self.bids and self.asks):
             return None
         return (max(self.bids) + min(self.asks)) / 2.0
 
     def is_fresh(self, max_age_sec: float) -> bool:
-        return self.ready and bool(self.bids) and bool(self.asks) and (
-            time.time() - self.alive_ts <= max_age_sec)
+        return (
+            self.ready
+            and bool(self.bids)
+            and bool(self.asks)
+            and (time.time() - self.alive_ts <= max_age_sec)
+        )
 
 
 def floor_step(x: float, step: float) -> float:
     return round(math.floor(x / step + 1e-9) * step, 12)
 
 
-def crossable_base(asks: List[Level], bids: List[Level], threshold: float,
-                   buy_fee: float = 0.0, sell_fee: float = 0.0) -> Tuple[float, float]:
+def crossable_base(
+    asks: list[Level],
+    bids: list[Level],
+    threshold: float,
+    buy_fee: float = 0.0,
+    sell_fee: float = 0.0,
+) -> tuple[float, float]:
     """Walk both books level by level and return (base qty, buy notional) that
     can be crossed while every marginal slice still clears fees + threshold."""
     qty = 0.0
@@ -113,7 +128,7 @@ def crossable_base(asks: List[Level], bids: List[Level], threshold: float,
     return qty, buy_notional
 
 
-def walk_depth(levels: List[Level], qty: float) -> Tuple[float, float]:
+def walk_depth(levels: list[Level], qty: float) -> tuple[float, float]:
     remaining = qty
     notional = 0.0
     marginal_px = levels[0][0]
@@ -147,14 +162,24 @@ class ArbPlan:
 
     @property
     def exp_edge_usd(self) -> float:
-        return (self.sell_notional * (1.0 - self.sell_fee)
-                - self.buy_notional * (1.0 + self.buy_fee))
+        return self.sell_notional * (1.0 - self.sell_fee) - self.buy_notional * (
+            1.0 + self.buy_fee
+        )
 
 
-def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
-             buy_fee_bps: float, sell_fee_bps: float, take_fraction: float,
-             cap_notional: float, min_base: float, min_notional: float,
-             size_step: float):
+def plan_arb(
+    buy_book: OrderBook,
+    sell_book: OrderBook,
+    *,
+    threshold_bps: float,
+    buy_fee_bps: float,
+    sell_fee_bps: float,
+    take_fraction: float,
+    cap_notional: float,
+    min_base: float,
+    min_notional: float,
+    size_step: float,
+):
     """Size a two-leg taker slice: buy on buy_book, sell on sell_book.
 
     A slice qualifies when the executable premium (sell bid over buy ask)
@@ -183,10 +208,15 @@ def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
     if buy_notional < min_notional or sell_notional < min_notional:
         return None, "below_min_notional"
     return ArbPlan(
-        qty=target, buy_limit=buy_limit, sell_limit=sell_limit,
-        buy_notional=buy_notional, sell_notional=sell_notional,
-        q_max=q_max, q_max_notional=q_max_notional,
+        qty=target,
+        buy_limit=buy_limit,
+        sell_limit=sell_limit,
+        buy_notional=buy_notional,
+        sell_notional=sell_notional,
+        q_max=q_max,
+        q_max_notional=q_max_notional,
         top_premium_bps=top_premium_bps,
         marginal_premium_bps=(sell_limit / buy_limit - 1.0) * 1e4,
-        buy_fee=buy_fee, sell_fee=sell_fee,
+        buy_fee=buy_fee,
+        sell_fee=sell_fee,
     ), "ok"

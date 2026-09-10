@@ -20,12 +20,17 @@ log = logging.getLogger("reference")
 
 ENTROPY_REFERENCE_HEADER: tuple[str, ...] = ("recv_ms", "oracle_px", "mark_px")
 LIGHTER_REFERENCE_HEADER: tuple[str, ...] = (
-    "recv_ms", "server_ms", "index_px", "mark_px"
+    "recv_ms",
+    "server_ms",
+    "index_px",
+    "mark_px",
 )
 REFERENCE_FEED_STOP_TIMEOUT_SEC = 5.0
 
 
-def reference_paths(symbol: str, hedge_key: str, directory: str = "logs") -> tuple[str, str]:
+def reference_paths(
+    symbol: str, hedge_key: str, directory: str = "logs"
+) -> tuple[str, str]:
     """Legacy export naming helper; live recording no longer writes these paths."""
     return (
         f"{directory}/reference-{symbol}-{hedge_key}-entropy.csv",
@@ -138,10 +143,7 @@ def parse_lighter_reference(
         return None
     if payload_market_id != market_id:
         return None
-    if (
-        channel_market_id is not None
-        and channel_market_id != payload_market_id
-    ):
+    if channel_market_id is not None and channel_market_id != payload_market_id:
         return None
 
     return (
@@ -180,17 +182,31 @@ class EntropyReferenceStoreWriter(_ReferenceStoreWriter):
     def write(self, row: tuple[object, ...]) -> None:
         if self.enabled:
             recv_ms, oracle_px, mark_px = row
-            self.store.append_entropy_reference(EntropyReferenceRow(
-                self.symbol, self.hedge, int(recv_ms), float(oracle_px), float(mark_px)))
+            self.store.append_entropy_reference(
+                EntropyReferenceRow(
+                    self.symbol,
+                    self.hedge,
+                    int(recv_ms),
+                    float(oracle_px),
+                    float(mark_px),
+                )
+            )
 
 
 class HedgeReferenceStoreWriter(_ReferenceStoreWriter):
     def write(self, row: tuple[object, ...]) -> None:
         if self.enabled:
             recv_ms, server_ms, index_px, mark_px = row
-            self.store.append_hedge_reference(HedgeReferenceRow(
-                self.symbol, self.hedge, int(recv_ms), int(server_ms),
-                float(index_px), float(mark_px)))
+            self.store.append_hedge_reference(
+                HedgeReferenceRow(
+                    self.symbol,
+                    self.hedge,
+                    int(recv_ms),
+                    int(server_ms),
+                    float(index_px),
+                    float(mark_px),
+                )
+            )
 
 
 class HLReferenceFeed:
@@ -299,10 +315,7 @@ class HLReferenceFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if (
-                    coordinator is not None
-                    and is_entropy_quota_error(exc)
-                ):
+                if coordinator is not None and is_entropy_quota_error(exc):
                     coordinator.note_quota_error("reference")
                 lifecycle.error(exc, reconnect_delay=reconnect_delay)
                 log.warning(

@@ -9,7 +9,6 @@ from entropy_arb.reference import HLReferenceFeed, ReferenceRecorder
 from entropy_arb.venue_hl import HLVenue
 from entropy_arb.ws_lifecycle import active_entropy_ws_count, reset_entropy_ws_state
 
-
 BOOK_FRAME = json.dumps(
     {
         "channel": "l2Book",
@@ -95,9 +94,7 @@ def test_market_feed_reconnect_has_no_overlapping_entropy_instances(caplog):
             max_active=max_active,
             error=OSError("dropped"),
         )
-        second = TrackingWebSocket(
-            [], active=active, max_active=max_active, stop=stop
-        )
+        second = TrackingWebSocket([], active=active, max_active=max_active, stop=stop)
         connector = ConnectSequence([first, second])
         delays = []
 
@@ -153,7 +150,9 @@ def test_repeated_market_connect_failures_never_accumulate_active_instances():
         max_active = [0]
         sockets = [
             TrackingWebSocket(
-                [], active=active, max_active=max_active,
+                [],
+                active=active,
+                max_active=max_active,
                 error=OSError("connect failed"),
             )
             for _ in range(4)
@@ -167,7 +166,10 @@ def test_repeated_market_connect_failures_never_accumulate_active_instances():
                 stop.set()
 
         feed = HLBookFeed(
-            "ENTROPY", "wss://example.invalid/ws", "io:SNDK", OrderBook(),
+            "ENTROPY",
+            "wss://example.invalid/ws",
+            "io:SNDK",
+            OrderBook(),
             lambda: None,
         )
         from entropy_arb import feeds
@@ -210,7 +212,10 @@ def test_market_feed_shutdown_closes_the_current_entropy_instance():
         socket = BlockingWebSocket([], active=active, max_active=max_active)
         connector = ConnectSequence([socket])
         feed = HLBookFeed(
-            "ENTROPY", "wss://example.invalid/ws", "io:SNDK", OrderBook(),
+            "ENTROPY",
+            "wss://example.invalid/ws",
+            "io:SNDK",
+            OrderBook(),
             lambda: None,
         )
         from entropy_arb import feeds
@@ -236,9 +241,7 @@ def test_entropy_reference_is_one_loop_with_bounded_active_count():
         stop = asyncio.Event()
         active = [0]
         max_active = [0]
-        socket = TrackingWebSocket(
-            [], active=active, max_active=max_active, stop=stop
-        )
+        socket = TrackingWebSocket([], active=active, max_active=max_active, stop=stop)
         connector = ConnectSequence([socket])
         feed = HLReferenceFeed(
             "entropy-reference",

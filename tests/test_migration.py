@@ -4,19 +4,38 @@ from pathlib import Path
 
 from entropy_arb.migration import migrate_directory
 
-
 SAMPLE_HEADER = [
-    "timestamp_ms", "premium_bps", "sell_edge_bps", "buy_edge_bps",
-    "entropy_bid", "entropy_ask", "hedge_bid", "hedge_ask",
-    "entropy_book_update_ms", "hedge_book_update_ms",
+    "timestamp_ms",
+    "premium_bps",
+    "sell_edge_bps",
+    "buy_edge_bps",
+    "entropy_bid",
+    "entropy_ask",
+    "hedge_bid",
+    "hedge_ask",
+    "entropy_book_update_ms",
+    "hedge_book_update_ms",
 ]
 MINUTE_HEADER = [
-    "minute_ts", "time_utc", "symbol", "hedge",
-    "entropy_bid", "entropy_ask", "hedge_bid", "hedge_ask",
-    "premium_open_bps", "premium_high_bps", "premium_low_bps",
-    "premium_close_bps", "premium_mean_bps", "premium_std_bps",
-    "sell_edge_mean_bps", "sell_edge_max_bps",
-    "buy_edge_mean_bps", "buy_edge_max_bps", "samples",
+    "minute_ts",
+    "time_utc",
+    "symbol",
+    "hedge",
+    "entropy_bid",
+    "entropy_ask",
+    "hedge_bid",
+    "hedge_ask",
+    "premium_open_bps",
+    "premium_high_bps",
+    "premium_low_bps",
+    "premium_close_bps",
+    "premium_mean_bps",
+    "premium_std_bps",
+    "sell_edge_mean_bps",
+    "sell_edge_max_bps",
+    "buy_edge_mean_bps",
+    "buy_edge_max_bps",
+    "samples",
 ]
 ENTROPY_REFERENCE_HEADER = ["recv_ms", "oracle_px", "mark_px"]
 HEDGE_REFERENCE_HEADER = ["recv_ms", "server_ms", "index_px", "mark_px"]
@@ -39,10 +58,25 @@ def sample_row(ts=1_700_000_000_000, premium=10.0):
 
 def minute_row(ts=1_699_999_980):
     return [
-        ts, "2023-11-14T22:13:00Z", "SNDK", "lighter-rh",
-        100.09, 100.11, 99.99, 100.01,
-        10.0, 20.0, 10.0, 20.0, 15.0, 5.0,
-        13.0, 18.0, -17.0, -12.0, 2,
+        ts,
+        "2023-11-14T22:13:00Z",
+        "SNDK",
+        "lighter-rh",
+        100.09,
+        100.11,
+        99.99,
+        100.01,
+        10.0,
+        20.0,
+        10.0,
+        20.0,
+        15.0,
+        5.0,
+        13.0,
+        18.0,
+        -17.0,
+        -12.0,
+        2,
     ]
 
 
@@ -112,7 +146,9 @@ def test_same_key_different_payload_is_conflict_and_does_not_replace(tmp_path: P
     src.mkdir()
     database = tmp_path / "history.sqlite"
     name = "samples-v2-SNDK-lighter-rh.csv"
-    write_csv(src / name, SAMPLE_HEADER, [sample_row(premium=10.0), sample_row(premium=999.0)])
+    write_csv(
+        src / name, SAMPLE_HEADER, [sample_row(premium=10.0), sample_row(premium=999.0)]
+    )
 
     report = report_for(migrate_directory(src, database, {}), name)
 
@@ -154,7 +190,12 @@ def test_all_invalid_rows_fail_without_recording_a_migration_timestamp(tmp_path:
 
     assert report.status == "FAIL"
     with sqlite3.connect(database) as conn:
-        assert conn.execute("SELECT value FROM meta WHERE key='last_migration_at_utc'").fetchone() is None
+        assert (
+            conn.execute(
+                "SELECT value FROM meta WHERE key='last_migration_at_utc'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_unknown_schema_fails_closed(tmp_path: Path):
@@ -235,7 +276,10 @@ def test_explicit_samples_mapping_succeeds(tmp_path: Path):
     assert report.status == "PASS"
     assert report.inserted_rows == 1
     with sqlite3.connect(database) as conn:
-        assert conn.execute("SELECT symbol,hedge FROM samples").fetchone() == ("SNDK", "lighter-rh")
+        assert conn.execute("SELECT symbol,hedge FROM samples").fetchone() == (
+            "SNDK",
+            "lighter-rh",
+        )
 
 
 def test_original_csv_bytes_and_mtime_are_unchanged(tmp_path: Path):

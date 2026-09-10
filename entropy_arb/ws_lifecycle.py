@@ -4,13 +4,13 @@ The active counter tracks websocket instances that entered their async context,
 not connection attempts.  Feed implementations still own reconnect policy and
 shutdown; this module only records those lifecycle transitions.
 """
+
 from __future__ import annotations
 
 import logging
 import threading
 import uuid
 from typing import Final
-
 
 _ACTIVE_IDS: set[str] = set()
 _ACTIVE_LOCK: Final = threading.Lock()

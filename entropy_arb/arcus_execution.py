@@ -6,6 +6,7 @@ calibration order.  Account subscriptions remain public according to the
 current Arcus API and are used as the source of truth for asynchronous order
 and fill lifecycle events.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -13,9 +14,10 @@ import inspect
 import json
 import logging
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import aiohttp
 
@@ -162,7 +164,9 @@ def _fill_from_content(
         client_id=_optional_text(content.get("clientId")),
         market_id=market_id,
         market_display_name=_optional_text(
-            content.get("market", content.get("marketDisplayName", message.get("market")))
+            content.get(
+                "market", content.get("marketDisplayName", message.get("market"))
+            )
         ),
         side=side,
         price=price,
@@ -205,8 +209,7 @@ def _user_fill_rows(
                 or contents.get("isSnapshot") is True
             )
         return [contents], bool(
-            message.get("type") == "subscribed"
-            or contents.get("isSnapshot") is True
+            message.get("type") == "subscribed" or contents.get("isSnapshot") is True
         )
     if isinstance(contents, list):
         return contents, bool(message.get("type") == "subscribed")
@@ -292,18 +295,28 @@ def parse_arcus_order_update(
         order_id=str(raw.get("orderId", "")),
         client_id=_optional_text(raw.get("clientId")),
         market_id=_integer(raw.get("marketId"), "order.marketId"),
-        market_display_name=_optional_text(raw.get("marketDisplayName", raw.get("market"))),
+        market_display_name=_optional_text(
+            raw.get("marketDisplayName", raw.get("market"))
+        ),
         side=(str(raw["side"]).upper() if raw.get("side") is not None else None),
         status=status,
         state=str(state).upper() if state is not None else None,
         price=_decimal(raw.get("price"), "order.price", allow_none=True),
-        original_size=_decimal(raw.get("originalSize"), "order.originalSize", allow_none=True),
-        remaining_size=_decimal(raw.get("remainingSize"), "order.remainingSize", allow_none=True),
-        avg_fill_price=_decimal(raw.get("avgFillPrice"), "order.avgFillPrice", allow_none=True),
+        original_size=_decimal(
+            raw.get("originalSize"), "order.originalSize", allow_none=True
+        ),
+        remaining_size=_decimal(
+            raw.get("remainingSize"), "order.remainingSize", allow_none=True
+        ),
+        avg_fill_price=_decimal(
+            raw.get("avgFillPrice"), "order.avgFillPrice", allow_none=True
+        ),
         created_at_us=_integer(raw.get("createdAt"), "order.createdAt"),
         updated_at_us=_integer(raw.get("updatedAt"), "order.updatedAt"),
         sequence_number=_integer(raw.get("sequenceNumber"), "order.sequenceNumber"),
-        is_snapshot=bool(message.get("type") == "subscribed" or raw.get("isSnapshot") is True),
+        is_snapshot=bool(
+            message.get("type") == "subscribed" or raw.get("isSnapshot") is True
+        ),
         last_sequence_id=_integer(
             raw.get("lastSequenceId", message.get("lastSequenceId")),
             "order.lastSequenceId",
@@ -360,14 +373,22 @@ def parse_arcus_fee_tiers(payload: Mapping[str, Any]) -> tuple[ArcusFeeTier, ...
     for index, raw in enumerate(rows):
         if not isinstance(raw, Mapping):
             raise ValueError(f"fee tier {index} is not an object")
-        level = _integer(_fee_value(raw, "level", "level"), f"fee tier {index}.level", allow_none=False)
+        level = _integer(
+            _fee_value(raw, "level", "level"),
+            f"fee tier {index}.level",
+            allow_none=False,
+        )
         maker = _integer(
             _fee_value(raw, "makerFeePpm", "maker_fee_ppm"),
             f"fee tier {index}.makerFeePpm",
             allow_none=False,
             allow_negative=True,
         )
-        taker = _integer(_fee_value(raw, "takerFeePpm", "taker_fee_ppm"), f"fee tier {index}.takerFeePpm", allow_none=False)
+        taker = _integer(
+            _fee_value(raw, "takerFeePpm", "taker_fee_ppm"),
+            f"fee tier {index}.takerFeePpm",
+            allow_none=False,
+        )
         assert level is not None and maker is not None and taker is not None
         result.append(ArcusFeeTier(level, str(raw.get("name", level)), maker, taker))
     return tuple(result)
@@ -481,14 +502,22 @@ class ArcusAccountState:
             if order.client_id and order.client_id.startswith(calibration_prefix):
                 known.append(order)
             else:
-                raise RuntimeError("unknown Arcus SNDK open order; aborting without cancel")
+                raise RuntimeError(
+                    "unknown Arcus SNDK open order; aborting without cancel"
+                )
         return known
 
     @staticmethod
     def validate_starting_inventory(
-        arcus_position: Decimal, rh_position: Decimal, *, tolerance: Decimal = Decimal("0")
+        arcus_position: Decimal,
+        rh_position: Decimal,
+        *,
+        tolerance: Decimal = Decimal("0"),
     ) -> None:
-        if abs(Decimal(arcus_position)) > tolerance or abs(Decimal(rh_position)) > tolerance:
+        if (
+            abs(Decimal(arcus_position)) > tolerance
+            or abs(Decimal(rh_position)) > tolerance
+        ):
             raise RuntimeError("non-zero starting inventory; aborting calibration")
 
 
@@ -631,9 +660,7 @@ class ArcusMakerClient:
                 "Phase B0 refuses to cancel a non-calibration Arcus clientId"
             )
         if order_id is not None and order_id not in self._known_order_ids:
-            raise ArcusOrderError(
-                "Phase B0 refuses to cancel an unknown Arcus orderId"
-            )
+            raise ArcusOrderError("Phase B0 refuses to cancel an unknown Arcus orderId")
         timestamp_ns = time.time_ns()
         signed = build_cancel_ordersign_payload(
             self.credentials,
@@ -791,9 +818,7 @@ class ArcusAccountFeed:
                 str(payload.get("orderType", "")).upper() != "LIMIT"
                 or str(payload.get("timeInForce", "")).upper() != "ALO"
             ):
-                raise ArcusOrderError(
-                    "Phase B0 Arcus placeOrder requires LIMIT+ALO"
-                )
+                raise ArcusOrderError("Phase B0 Arcus placeOrder requires LIMIT+ALO")
             client_id = payload.get("clientId")
             if not isinstance(client_id, str) or not client_id.startswith("b0-"):
                 raise ArcusOrderError(
@@ -809,10 +834,9 @@ class ArcusAccountFeed:
                 raise ArcusOrderError(
                     f"B0 Arcus quantity is fixed at {ARCUS_CALIBRATION_QTY} SNDK"
                 )
-        elif (
-            payload.get("clientId") is not None
-            and not str(payload["clientId"]).startswith("b0-")
-        ):
+        elif payload.get("clientId") is not None and not str(
+            payload["clientId"]
+        ).startswith("b0-"):
             raise ArcusOrderError(
                 "Phase B0 Arcus cancel refuses a non-calibration clientId"
             )
@@ -866,8 +890,10 @@ class ArcusAccountFeed:
                 if set(ARCUS_ACCOUNT_SUBSCRIPTIONS) <= self._subscribed_channels:
                     self.ready.set()
         request_id = message.get("id")
-        if isinstance(request_id, int) and request_id in self._pending and (
-            "status" in message or "result" in message or "error" in message
+        if (
+            isinstance(request_id, int)
+            and request_id in self._pending
+            and ("status" in message or "result" in message or "error" in message)
         ):
             future = self._pending[request_id]
             if not future.done():
@@ -880,9 +906,7 @@ class ArcusAccountFeed:
         try:
             message_type = message.get("type")
             if message_type not in ("subscribed", "channel_data"):
-                raise ValueError(
-                    f"unsupported account frame type={message_type!s}"
-                )
+                raise ValueError(f"unsupported account frame type={message_type!s}")
             if channel == "userFills":
                 receive_ms = int(time.time() * 1000)
                 receive_ns = time.monotonic_ns()
@@ -900,7 +924,10 @@ class ArcusAccountFeed:
                         local_receive_ts_ms=receive_ms,
                         local_receive_monotonic_ns=receive_ns,
                     )
-                    if self.startup_state is not None and fill.sequence_number is not None:
+                    if (
+                        self.startup_state is not None
+                        and fill.sequence_number is not None
+                    ):
                         self.startup_state.account_sequence_id = fill.sequence_number
                     await self._callback(self.on_fill, fill)
                 if skipped:
@@ -983,7 +1010,9 @@ class ArcusAccountFeed:
                 self.websocket = None
                 for future in self._pending.values():
                     if not future.done():
-                        future.set_exception(ArcusOrderError("Arcus account websocket disconnected"))
+                        future.set_exception(
+                            ArcusOrderError("Arcus account websocket disconnected")
+                        )
                 self._pending.clear()
                 if self.on_disconnect is not None:
                     await self._callback(self.on_disconnect)
@@ -1036,14 +1065,19 @@ class ArcusAccountRest:
             "lastSequenceId": payload.get(
                 "lastSequenceId",
                 (payload.get("contents") or {}).get("lastSequenceId")
-                if isinstance(payload.get("contents"), Mapping) else None,
+                if isinstance(payload.get("contents"), Mapping)
+                else None,
             ),
         }
         return [parse_arcus_order_update(message, row) for row in rows]
 
     async def fills(
-        self, address: str, market: str, account_index: int,
-        *, from_us: int | None = None,
+        self,
+        address: str,
+        market: str,
+        account_index: int,
+        *,
+        from_us: int | None = None,
     ) -> list[ArcusUserFill]:
         """Read recent fills for reconnect/cancel-race reconciliation.
 
@@ -1073,16 +1107,16 @@ class ArcusAccountRest:
                 message={"channel": "userFills", "market": market},
                 is_snapshot=False,
             )
-            result.append(replace(
-                fill,
-                local_receive_ts_ms=time.time_ns() // 1_000_000,
-                local_receive_monotonic_ns=time.monotonic_ns(),
-            ))
+            result.append(
+                replace(
+                    fill,
+                    local_receive_ts_ms=time.time_ns() // 1_000_000,
+                    local_receive_monotonic_ns=time.monotonic_ns(),
+                )
+            )
         return result
 
-    async def position(
-        self, address: str, market: str, account_index: int
-    ) -> Decimal:
+    async def position(self, address: str, market: str, account_index: int) -> Decimal:
         payload = await self.get(
             "/v1/positions",
             {"address": address, "market": market, "accountIndex": account_index},

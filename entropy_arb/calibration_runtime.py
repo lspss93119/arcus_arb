@@ -5,6 +5,7 @@ Its only Arcus mutation is a signed LIMIT+ALO maker order and its only
 follow-up mutation is an explicit cancel for that same calibration order.
 Lighter execution is delegated to the existing :class:`LighterVenue`.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -12,10 +13,11 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any
 
 from .arcus_execution import (
     ArcusAccountRest,
@@ -35,9 +37,9 @@ from .calibration import (
     CalibrationPnL,
     FillAccumulator,
     MarketHealth,
+    QuoteCandidate,
     SessionLimits,
     SessionRisk,
-    QuoteCandidate,
     build_quote_candidates,
     choose_quote,
     expected_edge_bps,
@@ -154,18 +156,44 @@ class CalibrationTelemetry:
     """Append-only B0 lifecycle writer backed by the existing WAL store."""
 
     _FIELDS = (
-        "client_id", "order_id", "arcus_side", "arcus_quote_price", "quote_qty",
-        "quote_created_ts_ms", "expected_edge_bps", "expected_edge_at_fill_bps",
-        "expected_usd", "fill_trade_id", "fill_ts_us", "arcus_fill_price",
-        "arcus_fill_qty", "arcus_fee", "arcus_fee_is_estimated",
+        "client_id",
+        "order_id",
+        "arcus_side",
+        "arcus_quote_price",
+        "quote_qty",
+        "quote_created_ts_ms",
+        "expected_edge_bps",
+        "expected_edge_at_fill_bps",
+        "expected_usd",
+        "fill_trade_id",
+        "fill_ts_us",
+        "arcus_fill_price",
+        "arcus_fill_qty",
+        "arcus_fee",
+        "arcus_fee_is_estimated",
         "fill_to_hedge_send_ms",
-        "fill_to_rh_fill_ms", "rh_signal_bid", "rh_signal_ask", "rh_hedge_side",
-        "rh_hedge_qty", "rh_hedge_avg_fill", "rh_fee", "matched_edge_usd",
-        "actual_usd", "remaining_arcus_qty", "unhedged_residual_qty",
-        "halt_reason", "account_sequence_id", "rh_order_send_ts_ms",
-        "rh_ack_ts_ms", "rh_fill_receive_ts_ms", "rh_realized_slippage_bps",
-        "is_outside_rth", "center_bps", "center_source",
-        "arcus_maker_fee_bps", "rh_taker_fee_bps",
+        "fill_to_rh_fill_ms",
+        "rh_signal_bid",
+        "rh_signal_ask",
+        "rh_hedge_side",
+        "rh_hedge_qty",
+        "rh_hedge_avg_fill",
+        "rh_fee",
+        "matched_edge_usd",
+        "actual_usd",
+        "remaining_arcus_qty",
+        "unhedged_residual_qty",
+        "halt_reason",
+        "account_sequence_id",
+        "rh_order_send_ts_ms",
+        "rh_ack_ts_ms",
+        "rh_fill_receive_ts_ms",
+        "rh_realized_slippage_bps",
+        "is_outside_rth",
+        "center_bps",
+        "center_source",
+        "arcus_maker_fee_bps",
+        "rh_taker_fee_bps",
     )
 
     def __init__(
@@ -197,16 +225,18 @@ class CalibrationTelemetry:
                 row_values.update(self.context_provider())
             row_values.update(values)
             lifecycle_state = values.get("lifecycle_state", self.lifecycle.state)
-            row_values.update({
-                "session_id": self.session_id,
-                "execution_id": values.get("execution_id") or self.session_id,
-                "event_type": event_type,
-                "event_ts_ms": int(values.get("event_ts_ms", time.time() * 1000)),
-                "event_local_receive_monotonic_ns": values.get(
-                    "event_local_receive_monotonic_ns", time.monotonic_ns()
-                ),
-                "lifecycle_state": lifecycle_state,
-            })
+            row_values.update(
+                {
+                    "session_id": self.session_id,
+                    "execution_id": values.get("execution_id") or self.session_id,
+                    "event_type": event_type,
+                    "event_ts_ms": int(values.get("event_ts_ms", time.time() * 1000)),
+                    "event_local_receive_monotonic_ns": values.get(
+                        "event_local_receive_monotonic_ns", time.monotonic_ns()
+                    ),
+                    "lifecycle_state": lifecycle_state,
+                }
+            )
             if row_values["remaining_arcus_qty"] is None:
                 row_values["remaining_arcus_qty"] = _text(self.lifecycle.remaining_qty)
             if row_values["unhedged_residual_qty"] is None:
@@ -398,16 +428,12 @@ class CalibrationController:
     def _context_for_order(self, order: ArcusOrderUpdate) -> _OrderContext | None:
         if order.market_id is not None and order.market_id != self.metadata.market_id:
             return None
-        return self._context_for_ids(
-            client_id=order.client_id, order_id=order.order_id
-        )
+        return self._context_for_ids(client_id=order.client_id, order_id=order.order_id)
 
     def _context_for_fill(self, fill: ArcusUserFill) -> _OrderContext | None:
         if fill.market_id is not None and fill.market_id != self.metadata.market_id:
             return None
-        return self._context_for_ids(
-            client_id=fill.client_id, order_id=fill.order_id
-        )
+        return self._context_for_ids(client_id=fill.client_id, order_id=fill.order_id)
 
     @property
     def arcus_maker_fee_bps(self) -> Decimal:
@@ -447,7 +473,8 @@ class CalibrationController:
         # health remain strict gates below.
         outside_rth = (
             getattr(attributes, "is_outside_rth", None)
-            if attributes is not None else None
+            if attributes is not None
+            else None
         )
         rh_ready = True
         ready_to_trade = getattr(self.hedge, "ready_to_trade", None)
@@ -469,9 +496,7 @@ class CalibrationController:
                 bool(getattr(self.arcus.book, "ready", False))
                 and getattr(self.arcus.book, "sequence_health", "STALE") == "OK"
             ),
-            rh_healthy=(
-                bool(getattr(self.hedge.book, "ready", False)) and rh_ready
-            ),
+            rh_healthy=(bool(getattr(self.hedge.book, "ready", False)) and rh_ready),
             bbo_fresh=(
                 self.arcus.book.is_fresh(self.staleness_sec)
                 and self.hedge.book.is_fresh(self.staleness_sec)
@@ -487,8 +512,7 @@ class CalibrationController:
             outside_rth=outside_rth,
             arcus_status=str(getattr(self.metadata, "status", "UNKNOWN")),
             active_resync=(
-                str(getattr(self.arcus.book, "sequence_health", "STALE"))
-                == "RESYNC"
+                str(getattr(self.arcus.book, "sequence_health", "STALE")) == "RESYNC"
             ),
         )
 
@@ -523,7 +547,8 @@ class CalibrationController:
         if min_notional is not None:
             minimum = _decimal(min_notional, "Arcus min order notional")
             candidates = [
-                candidate for candidate in candidates
+                candidate
+                for candidate in candidates
                 if candidate.price * candidate.quantity >= minimum
             ]
         return choose_quote(candidates)
@@ -551,12 +576,8 @@ class CalibrationController:
             rh_current_taker_fee_tick=getattr(
                 rh_limits, "current_taker_fee_tick", None
             ),
-            rh_verified_maker_fee_bps=getattr(
-                rh_limits, "maker_fee_bps", None
-            ),
-            rh_verified_taker_fee_bps=getattr(
-                rh_limits, "taker_fee_bps", None
-            ),
+            rh_verified_maker_fee_bps=getattr(rh_limits, "maker_fee_bps", None),
+            rh_verified_taker_fee_bps=getattr(rh_limits, "taker_fee_bps", None),
             rh_fee_source=getattr(rh_limits, "source", None),
             arcus_position=arcus_position,
             rh_position=rh_position,
@@ -577,8 +598,11 @@ class CalibrationController:
             center_source=self.center_source(),
             proposed_quote=self.proposed_quote(),
             outside_rth=(
-                getattr(getattr(self.arcus, "latest_attributes", None),
-                        "is_outside_rth", None)
+                getattr(
+                    getattr(self.arcus, "latest_attributes", None),
+                    "is_outside_rth",
+                    None,
+                )
             ),
             limits=self.limits,
         )
@@ -602,10 +626,7 @@ class CalibrationController:
 
     def _estimated_arcus_fee(self, fill: ArcusUserFill) -> Decimal:
         """Return the resolved-tier estimate used only until REST reconciliation."""
-        return (
-            fill.price * fill.quantity * self.arcus_maker_fee_bps
-            / Decimal("10000")
-        )
+        return fill.price * fill.quantity * self.arcus_maker_fee_bps / Decimal("10000")
 
     async def _refresh_actual_arcus_fee(
         self, fill: ArcusUserFill, context: _OrderContext
@@ -655,9 +676,7 @@ class CalibrationController:
             arcus_quote_price=_text(record.context.candidate.price),
             quote_qty=_text(record.context.candidate.quantity),
             quote_created_ts_ms=record.context.lifecycle.quote_created_ts_ms,
-            expected_edge_bps=_text(
-                record.context.lifecycle.expected_edge_at_creation
-            ),
+            expected_edge_bps=_text(record.context.lifecycle.expected_edge_at_creation),
             fill_trade_id=fill.trade_id,
             fill_ts_us=fill.created_at_us,
             arcus_fill_price=_text(fill.price),
@@ -694,9 +713,7 @@ class CalibrationController:
         elif update.sequence_number is not None:
             self.account_state.account_sequence_id = update.sequence_number
         try:
-            context.lifecycle.record_order_status(
-                update.status, update.remaining_size
-            )
+            context.lifecycle.record_order_status(update.status, update.remaining_size)
         except ValueError:
             self.risk.on_telemetry_failure(
                 f"unsupported Arcus order status {update.status}"
@@ -736,16 +753,16 @@ class CalibrationController:
     async def on_fill(self, fill: ArcusUserFill) -> None:
         context = self._context_for_fill(fill)
         if context is None and (
-            not fill.is_snapshot
-            and fill.client_id
-            and fill.client_id.startswith("b0-")
+            not fill.is_snapshot and fill.client_id and fill.client_id.startswith("b0-")
         ):
             # A stale calibration order must never be silently ignored if it
             # fills during startup cancellation or reconnect recovery.
             self.risk.halt("fill received for an unknown B0 clientId")
             self.telemetry.record(
-                "unexpected_fill", client_id=fill.client_id,
-                order_id=fill.order_id, fill_trade_id=fill.trade_id or None,
+                "unexpected_fill",
+                client_id=fill.client_id,
+                order_id=fill.order_id,
+                fill_trade_id=fill.trade_id or None,
                 halt_reason=self.risk.halt_reason,
             )
             await self.cancel_outstanding()
@@ -810,9 +827,7 @@ class CalibrationController:
             return
 
         expected_at_fill = self._expected_edge_at_fill(fill)
-        instruction = self.accumulator.add_fill(
-            side=fill.side, quantity=fill.quantity
-        )
+        instruction = self.accumulator.add_fill(side=fill.side, quantity=fill.quantity)
         self.telemetry.record(
             "fill",
             execution_id=context.execution_id,
@@ -844,9 +859,9 @@ class CalibrationController:
             estimated=fee_is_estimated,
         )
 
-        if self.risk.halted and (
-            self.risk.halt_reason or ""
-        ).startswith("telemetry failure"):
+        if self.risk.halted and (self.risk.halt_reason or "").startswith(
+            "telemetry failure"
+        ):
             # Do not issue a hedge when the audit/loss-control stream has
             # already failed.  The fill remains persisted when possible and
             # is reconciled on shutdown; no new Arcus quote is allowed.
@@ -855,15 +870,11 @@ class CalibrationController:
             return
         if instruction is not None:
             self._last_hedge_matched = False
-            await self._hedge_instruction(
-                fill, instruction, expected_at_fill, context
-            )
+            await self._hedge_instruction(fill, instruction, expected_at_fill, context)
             fee_record = self._arcus_fee_records.get(fill.trade_id)
             if fee_record is not None:
                 fee_record.matched_in_risk = self._last_hedge_matched
-        if fee_is_estimated and not await self._refresh_actual_arcus_fee(
-            fill, context
-        ):
+        if fee_is_estimated and not await self._refresh_actual_arcus_fee(fill, context):
             # The immediate hedge above is still required to remove exposure,
             # but continuing without an actual fee would make the all-in loss
             # calculation unreliable.  Stop and reconcile rather than
@@ -914,10 +925,14 @@ class CalibrationController:
         # Existing Lighter send_taker provides IOC/avg-price protection.  The
         # limit is deliberately bounded at 20 bps from the observed BBO.
         if instruction.hedge_side == "BUY":
-            limit_px = ask * (Decimal("1") + RH_HEDGE_SLIPPAGE_HARD_CAP_BPS / Decimal("10000"))
+            limit_px = ask * (
+                Decimal("1") + RH_HEDGE_SLIPPAGE_HARD_CAP_BPS / Decimal("10000")
+            )
             is_buy = True
         else:
-            limit_px = bid * (Decimal("1") - RH_HEDGE_SLIPPAGE_HARD_CAP_BPS / Decimal("10000"))
+            limit_px = bid * (
+                Decimal("1") - RH_HEDGE_SLIPPAGE_HARD_CAP_BPS / Decimal("10000")
+            )
             is_buy = False
         try:
             result = await self.hedge.send_taker(
@@ -938,7 +953,10 @@ class CalibrationController:
             await self._hedge_failure(f"invalid RH hedge result: {exc}")
             return
         if result.get("unresolved") or status in {
-            "timeout", "send-failed", "sent-unconfirmed", "unknown",
+            "timeout",
+            "send-failed",
+            "sent-unconfirmed",
+            "unknown",
         }:
             await self._hedge_failure(f"RH hedge {status or 'unresolved'}")
             return
@@ -952,25 +970,22 @@ class CalibrationController:
         rh_fee = result.get("fee")
         if rh_fee is None:
             rh_fee_decimal = (
-                avg_px_decimal * filled_qty * self.rh_taker_fee_bps
-                / Decimal("10000")
+                avg_px_decimal * filled_qty * self.rh_taker_fee_bps / Decimal("10000")
             )
         else:
             rh_fee_decimal = _decimal(rh_fee, "RH fee")
         if instruction.hedge_side == "BUY":
-            realized_slippage = (
-                (avg_px_decimal / ask) - Decimal("1")
-            ) * Decimal("10000")
+            realized_slippage = ((avg_px_decimal / ask) - Decimal("1")) * Decimal(
+                "10000"
+            )
         else:
-            realized_slippage = (
-                Decimal("1") - (avg_px_decimal / bid)
-            ) * Decimal("10000")
+            realized_slippage = (Decimal("1") - (avg_px_decimal / bid)) * Decimal(
+                "10000"
+            )
         if realized_slippage > RH_HEDGE_SLIPPAGE_HARD_CAP_BPS:
             # The bounded order has already executed; do not pretend it can be
             # undone.  Record the breach and stop all new Arcus quoting.
-            self.risk.halt(
-                "RH hedge realized slippage exceeded 20 bps emergency cap"
-            )
+            self.risk.halt("RH hedge realized slippage exceeded 20 bps emergency cap")
         try:
             self.pnl.add_rh_hedge(
                 side=instruction.hedge_side,
@@ -989,7 +1004,8 @@ class CalibrationController:
         fill_receive_ns = fill.local_receive_monotonic_ns
         fill_to_send_ms = (
             max(0, send_mono - fill_receive_ns) // 1_000_000
-            if fill_receive_ns is not None else None
+            if fill_receive_ns is not None
+            else None
         )
         fill_to_fill_ms = max(0, time.monotonic_ns() - send_mono) // 1_000_000
         if filled_qty < instruction.quantity:
@@ -1072,9 +1088,7 @@ class CalibrationController:
             )
             status = int(response.get("status", 0))
             if status not in (200, 202):
-                raise RuntimeError(
-                    f"Arcus cancel rejected with status={status}"
-                )
+                raise RuntimeError(f"Arcus cancel rejected with status={status}")
             self._cancel_pending = False
             self.telemetry.record(
                 "cancel_requested",
@@ -1138,8 +1152,9 @@ class CalibrationController:
             # A timeout is not proof of rejection; fail closed and reconcile
             # the clientId through the account stream rather than retrying.
             self.risk.halt(f"Arcus ALO placement unresolved: {exc}")
-            self.telemetry.record("place_failure", client_id=client_id,
-                                  halt_reason=self.risk.halt_reason)
+            self.telemetry.record(
+                "place_failure", client_id=client_id, halt_reason=self.risk.halt_reason
+            )
             await self.cancel_outstanding()
             return
         self.lifecycle.order_id = ack.order_id
@@ -1227,7 +1242,7 @@ class CalibrationController:
                     break
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=0.2)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         finally:
             await self.shutdown()
@@ -1294,9 +1309,8 @@ class CalibrationController:
             await self.cancel_outstanding()
         deadline = time.monotonic() + 15.0
         while (
-            (self.has_live_order or self._terminal_reconcile_pending)
-            and time.monotonic() < deadline
-        ):
+            self.has_live_order or self._terminal_reconcile_pending
+        ) and time.monotonic() < deadline:
             await self.reconcile()
             if self.has_live_order or self._terminal_reconcile_pending:
                 await asyncio.sleep(1.0)
@@ -1372,9 +1386,7 @@ async def fetch_lighter_open_orders(hedge: Any) -> list[Mapping[str, Any]]:
             api_key_index=api_key_index
         )
     except Exception:
-        raise RuntimeError(
-            "RH accountActiveOrders authentication failed"
-        ) from None
+        raise RuntimeError("RH accountActiveOrders authentication failed") from None
     if auth_error is not None or not auth:
         raise RuntimeError("RH accountActiveOrders authentication failed")
 
@@ -1387,8 +1399,7 @@ async def fetch_lighter_open_orders(hedge: Any) -> list[Mapping[str, Any]]:
         )
     except Exception as exc:
         raise RuntimeError(
-            "RH accountActiveOrders request failed "
-            + _lighter_api_error_detail(exc)
+            "RH accountActiveOrders request failed " + _lighter_api_error_detail(exc)
         ) from None
 
     rows = _lighter_active_order_rows(response)
@@ -1411,9 +1422,7 @@ def _lighter_active_order_rows(response: Any) -> list[Mapping[str, Any]]:
             converted = response.to_dict()
             if isinstance(converted, Mapping):
                 code = converted.get("code", code)
-                rows = converted.get(
-                    "orders", converted.get("active_orders")
-                )
+                rows = converted.get("orders", converted.get("active_orders"))
     if code is not None and code != 200:
         raise RuntimeError(f"RH active-order response returned code={code}")
     if rows is None:

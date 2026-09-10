@@ -20,18 +20,19 @@ Strategy model:
     Both hurdles are net of both venues' taker fees, so a full round trip
     nets >= (upper_bps + lower_bps) after fees by construction.
 """
+
 from __future__ import annotations
 
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 import yaml
 from dotenv import load_dotenv
 
 HL_API_URL = "https://api.hyperliquid.xyz"
-HL_WS_URL = "wss://api.hyperliquid.xyz/ws"   # official ws — the only HL feed used
+HL_WS_URL = "wss://api.hyperliquid.xyz/ws"  # official ws — the only HL feed used
 ARCUS_REST_URL = "https://api.arcus.xyz"
 ARCUS_WS_URL = "wss://api.arcus.xyz/v1/ws"
 
@@ -50,19 +51,25 @@ class LighterProfile:
 # Endpoint profiles for the two supported zkLighter deployments (these match
 # lighter-python's lighter.endpoint_profiles, duplicated here so --record-only
 # data collection works without the SDK installed).
-LIGHTER_PROFILES: Dict[str, LighterProfile] = {
+LIGHTER_PROFILES: dict[str, LighterProfile] = {
     "lighter": LighterProfile(
-        "mainnet", "https://mainnet.zklighter.elliot.ai",
-        "wss://mainnet.zklighter.elliot.ai/stream", 304),
+        "mainnet",
+        "https://mainnet.zklighter.elliot.ai",
+        "wss://mainnet.zklighter.elliot.ai/stream",
+        304,
+    ),
     "lighter-rh": LighterProfile(
-        "robinhood", "https://api.rh.lighter.xyz",
-        "wss://api.rh.lighter.xyz/stream", 466324),
+        "robinhood",
+        "https://api.rh.lighter.xyz",
+        "wss://api.rh.lighter.xyz/stream",
+        466324,
+    ),
 }
 
 # Lighter's mainnet market uses ANTHROPIC for the canonical ANTH CLI symbol.
 # Keep the alias venue-scoped so the CLI/config symbol remains canonical and
 # the Robinhood profile is not changed implicitly.
-LIGHTER_SYMBOL_ALIASES: Dict[str, Dict[str, str]] = {
+LIGHTER_SYMBOL_ALIASES: dict[str, dict[str, str]] = {
     "lighter": {
         "ANTH": "ANTHROPIC",
     },
@@ -74,20 +81,23 @@ LIGHTER_SYMBOL_ALIASES: Dict[str, Dict[str, str]] = {
 
 @dataclass
 class LighterCreds:
-    account_index: Optional[int]
-    api_key_index: Optional[int]
-    api_private_key: Optional[str]
+    account_index: int | None
+    api_key_index: int | None
+    api_private_key: str | None
 
     @property
     def complete(self) -> bool:
-        return (self.account_index is not None and self.api_key_index is not None
-                and bool(self.api_private_key))
+        return (
+            self.account_index is not None
+            and self.api_key_index is not None
+            and bool(self.api_private_key)
+        )
 
 
 @dataclass
 class HLCreds:
-    private_key: Optional[str]
-    account_address: Optional[str]
+    private_key: str | None
+    account_address: str | None
 
     @property
     def complete(self) -> bool:
@@ -96,19 +106,19 @@ class HLCreds:
 
 @dataclass
 class VenueConf:
-    key: str                  # "arcus" | "hedge"
-    kind: str                 # "arcus" | "hl" | "lighter"
-    label: str                # human name for logs, e.g. "ARCUS", "RH"
+    key: str  # "arcus" | "hedge"
+    kind: str  # "arcus" | "hl" | "lighter"
+    label: str  # human name for logs, e.g. "ARCUS", "RH"
     symbol: str
     fee_bps: float
     cap_usd: float
     orders_per_min: int
     # hl
     hl_dex: str = ""
-    hl_creds: Optional[HLCreds] = None
+    hl_creds: HLCreds | None = None
     # lighter
-    lighter_profile: Optional[LighterProfile] = None
-    lighter_creds: Optional[LighterCreds] = None
+    lighter_profile: LighterProfile | None = None
+    lighter_creds: LighterCreds | None = None
     # B0 must distinguish an explicitly verified zero fee from the default
     # modeling value.  This flag never changes the configured fee itself.
     fee_bps_verified: bool = False
@@ -119,8 +129,8 @@ class StrategyConf:
     name: str
     upper_bps: float
     lower_bps: float
-    center_bps: Optional[float] = None
-    window_minutes: Optional[int] = None
+    center_bps: float | None = None
+    window_minutes: int | None = None
     # stable_basis may optionally source its center from a causal rolling
     # median.  The fallback remains the explicitly configured center_bps.
     center_mode: str = "fixed"
@@ -186,15 +196,17 @@ class Config:
                 continue
             if v.kind == "hl" and not (v.hl_creds and v.hl_creds.complete):
                 return False
-            if v.kind == "lighter" and not (v.lighter_creds
-                                            and v.lighter_creds.complete):
+            if v.kind == "lighter" and not (
+                v.lighter_creds and v.lighter_creds.complete
+            ):
                 return False
         return True
+
 
 # ----------------------------------------------------------------- YAML layer
 
 # Schema: nested dict of key -> type (or nested dict). Unknown keys are errors.
-_SCHEMA: Dict[str, Any] = {
+_SCHEMA: dict[str, Any] = {
     "strategy": {
         "name": str,
         "params": dict,
@@ -251,14 +263,15 @@ class ConfigError(ValueError):
     pass
 
 
-def _validate(node: Any, schema: Dict[str, Any], path: str = "") -> None:
+def _validate(node: Any, schema: dict[str, Any], path: str = "") -> None:
     if not isinstance(node, dict):
         raise ConfigError(f"'{path or '<root>'}' must be a mapping")
     for key, val in node.items():
         here = f"{path}.{key}" if path else str(key)
         if key not in schema:
-            raise ConfigError(f"unknown config key '{here}' "
-                              f"(valid: {', '.join(sorted(schema))})")
+            raise ConfigError(
+                f"unknown config key '{here}' (valid: {', '.join(sorted(schema))})"
+            )
         want = schema[key]
         if isinstance(want, dict):
             _validate(val, want, here)
@@ -295,8 +308,7 @@ def _finite_number(params: dict, key: str, path: str) -> float:
     return value
 
 
-def _optional_finite_number(params: dict, key: str, default: float,
-                            path: str) -> float:
+def _optional_finite_number(params: dict, key: str, default: float, path: str) -> float:
     if key not in params:
         return default
     value = params[key]
@@ -310,8 +322,7 @@ def _optional_finite_number(params: dict, key: str, default: float,
     return value
 
 
-def _optional_positive_int(params: dict, key: str, default: int,
-                           path: str) -> int:
+def _optional_positive_int(params: dict, key: str, default: int, path: str) -> int:
     if key not in params:
         return default
     value = params[key]
@@ -334,8 +345,12 @@ def _parse_strategy(raw: dict) -> StrategyConf:
 
     if name == "stable_basis":
         allowed = {
-            "center_mode", "center_bps", "center_window_hours",
-            "center_update_minutes", "upper_bps", "lower_bps",
+            "center_mode",
+            "center_bps",
+            "center_window_hours",
+            "center_update_minutes",
+            "upper_bps",
+            "lower_bps",
         }
     else:
         allowed = {"window_minutes", "upper_bps", "lower_bps"}
@@ -392,20 +407,27 @@ def _parse_strategy(raw: dict) -> StrategyConf:
 
 # ------------------------------------------------------------------ env layer
 
-def _env_s(name: str) -> Optional[str]:
+
+def _env_s(name: str) -> str | None:
     v = os.getenv(name)
     return v.strip() if v not in (None, "") else None
 
 
-def _env_i(name: str) -> Optional[int]:
+def _env_i(name: str) -> int | None:
     v = os.getenv(name)
     return int(v) if v not in (None, "") else None
 
 
 # -------------------------------------------------------------------- loading
 
-def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
-                symbol: str, hedge_venue: str) -> Config:
+
+def load_config(
+    config_file: str = "config.yaml",
+    env_file: str = ".env",
+    *,
+    symbol: str,
+    hedge_venue: str,
+) -> Config:
     load_dotenv(env_file)
     try:
         with open(config_file) as fh:
@@ -414,7 +436,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         raise ConfigError(
             f"config file '{config_file}' not found — copy config.example.yaml "
             f"to config.yaml and edit it / 未找到配置文件，请先复制 "
-            f"config.example.yaml 为 config.yaml 并修改")
+            f"config.example.yaml 为 config.yaml 并修改"
+        )
     if "thresholds" in raw:
         raise ConfigError(
             "legacy 'thresholds:' config is no longer supported; use:\n"
@@ -435,22 +458,28 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
 
     symbol = (symbol or "").strip()
     if not symbol:
-        raise ConfigError("--symbol is required, e.g. --symbol SNDK / "
-                          "必须用 --symbol 指定交易品种")
+        raise ConfigError(
+            "--symbol is required, e.g. --symbol SNDK / 必须用 --symbol 指定交易品种"
+        )
     if hedge_venue not in HEDGE_VENUES:
         raise ConfigError(
             f"--hedge must be one of {list(HEDGE_VENUES)}, got "
-            f"{hedge_venue!r} / --hedge 必须是 {list(HEDGE_VENUES)} 之一")
+            f"{hedge_venue!r} / --hedge 必须是 {list(HEDGE_VENUES)} 之一"
+        )
     strategy_conf = _parse_strategy(raw)
 
     take_fraction = float(_get(raw, "sizing", "take_fraction", 0.5))
     if not 0.0 < take_fraction <= 1.0:
-        raise ConfigError("sizing.take_fraction must be in (0, 1] — taking "
-                          "more than the profitable depth loses money on the "
-                          "tail / 必须在 (0, 1] 之间")
+        raise ConfigError(
+            "sizing.take_fraction must be in (0, 1] — taking "
+            "more than the profitable depth loses money on the "
+            "tail / 必须在 (0, 1] 之间"
+        )
 
     arcus = VenueConf(
-        key="arcus", kind="arcus", label="ARCUS",
+        key="arcus",
+        kind="arcus",
+        label="ARCUS",
         symbol=symbol,
         fee_bps=float(_get(raw, "arcus", "taker_fee_bps", 0.0)),
         cap_usd=float(_get(raw, "arcus", "max_position_usd", 1000.0)),
@@ -459,36 +488,37 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
 
     if hedge_venue == "tradexyz":
         hedge = VenueConf(
-            key="hedge", kind="hl", label="XYZ",
+            key="hedge",
+            kind="hl",
+            label="XYZ",
             symbol=symbol,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 1.0)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 120)),
-            fee_bps_verified=bool(
-                _get(raw, "hedge", "taker_fee_bps_verified", False)
-            ),
+            fee_bps_verified=bool(_get(raw, "hedge", "taker_fee_bps_verified", False)),
             hl_dex="xyz",
             hl_creds=HLCreds(
                 _env_s("HL_PRIVATE_KEY_XYZ") or _env_s("HL_PRIVATE_KEY"),
-                _env_s("HL_ACCOUNT_ADDRESS_XYZ") or _env_s("HL_ACCOUNT_ADDRESS")),
+                _env_s("HL_ACCOUNT_ADDRESS_XYZ") or _env_s("HL_ACCOUNT_ADDRESS"),
+            ),
         )
     else:
-        hedge_symbol = LIGHTER_SYMBOL_ALIASES.get(hedge_venue, {}).get(
-            symbol, symbol)
+        hedge_symbol = LIGHTER_SYMBOL_ALIASES.get(hedge_venue, {}).get(symbol, symbol)
         hedge = VenueConf(
-            key="hedge", kind="lighter",
+            key="hedge",
+            kind="lighter",
             label="LIGHTER" if hedge_venue == "lighter" else "RH",
             symbol=hedge_symbol,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 0.0)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 30)),
-            fee_bps_verified=bool(
-                _get(raw, "hedge", "taker_fee_bps_verified", False)
-            ),
+            fee_bps_verified=bool(_get(raw, "hedge", "taker_fee_bps_verified", False)),
             lighter_profile=LIGHTER_PROFILES[hedge_venue],
-            lighter_creds=LighterCreds(_env_i("LIGHTER_ACCOUNT_INDEX"),
-                                       _env_i("LIGHTER_API_KEY_INDEX"),
-                                       _env_s("LIGHTER_API_PRIVATE_KEY")),
+            lighter_creds=LighterCreds(
+                _env_i("LIGHTER_ACCOUNT_INDEX"),
+                _env_i("LIGHTER_API_KEY_INDEX"),
+                _env_s("LIGHTER_API_PRIVATE_KEY"),
+            ),
         )
 
     return Config(
@@ -509,14 +539,17 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         hedge_slippage_bps=float(_get(raw, "execution", "hedge_slippage_bps", 20.0)),
         net_tolerance_base=float(_get(raw, "execution", "net_tolerance_base", 0.001)),
         max_consecutive_errors=int(_get(raw, "execution", "max_consecutive_errors", 3)),
-        rate_limit_pause_sec=float(_get(raw, "execution", "rate_limit_pause_sec", 10.0)),
+        rate_limit_pause_sec=float(
+            _get(raw, "execution", "rate_limit_pause_sec", 10.0)
+        ),
         staleness_sec=float(_get(raw, "execution", "staleness_sec", 10.0)),
         reconcile_sec=float(_get(raw, "execution", "reconcile_sec", 15.0)),
         venue_probe_sec=float(_get(raw, "execution", "venue_probe_sec", 30.0)),
         http_keepalive_sec=float(_get(raw, "execution", "http_keepalive_sec", 10.0)),
         recorder_enabled=bool(_get(raw, "recorder", "enabled", True)),
-        recorder_database=str(_get(
-            raw, "recorder", "database", DEFAULT_RECORDER_DATABASE)),
+        recorder_database=str(
+            _get(raw, "recorder", "database", DEFAULT_RECORDER_DATABASE)
+        ),
         log_level=str(_get(raw, "logging", "level", "INFO")).upper(),
         status_interval_sec=float(_get(raw, "logging", "status_interval_sec", 30.0)),
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),

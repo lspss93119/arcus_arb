@@ -17,7 +17,6 @@ from entropy_arb.arcus_auth import (
     ArcusSigner,
 )
 
-
 ADDRESS = "0x" + "11" * 20
 
 

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import csv
 import math
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Iterable
 
 from entropy_arb.storage import (
     EntropyReferenceRow,
@@ -22,17 +22,37 @@ MIGRATION_BATCH_ROWS = 5_000
 SUPPORTED_HEDGES = ("lighter-rh", "tradexyz", "lighter")
 
 SAMPLE_HEADER = [
-    "timestamp_ms", "premium_bps", "sell_edge_bps", "buy_edge_bps",
-    "entropy_bid", "entropy_ask", "hedge_bid", "hedge_ask",
-    "entropy_book_update_ms", "hedge_book_update_ms",
+    "timestamp_ms",
+    "premium_bps",
+    "sell_edge_bps",
+    "buy_edge_bps",
+    "entropy_bid",
+    "entropy_ask",
+    "hedge_bid",
+    "hedge_ask",
+    "entropy_book_update_ms",
+    "hedge_book_update_ms",
 ]
 MINUTE_HEADER = [
-    "minute_ts", "time_utc", "symbol", "hedge",
-    "entropy_bid", "entropy_ask", "hedge_bid", "hedge_ask",
-    "premium_open_bps", "premium_high_bps", "premium_low_bps",
-    "premium_close_bps", "premium_mean_bps", "premium_std_bps",
-    "sell_edge_mean_bps", "sell_edge_max_bps",
-    "buy_edge_mean_bps", "buy_edge_max_bps", "samples",
+    "minute_ts",
+    "time_utc",
+    "symbol",
+    "hedge",
+    "entropy_bid",
+    "entropy_ask",
+    "hedge_bid",
+    "hedge_ask",
+    "premium_open_bps",
+    "premium_high_bps",
+    "premium_low_bps",
+    "premium_close_bps",
+    "premium_mean_bps",
+    "premium_std_bps",
+    "sell_edge_mean_bps",
+    "sell_edge_max_bps",
+    "buy_edge_mean_bps",
+    "buy_edge_max_bps",
+    "samples",
 ]
 ENTROPY_REFERENCE_HEADER = ["recv_ms", "oracle_px", "mark_px"]
 HEDGE_REFERENCE_HEADER = ["recv_ms", "server_ms", "index_px", "mark_px"]
@@ -167,18 +187,30 @@ def _hedge_reference_row(
 
 
 _SPECS = {
-    "samples": _FileSpec("samples", SAMPLE_HEADER, _sample_row, lambda row: row.timestamp_ms),
-    "minutes": _FileSpec("minutes", MINUTE_HEADER, _minute_row, lambda row: row.minute_ts),
+    "samples": _FileSpec(
+        "samples", SAMPLE_HEADER, _sample_row, lambda row: row.timestamp_ms
+    ),
+    "minutes": _FileSpec(
+        "minutes", MINUTE_HEADER, _minute_row, lambda row: row.minute_ts
+    ),
     "entropy_reference": _FileSpec(
-        "entropy_reference", ENTROPY_REFERENCE_HEADER, _entropy_reference_row, lambda row: row.recv_ms
+        "entropy_reference",
+        ENTROPY_REFERENCE_HEADER,
+        _entropy_reference_row,
+        lambda row: row.recv_ms,
     ),
     "hedge_reference": _FileSpec(
-        "hedge_reference", HEDGE_REFERENCE_HEADER, _hedge_reference_row, lambda row: row.recv_ms
+        "hedge_reference",
+        HEDGE_REFERENCE_HEADER,
+        _hedge_reference_row,
+        lambda row: row.recv_ms,
     ),
 }
 
 
-def _report(path: Path, dataset: str | None, *, status: str, message: str, **counts: object) -> MigrationFileReport:
+def _report(
+    path: Path, dataset: str | None, *, status: str, message: str, **counts: object
+) -> MigrationFileReport:
     defaults: dict[str, object] = {
         "source_rows": 0,
         "valid_rows": 0,
@@ -190,7 +222,9 @@ def _report(path: Path, dataset: str | None, *, status: str, message: str, **cou
         "max_timestamp": None,
     }
     defaults.update(counts)
-    return MigrationFileReport(path=str(path), dataset=dataset, status=status, message=message, **defaults)
+    return MigrationFileReport(
+        path=str(path), dataset=dataset, status=status, message=message, **defaults
+    )
 
 
 def _candidate_dataset(path: Path) -> str | None:
@@ -209,7 +243,7 @@ def _candidate_dataset(path: Path) -> str | None:
 def _parse_filename_pair(stem: str, prefix: str) -> tuple[str, str] | None:
     if not stem.startswith(prefix):
         return None
-    rest = stem[len(prefix):]
+    rest = stem[len(prefix) :]
     for hedge in SUPPORTED_HEDGES:
         suffix = f"-{hedge}"
         if rest.endswith(suffix):
@@ -261,11 +295,13 @@ def _read_companion_pair(path: Path) -> tuple[str, str] | None:
         return None
 
 
-def _sample_provenance(path: Path, mappings: dict[str, tuple[str, str]]) -> tuple[str, str] | None:
+def _sample_provenance(
+    path: Path, mappings: dict[str, tuple[str, str]]
+) -> tuple[str, str] | None:
     filename_pair = _sample_filename_pair(path)
     if filename_pair is not None:
         return filename_pair
-    suffix = path.name[len("samples-v2"):]
+    suffix = path.name[len("samples-v2") :]
     companion_pair = _read_companion_pair(path.with_name(f"minutes{suffix}"))
     if companion_pair is not None:
         return companion_pair
@@ -317,7 +353,9 @@ def _migrate_file(
         with path.open(newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             if reader.fieldnames != spec.header:
-                return _report(path, dataset, status="FAIL", message="unsupported CSV header")
+                return _report(
+                    path, dataset, status="FAIL", message="unsupported CSV header"
+                )
             if dataset == "samples":
                 provenance = _sample_provenance(path, mappings)
                 if provenance is None:
@@ -347,8 +385,16 @@ def _migrate_file(
                     continue
                 valid_rows.append(row)
                 timestamp = spec.timestamp(row)
-                min_timestamp = timestamp if min_timestamp is None else min(min_timestamp, timestamp)
-                max_timestamp = timestamp if max_timestamp is None else max(max_timestamp, timestamp)
+                min_timestamp = (
+                    timestamp
+                    if min_timestamp is None
+                    else min(min_timestamp, timestamp)
+                )
+                max_timestamp = (
+                    timestamp
+                    if max_timestamp is None
+                    else max(max_timestamp, timestamp)
+                )
     except (OSError, UnicodeError, csv.Error) as exc:
         return _report(
             path,
@@ -409,7 +455,11 @@ def migrate_directory(
     source = Path(source)
     database = Path(database)
     if not source.is_dir():
-        return [_report(source, None, status="FAIL", message="source directory does not exist")]
+        return [
+            _report(
+                source, None, status="FAIL", message="source directory does not exist"
+            )
+        ]
 
     candidates = [
         (path, _candidate_dataset(path))
@@ -420,16 +470,30 @@ def migrate_directory(
         store = MarketHistoryStore(database)
     except Exception as exc:
         if not candidates:
-            return [_report(database, None, status="FAIL", message=f"database open failed: {exc}")]
+            return [
+                _report(
+                    database,
+                    None,
+                    status="FAIL",
+                    message=f"database open failed: {exc}",
+                )
+            ]
         return [
-            _report(path, dataset, status="FAIL", message=f"database open failed: {exc}")
+            _report(
+                path, dataset, status="FAIL", message=f"database open failed: {exc}"
+            )
             for path, dataset in candidates
         ]
 
     try:
-        reports = [_migrate_file(path, dataset, store, mappings) for path, dataset in candidates]
+        reports = [
+            _migrate_file(path, dataset, store, mappings)
+            for path, dataset in candidates
+        ]
         if any(report.status in {"PASS", "PARTIAL"} for report in reports):
-            store.set_meta("last_migration_at_utc", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            store.set_meta(
+                "last_migration_at_utc", datetime.now(UTC).isoformat(timespec="seconds")
+            )
         return reports
     finally:
         store.close()

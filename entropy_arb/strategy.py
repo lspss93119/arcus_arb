@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 import statistics
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Deque, Iterable
 
 from .config import StrategyConf
 
@@ -70,7 +70,7 @@ class StableBasisStrategy:
         self.upper_bps = upper_bps
         self.lower_bps = lower_bps
         self._effective_center_bps = center_bps
-        self._rolling_samples: Deque[tuple[float, float]] = deque()
+        self._rolling_samples: deque[tuple[float, float]] = deque()
         self._rolling_ready = False
         self._next_update_ts: float | None = None
 
@@ -79,9 +79,7 @@ class StableBasisStrategy:
         return [
             (ts, value)
             for ts, value in self._rolling_samples
-            if cutoff <= ts < timestamp
-            and math.isfinite(ts)
-            and math.isfinite(value)
+            if cutoff <= ts < timestamp and math.isfinite(ts) and math.isfinite(value)
         ]
 
     def _valid_window_values(
@@ -126,9 +124,7 @@ class StableBasisStrategy:
         valid = sorted(
             (float(timestamp), float(value))
             for timestamp, value in observations
-            if math.isfinite(timestamp)
-            and math.isfinite(value)
-            and timestamp < now
+            if math.isfinite(timestamp) and math.isfinite(value) and timestamp < now
         )
         self._rolling_samples.extend(valid)
         self._prune(now)
@@ -215,7 +211,7 @@ class DriftingBasisStrategy:
         self.window_sec = float(window_minutes * 60)
         self.upper_bps = upper_bps
         self.lower_bps = lower_bps
-        self._samples: Deque[tuple[float, float]] = deque()
+        self._samples: deque[tuple[float, float]] = deque()
         self._segment_start_ts: float | None = None
         self._last_valid_ts: float | None = None
 

@@ -4,11 +4,13 @@ Phase A deliberately contains only public market discovery and streaming
 market-data models.  No credential, signing, or order-routing model belongs in
 this module.
 """
+
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any
 
 ARCUS_REST_URL = "https://api.arcus.xyz"
 ARCUS_WS_URL = "wss://api.arcus.xyz/v1/ws"
@@ -43,7 +45,7 @@ def _string(mapping: Mapping[str, Any], key: str, path: str) -> str:
     return value
 
 
-def _optional_string(mapping: Mapping[str, Any], key: str) -> Optional[str]:
+def _optional_string(mapping: Mapping[str, Any], key: str) -> str | None:
     value = mapping.get(key)
     if value is None:
         return None
@@ -52,8 +54,9 @@ def _optional_string(mapping: Mapping[str, Any], key: str) -> Optional[str]:
     return value
 
 
-def _decimal_text(value: Any, path: str, *, positive: bool = False,
-                  nonnegative: bool = False) -> str:
+def _decimal_text(
+    value: Any, path: str, *, positive: bool = False, nonnegative: bool = False
+) -> str:
     if isinstance(value, bool) or value is None:
         raise ArcusMarketDataError(f"{path} must be a decimal string")
     if not isinstance(value, (str, int, float)):
@@ -72,14 +75,14 @@ def _decimal_text(value: Any, path: str, *, positive: bool = False,
     return text
 
 
-def _optional_decimal(mapping: Mapping[str, Any], key: str) -> Optional[str]:
+def _optional_decimal(mapping: Mapping[str, Any], key: str) -> str | None:
     value = mapping.get(key)
     if value is None:
         return None
     return _decimal_text(value, key)
 
 
-def _integer(value: Any, path: str, *, optional: bool = False) -> Optional[int]:
+def _integer(value: Any, path: str, *, optional: bool = False) -> int | None:
     if value is None and optional:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
@@ -89,7 +92,7 @@ def _integer(value: Any, path: str, *, optional: bool = False) -> Optional[int]:
     return value
 
 
-def _optional_bool(mapping: Mapping[str, Any], key: str) -> Optional[bool]:
+def _optional_bool(mapping: Mapping[str, Any], key: str) -> bool | None:
     value = mapping.get(key)
     if value is None:
         return None
@@ -107,17 +110,17 @@ class ArcusMarketMetadata:
     tick_size: str
     step_size: str
     status: str
-    min_order_notional: Optional[str]
-    min_order_size: Optional[str]
-    max_order_size: Optional[str]
+    min_order_notional: str | None
+    min_order_size: str | None
+    max_order_size: str | None
     tick_tiers: tuple[Mapping[str, Any], ...]
-    is_outside_rth: Optional[bool]
-    current_settlement_price: Optional[str]
-    upper_trading_bound: Optional[str]
-    lower_trading_bound: Optional[str]
-    next_upper_trading_bound: Optional[str]
-    next_lower_trading_bound: Optional[str]
-    regular_trading_hours: Optional[Mapping[str, Any]]
+    is_outside_rth: bool | None
+    current_settlement_price: str | None
+    upper_trading_bound: str | None
+    lower_trading_bound: str | None
+    next_upper_trading_bound: str | None
+    next_lower_trading_bound: str | None
+    regular_trading_hours: Mapping[str, Any] | None
     raw: Mapping[str, Any]
 
 
@@ -195,8 +198,8 @@ class ArcusBookSnapshot:
     bids: tuple[tuple[str, str], ...]
     asks: tuple[tuple[str, str], ...]
     last_sequence_id: int
-    global_sequence_id: Optional[int]
-    exchange_timestamp_us: Optional[int]
+    global_sequence_id: int | None
+    exchange_timestamp_us: int | None
 
 
 @dataclass(frozen=True)
@@ -205,7 +208,7 @@ class ArcusBookUpdate:
     asks: tuple[tuple[str, str], ...]
     last_sequence_id: int
     global_sequence_id: int
-    exchange_timestamp_us: Optional[int]
+    exchange_timestamp_us: int | None
 
 
 @dataclass(frozen=True)
@@ -218,19 +221,19 @@ class ArcusL2Event:
     the two sides in separate arrays.
     """
 
-    market_id: Optional[int]
+    market_id: int | None
     market_display_name: str
     event_type: str
     book_epoch: int
     local_receive_ts_ms: int
     local_receive_monotonic_ns: int
     last_sequence_id: int
-    global_sequence_id: Optional[int]
+    global_sequence_id: int | None
     side: str
     price: str
     absolute_size: str
     event_index: int
-    exchange_timestamp_us: Optional[int]
+    exchange_timestamp_us: int | None
 
 
 def _levels(value: Any, path: str) -> tuple[tuple[str, str], ...]:
@@ -241,9 +244,7 @@ def _levels(value: Any, path: str) -> tuple[tuple[str, str], ...]:
         if not isinstance(level, (list, tuple)) or len(level) != 2:
             raise ArcusMarketDataError(f"{path}[{index}] must be [price, size]")
         price = _decimal_text(level[0], f"{path}[{index}][0]", positive=True)
-        size = _decimal_text(
-            level[1], f"{path}[{index}][1]", nonnegative=True
-        )
+        size = _decimal_text(level[1], f"{path}[{index}][1]", nonnegative=True)
         result.append((price, size))
     return tuple(result)
 
@@ -307,21 +308,21 @@ def parse_arcus_book_update(message: Mapping[str, Any]) -> ArcusBookUpdate:
 
 @dataclass(frozen=True)
 class ArcusTrade:
-    market_id: Optional[int]
-    market_display_name: Optional[str]
-    taker_order_id: Optional[str]
-    maker_order_id: Optional[str]
-    taker_address: Optional[str]
-    maker_address: Optional[str]
-    trade_id: Optional[str]
+    market_id: int | None
+    market_display_name: str | None
+    taker_order_id: str | None
+    maker_order_id: str | None
+    taker_address: str | None
+    maker_address: str | None
+    trade_id: str | None
     exchange_timestamp_us: int
     price: str
     quantity: str
-    aggressor_side: Optional[str]
+    aggressor_side: str | None
     sequence_number: int
 
 
-def _optional_text(item: Mapping[str, Any], key: str) -> Optional[str]:
+def _optional_text(item: Mapping[str, Any], key: str) -> str | None:
     value = item.get(key)
     if value is None:
         return None
@@ -384,23 +385,23 @@ class ArcusMarketAttributes:
     is_snapshot: bool
     market_id: int
     market_display_name: str
-    off_hours_initial_margin_fraction: Optional[str]
-    is_outside_rth: Optional[bool]
-    current_settlement_price: Optional[str]
-    upper_trading_bound: Optional[str]
-    lower_trading_bound: Optional[str]
-    next_upper_trading_bound: Optional[str]
-    next_lower_trading_bound: Optional[str]
-    is_upper_in_expansion_zone: Optional[bool]
-    is_lower_in_expansion_zone: Optional[bool]
-    upper_zone_entered_at: Optional[int]
-    upper_expected_expansion_at: Optional[int]
-    lower_zone_entered_at: Optional[int]
-    lower_expected_expansion_at: Optional[int]
-    bound_event: Optional[str]
-    bound_side: Optional[str]
-    event_timestamp_us: Optional[int]
-    market_sequence_num: Optional[int]
+    off_hours_initial_margin_fraction: str | None
+    is_outside_rth: bool | None
+    current_settlement_price: str | None
+    upper_trading_bound: str | None
+    lower_trading_bound: str | None
+    next_upper_trading_bound: str | None
+    next_lower_trading_bound: str | None
+    is_upper_in_expansion_zone: bool | None
+    is_lower_in_expansion_zone: bool | None
+    upper_zone_entered_at: int | None
+    upper_expected_expansion_at: int | None
+    lower_zone_entered_at: int | None
+    lower_expected_expansion_at: int | None
+    bound_event: str | None
+    bound_side: str | None
+    event_timestamp_us: int | None
+    market_sequence_num: int | None
 
 
 def _attribute_entry(
@@ -409,7 +410,8 @@ def _attribute_entry(
     item = _mapping(raw, "marketAttributes.entry")
     market_id = _integer(_required(item, "marketId", "entry"), "entry.marketId")
     assert market_id is not None
-    def optional_time(key: str) -> Optional[int]:
+
+    def optional_time(key: str) -> int | None:
         return _integer(item.get(key), f"entry.{key}", optional=True)
 
     return ArcusMarketAttributes(
@@ -440,7 +442,7 @@ def _attribute_entry(
 
 def parse_arcus_market_attributes(
     message: Mapping[str, Any], market_id: int
-) -> Optional[ArcusMarketAttributes]:
+) -> ArcusMarketAttributes | None:
     """Parse the target entry from the global market-attributes channel."""
     if message.get("channel") != "marketAttributes":
         raise ArcusMarketDataError("message is not marketAttributes")
@@ -449,7 +451,9 @@ def parse_arcus_market_attributes(
     contents = _mapping(_required(message, "contents", "message"), "message.contents")
     is_snapshot = contents.get("isSnapshot")
     if not isinstance(is_snapshot, bool):
-        raise ArcusMarketDataError("marketAttributes.contents.isSnapshot must be boolean")
+        raise ArcusMarketDataError(
+            "marketAttributes.contents.isSnapshot must be boolean"
+        )
     entries = contents.get("entries")
     if not isinstance(entries, list):
         raise ArcusMarketDataError("marketAttributes.contents.entries must be an array")

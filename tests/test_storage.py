@@ -63,11 +63,15 @@ def test_fresh_database_creates_schema_and_meta(tmp_path: Path):
     with sqlite3.connect(db) as conn:
         tables = {
             row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-        assert {"meta", "samples", "minutes", "entropy_reference", "hedge_reference"} <= tables
+        assert {
+            "meta",
+            "samples",
+            "minutes",
+            "entropy_reference",
+            "hedge_reference",
+        } <= tables
         assert conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone() == ("1",)
@@ -113,7 +117,9 @@ def test_recent_premium_observations_fall_back_to_minute_means(tmp_path: Path):
     store.close()
 
 
-def test_exact_duplicate_is_noop_and_conflicting_payload_does_not_replace(tmp_path: Path):
+def test_exact_duplicate_is_noop_and_conflicting_payload_does_not_replace(
+    tmp_path: Path,
+):
     db = tmp_path / "market-history.sqlite"
     store = MarketHistoryStore(db)
     store.append_sample(sample())
@@ -176,12 +182,16 @@ def test_reference_rows_write_with_full_payload_primary_keys(tmp_path: Path):
 
 
 def test_import_meta_cap_pragmas_and_unknown_dataset(tmp_path: Path, caplog):
-    store = MarketHistoryStore(tmp_path / "history.sqlite", max_pending_rows_per_dataset=1)
+    store = MarketHistoryStore(
+        tmp_path / "history.sqlite", max_pending_rows_per_dataset=1
+    )
     assert store._conn.execute("PRAGMA busy_timeout").fetchone() == (10000,)
     assert store._conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
     store.set_meta("owner", "research")
     store.set_meta("owner", "updated")
-    assert store._conn.execute("SELECT value FROM meta WHERE key='owner'").fetchone() == ("updated",)
+    assert store._conn.execute(
+        "SELECT value FROM meta WHERE key='owner'"
+    ).fetchone() == ("updated",)
     store.append_sample(sample())
     with caplog.at_level("CRITICAL"):
         store.append_sample(sample(ts=2))
@@ -312,8 +322,12 @@ def test_two_real_processes_write_same_wal_database(tmp_path: Path):
     db = tmp_path / "market-history.sqlite"
     MarketHistoryStore(db).close()
     ctx = mp.get_context("spawn")
-    p1 = ctx.Process(target=_write_process, args=(str(db), "SNDK", 1_700_000_000_000, 200))
-    p2 = ctx.Process(target=_write_process, args=(str(db), "ANTH", 1_700_001_000_000, 200))
+    p1 = ctx.Process(
+        target=_write_process, args=(str(db), "SNDK", 1_700_000_000_000, 200)
+    )
+    p2 = ctx.Process(
+        target=_write_process, args=(str(db), "ANTH", 1_700_001_000_000, 200)
+    )
     p1.start()
     p2.start()
     p1.join(20)

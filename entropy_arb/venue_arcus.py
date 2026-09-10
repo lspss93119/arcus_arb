@@ -4,16 +4,22 @@ This adapter intentionally has no order, wallet, credential, or signing
 implementation.  Its public surface is market discovery plus the read-only
 book/trade/attribute feed.
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any
 
 import aiohttp
 
-from .arcus import ARCUS_REST_URL, ARCUS_WS_URL, ArcusMarketMetadata, resolve_arcus_market
+from .arcus import (
+    ARCUS_REST_URL,
+    ARCUS_WS_URL,
+    ArcusMarketMetadata,
+    resolve_arcus_market,
+)
 from .arcus_book import ArcusOrderBook
 from .arcus_feed import ArcusBookFeed
 
@@ -30,7 +36,7 @@ class ArcusVenue:
     def __init__(
         self,
         conf: Any = None,
-        session: Optional[aiohttp.ClientSession] = None,
+        session: aiohttp.ClientSession | None = None,
         *,
         rest_url: str = ARCUS_REST_URL,
         ws_url: str = ARCUS_WS_URL,
@@ -42,7 +48,7 @@ class ArcusVenue:
         self.rest_url = rest_url.rstrip("/")
         self.ws_url = ws_url
         self.book = ArcusOrderBook()
-        self.market: Optional[ArcusMarketMetadata] = None
+        self.market: ArcusMarketMetadata | None = None
         self.market_id = -1
         self.exchange_symbol = ""
         self.price_tick = 0.0
@@ -66,7 +72,7 @@ class ArcusVenue:
         self._trade_sink = None
         self._attribute_sink = None
 
-    async def _get(self, path: str, params: Optional[dict] = None) -> dict:
+    async def _get(self, path: str, params: dict | None = None) -> dict:
         if self.session is None:
             raise RuntimeError("Arcus public HTTP session is not configured")
         async with self.session.get(
@@ -135,12 +141,11 @@ class ArcusVenue:
             raise RuntimeError("Arcus trading is not implemented in Phase A")
         if self.market is None:
             raise RuntimeError("Arcus market must be resolved before starting feed")
+
         async def record_attributes(attributes, receive_ms, monotonic_ns):
             self.latest_attributes = attributes
             if self._attribute_sink is not None:
-                result = self._attribute_sink(
-                    attributes, receive_ms, monotonic_ns
-                )
+                result = self._attribute_sink(attributes, receive_ms, monotonic_ns)
                 if asyncio.iscoroutine(result):
                     await result
 

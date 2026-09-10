@@ -15,6 +15,7 @@ RTH state, sequence health, recorder rows, and raw L2 event count) and writes
 log lines to logging.file; use --no-dashboard for plain console logs
 (nohup/systemd). See the README (English) / README.zh-CN.md (中文).
 """
+
 import argparse
 import asyncio
 import contextlib
@@ -54,13 +55,15 @@ def validate_runtime_gates(
     )
 
 
-def setup_logging(level: str, log_file: str = None,
-                  extra_handler: logging.Handler = None) -> None:
+def setup_logging(
+    level: str, log_file: str = None, extra_handler: logging.Handler = None
+) -> None:
     root = logging.getLogger()
     root.setLevel(getattr(logging, level, logging.INFO))
     fmt = logging.Formatter(
         "%(asctime)s.%(msecs)03d %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S")
+        datefmt="%H:%M:%S",
+    )
     if log_file:
         d = os.path.dirname(log_file)
         if d:
@@ -75,10 +78,18 @@ def setup_logging(level: str, log_file: str = None,
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
-async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
-                log_buffer, lang: str, *, tiny_live: bool = False,
-                confirm_mainnet: bool = False,
-                approve_first_order: bool = False) -> None:
+async def amain(
+    cfg,
+    record_only: bool,
+    use_dashboard: bool,
+    force_tty: bool,
+    log_buffer,
+    lang: str,
+    *,
+    tiny_live: bool = False,
+    confirm_mainnet: bool = False,
+    approve_first_order: bool = False,
+) -> None:
     eng = Engine(
         cfg,
         record_only=record_only,
@@ -93,8 +104,8 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
         await eng.run()
         return
     from entropy_arb.dashboard import Dashboard
-    dash = Dashboard(eng, log_buffer, cfg.log_file, force_terminal=force_tty,
-                     lang=lang)
+
+    dash = Dashboard(eng, log_buffer, cfg.log_file, force_terminal=force_tty, lang=lang)
     dash_task = asyncio.create_task(dash.run(), name="dashboard")
     try:
         await eng.run()
@@ -109,54 +120,85 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Arcus SNDK × Lighter-RH SNDK recorder and gated B0 "
-                    "maker-first calibration")
-    p.add_argument("--symbol", required=True,
-                   help="symbol traded on both venues, e.g. SNDK / "
-                        "两个交易所共同交易的品种")
-    p.add_argument("--hedge", required=True, choices=("lighter-rh",),
-                   metavar="VENUE",
-                   help="Phase A hedge venue: lighter-rh / 对冲腿：lighter-rh")
-    p.add_argument("--config", default="config.yaml",
-                   help="strategy config (default: config.yaml)")
-    p.add_argument("--env-file", default=".env",
-                   help="optional local env-file path; record-only ignores "
-                        "Arcus credentials")
-    p.add_argument("--record-only", action="store_true",
-                   help="collect public BBO, trades, and raw L2 data only; "
-                        "run no strategy or orders (needs no credentials)")
-    p.add_argument("--tiny-live", action="store_true",
-                   help="B0 preflight / explicitly gated tiny Arcus ALO maker "
-                        "calibration; never live-by-default")
-    p.add_argument("--confirm-mainnet", action="store_true",
-                   help="required acknowledgement for --tiny-live mainnet "
-                        "account access")
-    p.add_argument("--approve-first-order", action="store_true",
-                   help="separate human approval gate; permits the first B0 "
-                        "mainnet ALO only after preflight (use deliberately)")
-    p.add_argument("--cn", action="store_true",
-                   help="display the dashboard in Chinese / 仪表盘使用中文")
+        "maker-first calibration"
+    )
+    p.add_argument(
+        "--symbol",
+        required=True,
+        help="symbol traded on both venues, e.g. SNDK / 两个交易所共同交易的品种",
+    )
+    p.add_argument(
+        "--hedge",
+        required=True,
+        choices=("lighter-rh",),
+        metavar="VENUE",
+        help="Phase A hedge venue: lighter-rh / 对冲腿：lighter-rh",
+    )
+    p.add_argument(
+        "--config", default="config.yaml", help="strategy config (default: config.yaml)"
+    )
+    p.add_argument(
+        "--env-file",
+        default=".env",
+        help="optional local env-file path; record-only ignores Arcus credentials",
+    )
+    p.add_argument(
+        "--record-only",
+        action="store_true",
+        help="collect public BBO, trades, and raw L2 data only; "
+        "run no strategy or orders (needs no credentials)",
+    )
+    p.add_argument(
+        "--tiny-live",
+        action="store_true",
+        help="B0 preflight / explicitly gated tiny Arcus ALO maker "
+        "calibration; never live-by-default",
+    )
+    p.add_argument(
+        "--confirm-mainnet",
+        action="store_true",
+        help="required acknowledgement for --tiny-live mainnet account access",
+    )
+    p.add_argument(
+        "--approve-first-order",
+        action="store_true",
+        help="separate human approval gate; permits the first B0 "
+        "mainnet ALO only after preflight (use deliberately)",
+    )
+    p.add_argument(
+        "--cn",
+        action="store_true",
+        help="display the dashboard in Chinese / 仪表盘使用中文",
+    )
     disp = p.add_mutually_exclusive_group()
-    disp.add_argument("--dashboard", action="store_true",
-                      help="force the Rich dashboard even without a tty")
-    disp.add_argument("--no-dashboard", action="store_true",
-                      help="plain console logs instead of the dashboard")
+    disp.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="force the Rich dashboard even without a tty",
+    )
+    disp.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="plain console logs instead of the dashboard",
+    )
     args = p.parse_args()
 
     try:
-        validate_runtime_gates(
-            args.record_only, args.tiny_live, args.confirm_mainnet
-        )
+        validate_runtime_gates(args.record_only, args.tiny_live, args.confirm_mainnet)
     except ValueError as e:
         print(f"runtime mode error: {e}", file=sys.stderr)
         sys.exit(2)
     if args.approve_first_order and not args.tiny_live:
-        print("runtime mode error: --approve-first-order requires --tiny-live",
-              file=sys.stderr)
+        print(
+            "runtime mode error: --approve-first-order requires --tiny-live",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     try:
-        cfg = load_config(args.config, args.env_file,
-                          symbol=args.symbol, hedge_venue=args.hedge)
+        cfg = load_config(
+            args.config, args.env_file, symbol=args.symbol, hedge_venue=args.hedge
+        )
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
         sys.exit(2)
@@ -171,24 +213,32 @@ def main() -> None:
         try:
             from entropy_arb.dashboard import BufferLogHandler
         except ImportError:
-            print("`rich` is not installed — falling back to plain logs "
-                  "(pip install -r requirements.txt)", file=sys.stderr)
+            print(
+                "`rich` is not installed — falling back to plain logs "
+                "(pip install -r requirements.txt)",
+                file=sys.stderr,
+            )
             use_dashboard = False
     if use_dashboard:
         log_buffer = BufferLogHandler()
-        setup_logging(cfg.log_level, log_file=cfg.log_file,
-                      extra_handler=log_buffer)
+        setup_logging(cfg.log_level, log_file=cfg.log_file, extra_handler=log_buffer)
     else:
         setup_logging(cfg.log_level)
 
     try:
-        asyncio.run(amain(cfg, record_only=args.record_only,
-                          tiny_live=args.tiny_live,
-                          confirm_mainnet=args.confirm_mainnet,
-                          approve_first_order=args.approve_first_order,
-                          use_dashboard=use_dashboard, force_tty=force_tty,
-                          log_buffer=log_buffer,
-                          lang="zh" if args.cn else "en"))
+        asyncio.run(
+            amain(
+                cfg,
+                record_only=args.record_only,
+                tiny_live=args.tiny_live,
+                confirm_mainnet=args.confirm_mainnet,
+                approve_first_order=args.approve_first_order,
+                use_dashboard=use_dashboard,
+                force_tty=force_tty,
+                log_buffer=log_buffer,
+                lang="zh" if args.cn else "en",
+            )
+        )
     except RuntimeError as e:
         # startup failures (missing credentials, market not found, venue
         # unreachable) — a clean message, not a traceback

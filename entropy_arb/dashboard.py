@@ -6,13 +6,13 @@ premium against both entry hurdles, positions and net delta, session PnL,
 recorder progress, and the last executions. Disable with --no-dashboard
 (plain console logs, for nohup/systemd).
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
 from collections import deque
-from typing import Optional
 
 from rich import box
 from rich.console import Console, Group
@@ -72,8 +72,7 @@ _ZH = {
     "last exec": "上次执行",
     "minute rows": "分钟数据行数",
     "{s}s ago": "{s} 秒前",
-    "signal — executable premium vs full hurdle incl. fees (● = armed)":
-        "信号 —— 可成交溢价 vs 完整门槛（含手续费，● = 已武装）",
+    "signal — executable premium vs full hurdle incl. fees (● = armed)": "信号 —— 可成交溢价 vs 完整门槛（含手续费，● = 已武装）",
     "mid premium ": "中间价溢价 ",
     "   strategy ": "   策略 ",
     "   midline ": "   中枢 ",
@@ -112,9 +111,11 @@ class BufferLogHandler(logging.Handler):
     def __init__(self, maxlen: int = 200) -> None:
         super().__init__()
         self.lines: deque = deque(maxlen=maxlen)
-        self.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-            datefmt="%H:%M:%S"))
+        self.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S"
+            )
+        )
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -126,7 +127,7 @@ class BufferLogHandler(logging.Handler):
         self.lines.append((record.levelno, msg))
 
 
-def _usd(x: Optional[float], signed: bool = True, decimals: int = 4) -> Text:
+def _usd(x: float | None, signed: bool = True, decimals: int = 4) -> Text:
     if x is None:
         return Text("—", style="dim")
     style = "bold green" if x > 0 else ("bold red" if x < 0 else "")
@@ -136,8 +137,14 @@ def _usd(x: Optional[float], signed: bool = True, decimals: int = 4) -> Text:
 
 
 class Dashboard:
-    def __init__(self, eng, log_buffer: BufferLogHandler, log_file: str,
-                 force_terminal: bool = False, lang: str = "en") -> None:
+    def __init__(
+        self,
+        eng,
+        log_buffer: BufferLogHandler,
+        log_file: str,
+        force_terminal: bool = False,
+        lang: str = "en",
+    ) -> None:
         self.eng = eng
         self.log_buffer = log_buffer
         self.log_file = log_file
@@ -154,13 +161,14 @@ class Dashboard:
 
     async def run(self) -> None:
         eng = self.eng
-        with Live(self._safe_render(), console=self.console,
-                  refresh_per_second=8, screen=True) as live:
+        with Live(
+            self._safe_render(), console=self.console, refresh_per_second=8, screen=True
+        ) as live:
             while not eng.stop.is_set():
                 live.update(self._safe_render())
                 try:
                     await asyncio.wait_for(eng.stop.wait(), timeout=0.25)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         if eng.record_only and getattr(eng, "arcus", None) is not None:
             t = Text("arcus-arb stopped — RECORD-ONLY", style="bold")
@@ -182,14 +190,16 @@ class Dashboard:
             return
         t = Text()
         t.append(self._t("entropy-arb stopped"), style="bold")
-        t.append(self._t(" — {t} trades / {h} hedges, session PnL ",
-                         t=eng.trades, h=eng.hedges))
+        t.append(
+            self._t(
+                " — {t} trades / {h} hedges, session PnL ", t=eng.trades, h=eng.hedges
+            )
+        )
         t.append_text(_usd(eng.session_pnl()))
         t.append(self._t(", Σ fill edge "))
         t.append_text(_usd(eng.total_fill_edge))
         if eng.recorder is not None:
-            t.append(self._t(", {n} minute rows recorded",
-                             n=eng.recorder.rows_written))
+            t.append(self._t(", {n} minute rows recorded", n=eng.recorder.rows_written))
         t.append(self._t(" — full log: {f}", f=self.log_file))
         self.console.print(t)
 
@@ -205,13 +215,18 @@ class Dashboard:
     def _render(self):
         eng = self.eng
         if eng.entropy is None or eng.hedge is None or not eng.markets_ready:
-            return Group(Panel(Text(self._t("starting — resolving markets…"),
-                                    style="yellow"),
-                               title="arcus-arb",
-                               box=box.ROUNDED), self._events_panel())
+            return Group(
+                Panel(
+                    Text(self._t("starting — resolving markets…"), style="yellow"),
+                    title="arcus-arb",
+                    box=box.ROUNDED,
+                ),
+                self._events_panel(),
+            )
         if eng.record_only and getattr(eng, "arcus", None) is not None:
-            return Group(self._header(), self._record_only_panel(),
-                         self._events_panel())
+            return Group(
+                self._header(), self._record_only_panel(), self._events_panel()
+            )
         if getattr(eng, "tiny_live", False) and getattr(eng, "arcus", None) is not None:
             return Group(self._header(), self._b0_panel(), self._events_panel())
         if self.console.width >= 100:
@@ -221,8 +236,13 @@ class Dashboard:
             mid.add_row(self._venues_panel(), self._session_panel())
         else:
             mid = Group(self._venues_panel(), self._session_panel())
-        return Group(self._header(), mid, self._signal_panel(),
-                     self._trades_panel(), self._events_panel())
+        return Group(
+            self._header(),
+            mid,
+            self._signal_panel(),
+            self._trades_panel(),
+            self._events_panel(),
+        )
 
     def _header(self):
         eng, cfg = self.eng, self.eng.cfg
@@ -233,16 +253,16 @@ class Dashboard:
             mode = Text(self._t(" RECORD-ONLY "), style="black on yellow")
         else:
             mode = Text(self._t(" LIVE "), style="white on dark_green")
-        stale = sum(1 for v in eng.venues.values()
-                    if not v.book.is_fresh(cfg.staleness_sec))
+        stale = sum(
+            1 for v in eng.venues.values() if not v.book.is_fresh(cfg.staleness_sec)
+        )
         limited = sum(1 for v in eng.venues.values() if eng._venue_limited(v))
         if eng.halted:
             state = Text(self._t(" HALTED "), style="bold white on red")
         elif eng._venue_down:
             state = Text(self._t(" VENUE DOWN "), style="bold white on red")
         elif stale:
-            state = Text(self._t(" {n} STALE ", n=stale),
-                         style="black on yellow")
+            state = Text(self._t(" {n} STALE ", n=stale), style="black on yellow")
         elif limited:
             state = Text(self._t(" RATE-LTD "), style="black on yellow")
         elif eng.record_only:
@@ -260,20 +280,23 @@ class Dashboard:
         g.add_column(justify="left")
         g.add_column(justify="right")
         if getattr(eng, "arcus", None) is not None:
-            left = Text.assemble(("arcus-arb  ", "bold"),
-                                 (f"{cfg.symbol} × ARCUS · {eng.hedge.name}",
-                                  "bold cyan"))
+            left = Text.assemble(
+                ("arcus-arb  ", "bold"),
+                (f"{cfg.symbol} × ARCUS · {eng.hedge.name}", "bold cyan"),
+            )
         else:
-            left = Text.assemble(("entropy-arb  ", "bold"),
-                                 (f"{cfg.symbol} × ENTROPY · {eng.hedge.name}",
-                                  "bold cyan"))
+            left = Text.assemble(
+                ("entropy-arb  ", "bold"),
+                (f"{cfg.symbol} × ENTROPY · {eng.hedge.name}", "bold cyan"),
+            )
         right = Text()
         right.append_text(mode)
         right.append("  ")
         right.append_text(state)
-        right.append(self._t("  up {t}",
-                             t=f"{up // 3600}:{up % 3600 // 60:02d}"
-                               f":{up % 60:02d}"), style="dim")
+        right.append(
+            self._t("  up {t}", t=f"{up // 3600}:{up % 3600 // 60:02d}:{up % 60:02d}"),
+            style="dim",
+        )
         g.add_row(left, right)
         return Panel(g, box=box.ROUNDED, padding=(0, 1))
 
@@ -298,10 +321,15 @@ class Dashboard:
                 receive_ts = getattr(book, "alive_ts", 0.0)
             age = f"{max(0.0, now - receive_ts):.1f}s" if receive_ts else "—"
             fresh = book.is_fresh(cfg.staleness_sec)
-            return ((f"{label:<5} {bid:,.8g} / {ask:,.8g}"
-                     if bid is not None and ask is not None
-                     else f"{label:<5} —") + f"  age {age}"
-                    + ("" if fresh else "  STALE"))
+            return (
+                (
+                    f"{label:<5} {bid:,.8g} / {ask:,.8g}"
+                    if bid is not None and ask is not None
+                    else f"{label:<5} —"
+                )
+                + f"  age {age}"
+                + ("" if fresh else "  STALE")
+            )
 
         arcus_bid = self._book_value(arcus.book, "best_bid")
         arcus_ask = self._book_value(arcus.book, "best_ask")
@@ -309,8 +337,9 @@ class Dashboard:
         rh_ask = self._book_value(rh.book, "best_ask")
         premium = None
         if None not in (arcus_bid, arcus_ask, rh_bid, rh_ask):
-            premium = (((arcus_bid + arcus_ask) / 2)
-                       / ((rh_bid + rh_ask) / 2) - 1) * 1e4
+            premium = (
+                ((arcus_bid + arcus_ask) / 2) / ((rh_bid + rh_ask) / 2) - 1
+            ) * 1e4
         strategy = getattr(cfg, "strategy", None)
         center = getattr(eng, "rolling_center_bps", None)
         if center is None:
@@ -320,16 +349,19 @@ class Dashboard:
         if center is None and strategy is not None:
             center = getattr(strategy, "center_bps", None)
         attributes = getattr(arcus, "latest_attributes", None)
-        rth = ("OUTSIDE_RTH" if attributes and attributes.is_outside_rth
-               else "RTH" if attributes and attributes.is_outside_rth is False
-               else "UNKNOWN")
-        book = arcus.book
-        health = getattr(book, "health", "OK" if book.is_fresh(cfg.staleness_sec)
-                         else "STALE")
-        rows = getattr(getattr(eng, "recorder", None), "rows_written", 0)
-        l2_rows = getattr(
-            getattr(eng, "recorder", None), "l2_events_written", 0
+        rth = (
+            "OUTSIDE_RTH"
+            if attributes and attributes.is_outside_rth
+            else "RTH"
+            if attributes and attributes.is_outside_rth is False
+            else "UNKNOWN"
         )
+        book = arcus.book
+        health = getattr(
+            book, "health", "OK" if book.is_fresh(cfg.staleness_sec) else "STALE"
+        )
+        rows = getattr(getattr(eng, "recorder", None), "rows_written", 0)
+        l2_rows = getattr(getattr(eng, "recorder", None), "l2_events_written", 0)
         body = Text()
         body.append("RECORD-ONLY · Arcus trading disabled\n", style="bold yellow")
         body.append(line(arcus, "ARCUS") + "\n")
@@ -340,8 +372,9 @@ class Dashboard:
         body.append(f"{center:+.3f} bps" if center is not None else "—")
         body.append(f"\nrecorder rows {rows}   L2 events {l2_rows}   RTH {rth}")
         body.append(f"\nArcus sequence {health}")
-        return Panel(body, title="ARCUS / RH market data", box=box.ROUNDED,
-                     padding=(0, 1))
+        return Panel(
+            body, title="ARCUS / RH market data", box=box.ROUNDED, padding=(0, 1)
+        )
 
     def _b0_panel(self):
         """B0 state view with no order controls or action affordances."""
@@ -373,32 +406,38 @@ class Dashboard:
             center = calibration.center_bps()
             state_text = calibration.lifecycle.state
             risk_text = (
-                calibration.risk.halt_reason
-                if calibration.risk.halted else "RUNNING"
+                calibration.risk.halt_reason if calibration.risk.halted else "RUNNING"
             )
             residual_text = str(calibration.accumulator.residual_exposure)
             candidate = calibration.current_candidate or calibration.proposed_quote()
             quote_text = (
                 f"{candidate.side} {candidate.price} × {candidate.quantity} "
                 f"({candidate.expected_edge_bps} bps)"
-                if candidate is not None else "NONE"
+                if candidate is not None
+                else "NONE"
             )
             seq = getattr(arcus.book, "sequence_health", "UNKNOWN")
         attributes = getattr(arcus, "latest_attributes", None)
         rth = (
-            "OUTSIDE_RTH" if attributes and attributes.is_outside_rth
-            else "RTH" if attributes and attributes.is_outside_rth is False
+            "OUTSIDE_RTH"
+            if attributes and attributes.is_outside_rth
+            else "RTH"
+            if attributes and attributes.is_outside_rth is False
             else "UNKNOWN"
         )
         body = Text()
-        body.append("TINY-LIVE PRE-ORDER · Arcus ALO only · RH hedge gated\n",
-                    style="bold yellow")
+        body.append(
+            "TINY-LIVE PRE-ORDER · Arcus ALO only · RH hedge gated\n",
+            style="bold yellow",
+        )
         body.append(bbo_line(arcus, "ARCUS") + "\n")
         body.append(bbo_line(rh, "RH") + "\n")
         body.append(
             f"premium {premium:+.3f} bps" if premium is not None else "premium —"
         )
-        body.append(f"   center {center:+.3f} bps" if center is not None else "   center —")
+        body.append(
+            f"   center {center:+.3f} bps" if center is not None else "   center —"
+        )
         body.append(f"   RTH {rth}   sequence {seq}\n")
         body.append(f"lifecycle {state_text}   residual {residual_text}\n")
         body.append(f"proposed {quote_text}\n")
@@ -410,17 +449,24 @@ class Dashboard:
         )
         body.append(f"risk {risk_text}\n")
         body.append("Arcus trading is disabled until separate first-order approval")
-        return Panel(body, title="ARCUS / RH B0 calibration", box=box.ROUNDED,
-                     padding=(0, 1))
+        return Panel(
+            body, title="ARCUS / RH B0 calibration", box=box.ROUNDED, padding=(0, 1)
+        )
 
     def _venues_panel(self):
         eng, cfg = self.eng, self.eng.cfg
         now = time.time()
         t = Table(box=box.SIMPLE_HEAD, padding=(0, 1))
-        for col, j in (("venue", "left"), ("bid / ask", "right"),
-                       ("spr bps", "right"), ("age", "right"),
-                       ("position", "right"), ("volume", "right"),
-                       ("equity", "right"), ("free", "right")):
+        for col, j in (
+            ("venue", "left"),
+            ("bid / ask", "right"),
+            ("spr bps", "right"),
+            ("age", "right"),
+            ("position", "right"),
+            ("volume", "right"),
+            ("equity", "right"),
+            ("free", "right"),
+        ):
             t.add_column(self._t(col), justify=j, no_wrap=True)
         vol_total = 0.0
         for v in eng.venues.values():
@@ -431,24 +477,33 @@ class Dashboard:
                 name.append(self._t(" DOWN"), style="bold white on red")
             elif eng._venue_limited(v):
                 name.append(self._t(" LTD"), style="bold yellow")
-            age = (Text(f"{now - v.book.last_update_ts:.1f}s", style="dim")
-                   if v.book.ready else Text("—", style="dim"))
+            age = (
+                Text(f"{now - v.book.last_update_ts:.1f}s", style="dim")
+                if v.book.ready
+                else Text("—", style="dim")
+            )
             if not fresh:
                 age = Text(self._t("STALE"), style="bold red")
-            pos = Text(f"{v.position:+.6g}",
-                       style="green" if v.position > 0
-                       else ("red" if v.position < 0 else "dim"))
+            pos = Text(
+                f"{v.position:+.6g}",
+                style="green"
+                if v.position > 0
+                else ("red" if v.position < 0 else "dim"),
+            )
             if m is not None and v.position:
                 pos.append(f" · ${abs(v.position) * m:,.0f}", style="dim")
             vol = v.volume_usd
             vol_total += vol
-            t.add_row(name,
-                      f"{bb:,.6g} / {ba:,.6g}" if (bb and ba) else "—",
-                      f"{(ba / bb - 1) * 1e4:.1f}" if (bb and ba) else "—",
-                      age, pos,
-                      Text(f"${vol:,.0f}") if vol else Text("—", style="dim"),
-                      _usd(v.equity, signed=False, decimals=2),
-                      _usd(v.free, signed=False, decimals=2))
+            t.add_row(
+                name,
+                f"{bb:,.6g} / {ba:,.6g}" if (bb and ba) else "—",
+                f"{(ba / bb - 1) * 1e4:.1f}" if (bb and ba) else "—",
+                age,
+                pos,
+                Text(f"${vol:,.0f}") if vol else Text("—", style="dim"),
+                _usd(v.equity, signed=False, decimals=2),
+                _usd(v.free, signed=False, decimals=2),
+            )
         title = self._t("venues")
         if vol_total:
             title += self._t("  ·  session volume ${v}", v=f"{vol_total:,.0f}")
@@ -457,35 +512,52 @@ class Dashboard:
     def _session_panel(self):
         eng, cfg = self.eng, self.eng.cfg
         net = sum(v.position for v in eng.venues.values())
-        last = (self._t("{s}s ago", s=f"{time.time() - eng.last_trade_ts:.0f}")
-                if eng.last_trade_ts else "—")
+        last = (
+            self._t("{s}s ago", s=f"{time.time() - eng.last_trade_ts:.0f}")
+            if eng.last_trade_ts
+            else "—"
+        )
         g = Table.grid(padding=(0, 2))
         g.add_column(justify="left", style="dim", no_wrap=True)
         g.add_column(justify="right", no_wrap=True)
         g.add_row(self._t("PnL (MTM)"), _usd(eng.session_pnl()))
         g.add_row(self._t("account Δ"), _usd(eng.account_delta()))
         eqs = [v.equity for v in eng.venues.values()]
-        g.add_row(self._t("Σ equity"),
-                  _usd(sum(eqs) if all(e is not None for e in eqs) else None,
-                       signed=False, decimals=2))
+        g.add_row(
+            self._t("Σ equity"),
+            _usd(
+                sum(eqs) if all(e is not None for e in eqs) else None,
+                signed=False,
+                decimals=2,
+            ),
+        )
         g.add_row(self._t("Σ exp edge"), _usd(eng.total_exp_edge))
         g.add_row(self._t("Σ fill edge"), _usd(eng.total_fill_edge))
-        g.add_row(self._t("trades / hedges"),
-                  Text(f"{eng.trades} / {eng.hedges}"))
-        g.add_row(self._t("net delta"), Text(f"{net:+.6g}",
-                  style="bold red" if abs(net) > cfg.net_tolerance_base
-                  else "dim"))
-        g.add_row(self._t("errors"), Text(str(eng.consec_errors),
-                  style="bold red" if eng.consec_errors else "dim"))
+        g.add_row(self._t("trades / hedges"), Text(f"{eng.trades} / {eng.hedges}"))
+        g.add_row(
+            self._t("net delta"),
+            Text(
+                f"{net:+.6g}",
+                style="bold red" if abs(net) > cfg.net_tolerance_base else "dim",
+            ),
+        )
+        g.add_row(
+            self._t("errors"),
+            Text(
+                str(eng.consec_errors), style="bold red" if eng.consec_errors else "dim"
+            ),
+        )
         g.add_row(self._t("last exec"), Text(last, style="dim"))
         if eng.recorder is not None:
-            g.add_row(self._t("minute rows"),
-                      Text(str(eng.recorder.rows_written), style="dim"))
-        return Panel(g, title=self._t("session"), box=box.ROUNDED,
-                     padding=(0, 1))
+            g.add_row(
+                self._t("minute rows"),
+                Text(str(eng.recorder.rows_written), style="dim"),
+            )
+        return Panel(g, title=self._t("session"), box=box.ROUNDED, padding=(0, 1))
 
-    def _dir_row(self, t: Table, label: str, buy, sell,
-                 hurdle_bps: Optional[float], armed_key: str) -> None:
+    def _dir_row(
+        self, t: Table, label: str, buy, sell, hurdle_bps: float | None, armed_key: str
+    ) -> None:
         """One direction: executable premium vs its full hurdle (fees and
         inventory surcharge included)."""
         eng = self.eng
@@ -493,25 +565,28 @@ class Dashboard:
         if hurdle_bps is None:
             hurdle = None
         else:
-            hurdle = (hurdle_bps + buy.fee_bps + sell.fee_bps
-                      + eng._inv_add_bps(buy, sell))
+            hurdle = (
+                hurdle_bps + buy.fee_bps + sell.fee_bps + eng._inv_add_bps(buy, sell)
+            )
         if not (ba and sb):
             hurdle_text = f"{hurdle:+.1f}" if hurdle is not None else "—"
-            t.add_row(label, Text("—", style="dim"),
-                      hurdle_text, Text("—", style="dim"), "")
+            t.add_row(
+                label, Text("—", style="dim"), hurdle_text, Text("—", style="dim"), ""
+            )
             return
         prem = (sb / ba - 1) * 1e4
         if hurdle is None:
-            t.add_row(label, Text(f"{prem:+.2f}"),
-                      "—", Text("—", style="dim"), "")
+            t.add_row(label, Text(f"{prem:+.2f}"), "—", Text("—", style="dim"), "")
             return
         gap = prem - hurdle
         armed = Text("●", style="green") if eng._armed.get(armed_key) else ""
-        t.add_row(label,
-                  Text(f"{prem:+.2f}", style="bold green" if gap >= 0 else ""),
-                  f"{hurdle:+.2f}",
-                  Text(f"{gap:+.2f}", style="green" if gap >= 0 else "dim"),
-                  armed)
+        t.add_row(
+            label,
+            Text(f"{prem:+.2f}", style="bold green" if gap >= 0 else ""),
+            f"{hurdle:+.2f}",
+            Text(f"{gap:+.2f}", style="green" if gap >= 0 else "dim"),
+            armed,
+        )
 
     def _signal_panel(self):
         eng = self.eng
@@ -519,8 +594,7 @@ class Dashboard:
         state = eng.strategy.state()
         head = Text()
         head.append(self._t("mid premium "), style="dim")
-        head.append(f"{prem:+.2f} bps" if prem is not None else "—",
-                    style="bold cyan")
+        head.append(f"{prem:+.2f} bps" if prem is not None else "—", style="bold cyan")
         head.append(self._t("   strategy "), style="dim")
         head.append(eng.cfg.strategy.name)
         head.append(self._t("   midline "), style="dim")
@@ -549,14 +623,30 @@ class Dashboard:
         t.add_column(self._t("hurdle bps"), justify="right")
         t.add_column(self._t("gap bps"), justify="right")
         t.add_column("", justify="left")
-        self._dir_row(t, self._t("SELL entropy → buy {h}", h=eng.hedge.name),
-                      eng.hedge, eng.entropy, sell_hurdle, "sell_entropy")
-        self._dir_row(t, self._t("BUY entropy → sell {h}", h=eng.hedge.name),
-                      eng.entropy, eng.hedge, buy_hurdle, "buy_entropy")
-        return Panel(Group(head, t),
-                     title=self._t("signal — executable premium vs full "
-                                   "hurdle incl. fees (● = armed)"),
-                     box=box.ROUNDED, padding=(0, 1))
+        self._dir_row(
+            t,
+            self._t("SELL entropy → buy {h}", h=eng.hedge.name),
+            eng.hedge,
+            eng.entropy,
+            sell_hurdle,
+            "sell_entropy",
+        )
+        self._dir_row(
+            t,
+            self._t("BUY entropy → sell {h}", h=eng.hedge.name),
+            eng.entropy,
+            eng.hedge,
+            buy_hurdle,
+            "buy_entropy",
+        )
+        return Panel(
+            Group(head, t),
+            title=self._t(
+                "signal — executable premium vs full hurdle incl. fees (● = armed)"
+            ),
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
 
     def _trades_panel(self):
         eng = self.eng
@@ -565,36 +655,56 @@ class Dashboard:
         actuals = [r.get("actual") for r in rows]
         actual_pending = any(value is None for value in actuals)
         actual_sum = sum(value for value in actuals if value is not None)
-        t = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1),
-                  show_footer=bool(rows))
-        t.add_column(self._t("time"),
-                     footer=Text(self._t("Σ last {n}", n=len(rows)),
-                                 style="dim"))
+        t = Table(
+            box=box.SIMPLE_HEAD, expand=True, padding=(0, 1), show_footer=bool(rows)
+        )
+        t.add_column(
+            self._t("time"),
+            footer=Text(self._t("Σ last {n}", n=len(rows)), style="dim"),
+        )
         t.add_column(self._t("direction"))
         t.add_column(self._t("qty"), justify="right")
         t.add_column(self._t("notional"), justify="right")
         t.add_column(self._t("prem bps"), justify="right")
         t.add_column(self._t("expected $"), justify="right", footer=_usd(exp_sum))
-        t.add_column(self._t("actual $"), justify="right",
-                     footer=(Text("pending", style="yellow")
-                             if actual_pending else _usd(actual_sum)))
+        t.add_column(
+            self._t("actual $"),
+            justify="right",
+            footer=(
+                Text("pending", style="yellow") if actual_pending else _usd(actual_sum)
+            ),
+        )
         t.add_column(self._t("status"))
         for r in reversed(rows):
             style = "green" if r["ok"] else "bold red"
             actual = r.get("actual")
-            t.add_row(time.strftime("%H:%M:%S", time.localtime(r["ts"])),
-                      r["direction"], f"{r['qty']:.6g}",
-                      f"${r['notional']:,.0f}", f"{r['prem_bps']:+.1f}",
-                      _usd(r["exp"]),
-                      (Text("pending", style="yellow")
-                       if actual is None else _usd(actual)),
-                      Text(r["status"], style=style))
+            t.add_row(
+                time.strftime("%H:%M:%S", time.localtime(r["ts"])),
+                r["direction"],
+                f"{r['qty']:.6g}",
+                f"${r['notional']:,.0f}",
+                f"{r['prem_bps']:+.1f}",
+                _usd(r["exp"]),
+                (Text("pending", style="yellow") if actual is None else _usd(actual)),
+                Text(r["status"], style=style),
+            )
         if not rows:
-            t.add_row(Text(self._t("no executions yet"), style="dim"),
-                      "", "", "", "", "", "", "")
-        return Panel(t, title=self._t("last {n} executions (net of fees)",
-                                      n=TRADE_ROWS),
-                     box=box.ROUNDED, padding=(0, 1))
+            t.add_row(
+                Text(self._t("no executions yet"), style="dim"),
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            )
+        return Panel(
+            t,
+            title=self._t("last {n} executions (net of fees)", n=TRADE_ROWS),
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
 
     def _events_panel(self):
         body = Text(no_wrap=True, overflow="ellipsis")
@@ -605,6 +715,9 @@ class Dashboard:
             if i:
                 body.append("\n")
             body.append(msg, style=LEVEL_STYLE.get(lvl, ""))
-        return Panel(body, title=self._t("events (full log: {f})",
-                                         f=self.log_file),
-                     box=box.ROUNDED, padding=(0, 1))
+        return Panel(
+            body,
+            title=self._t("events (full log: {f})", f=self.log_file),
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )

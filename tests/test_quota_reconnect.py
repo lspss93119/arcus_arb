@@ -2,15 +2,15 @@ import asyncio
 import logging
 
 from entropy_arb.book import OrderBook
+from entropy_arb.entropy_quota import (
+    EntropyQuotaCoordinator,
+    is_entropy_quota_error,
+)
 from entropy_arb.feeds import HLBookFeed
 from entropy_arb.reference import HLReferenceFeed
 from entropy_arb.ws_lifecycle import (
     active_entropy_ws_count,
     reset_entropy_ws_state,
-)
-from entropy_arb.entropy_quota import (
-    EntropyQuotaCoordinator,
-    is_entropy_quota_error,
 )
 
 
@@ -105,15 +105,17 @@ def test_main_quota_errors_use_dedicated_backoff_and_remain_bounded(caplog):
         reset_entropy_ws_state()
         stop = asyncio.Event()
         coordinator = EntropyQuotaCoordinator()
-        connector = ConnectSequence([
-            FailedConnection(
-                QuotaError(
-                    "received 1008 (policy violation) "
-                    "Cannot open more than 15 connections"
+        connector = ConnectSequence(
+            [
+                FailedConnection(
+                    QuotaError(
+                        "received 1008 (policy violation) "
+                        "Cannot open more than 15 connections"
+                    )
                 )
-            )
-            for _ in range(4)
-        ])
+                for _ in range(4)
+            ]
+        )
         delays = []
 
         async def wait_or_stop(feed_stop, delay):
@@ -184,9 +186,7 @@ def test_reference_wait_is_interruptible_by_shutdown():
         coordinator = EntropyQuotaCoordinator()
         coordinator.note_quota_error("reference")
         stop = asyncio.Event()
-        wait_task = asyncio.create_task(
-            coordinator.wait_reference_recovery(stop)
-        )
+        wait_task = asyncio.create_task(coordinator.wait_reference_recovery(stop))
         await asyncio.sleep(0)
         stop.set()
         assert await asyncio.wait_for(wait_task, timeout=0.2) is False

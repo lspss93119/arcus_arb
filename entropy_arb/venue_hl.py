@@ -11,6 +11,7 @@ outcomes (timeout/5xx) fall back to orderStatus-by-cloid polling inside
 send_taker(), so the engine sees the same unified result shape as the Lighter
 venue: {status, filled_base, avg_px, err, unresolved}.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +19,6 @@ import json
 import logging
 import math
 import time
-from typing import Optional
 
 import aiohttp
 
@@ -42,9 +42,11 @@ class NonceAllocator:
 
 
 class HLAccount:
-    def __init__(self, private_key: str, account_address: Optional[str],
-                 api_url: str) -> None:
+    def __init__(
+        self, private_key: str, account_address: str | None, api_url: str
+    ) -> None:
         from eth_account import Account
+
         self.wallet = Account.from_key(private_key)
         self.query_address = (account_address or self.wallet.address).lower()
         self.is_mainnet = api_url == "https://api.hyperliquid.xyz"
@@ -60,10 +62,16 @@ class HLAccount:
 class HLVenue:
     kind = "hl"
 
-    def __init__(self, conf: VenueConf, api_url: str, ws_url: str,
-                 session: aiohttp.ClientSession, settle_timeout_sec: float,
-                 *, quota_coordinator: EntropyQuotaCoordinator | None = None,
-                 ) -> None:
+    def __init__(
+        self,
+        conf: VenueConf,
+        api_url: str,
+        ws_url: str,
+        session: aiohttp.ClientSession,
+        settle_timeout_sec: float,
+        *,
+        quota_coordinator: EntropyQuotaCoordinator | None = None,
+    ) -> None:
         self.conf = conf
         self.key = conf.key
         self.name = conf.label
@@ -74,7 +82,7 @@ class HLVenue:
         self.book = OrderBook()
         self.position = 0.0
         self.cash = 0.0
-        self.volume_usd = 0.0     # cumulative filled notional this session
+        self.volume_usd = 0.0  # cumulative filled notional this session
         self.equity = None
         self.free = None
         self.start_equity = None
@@ -83,20 +91,22 @@ class HLVenue:
         self.cap_usd = conf.cap_usd
         self.orders_per_min = conf.orders_per_min
         self.last_traded_ts = 0.0
-        self.account: Optional[HLAccount] = None
+        self.account: HLAccount | None = None
         self.coin = ""
         self.asset_id = -1
         self.size_decimals = 0
         self.min_base = 0.0
         self.min_quote = 10.0
         self._cloid = int(time.time() * 1000)
-        self._signing = None      # lazy hyperliquid-sdk signing module
+        self._signing = None  # lazy hyperliquid-sdk signing module
         self.quota_coordinator = quota_coordinator
 
     async def _info(self, payload: dict):
         async with self.session.post(
-                self.api_url + "/info", json=payload,
-                timeout=aiohttp.ClientTimeout(total=INFO_TIMEOUT)) as r:
+            self.api_url + "/info",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=INFO_TIMEOUT),
+        ) as r:
             r.raise_for_status()
             return await r.json()
 
@@ -104,9 +114,11 @@ class HLVenue:
         dexs = await self._info({"type": "perpDexs"})
         names = [(d or {}).get("name", "") for d in dexs]
         if self.conf.hl_dex not in names:
-            raise RuntimeError(f"[{self.name}] dex '{self.conf.hl_dex}' not "
-                               f"found on Hyperliquid (available: "
-                               f"{[n for n in names if n][:20]}...)")
+            raise RuntimeError(
+                f"[{self.name}] dex '{self.conf.hl_dex}' not "
+                f"found on Hyperliquid (available: "
+                f"{[n for n in names if n][:20]}...)"
+            )
         dex_index = names.index(self.conf.hl_dex)
         meta = await self._info({"type": "meta", "dex": self.conf.hl_dex})
         want = f"{self.conf.hl_dex}:{self.conf.symbol}"
@@ -118,11 +130,16 @@ class HLVenue:
             self.coin = a["name"]
             self.asset_id = 110000 + (dex_index - 1) * 10000 + idx
             self.size_decimals = int(a["szDecimals"])
-            self.min_base = 10 ** -self.size_decimals
-            log.info("[%s] %s asset_id=%d szDecimals=%d maxLev=%sx %s",
-                     self.name, self.coin, self.asset_id, self.size_decimals,
-                     a.get("maxLeverage"),
-                     "isolated-only" if a.get("onlyIsolated") else "")
+            self.min_base = 10**-self.size_decimals
+            log.info(
+                "[%s] %s asset_id=%d szDecimals=%d maxLev=%sx %s",
+                self.name,
+                self.coin,
+                self.asset_id,
+                self.size_decimals,
+                a.get("maxLeverage"),
+                "isolated-only" if a.get("onlyIsolated") else "",
+            )
             return
         raise RuntimeError(f"[{self.name}] {want} not found")
 
@@ -135,32 +152,46 @@ class HLVenue:
             raise RuntimeError(
                 "live trading on Hyperliquid needs the official SDK — "
                 "pip install -r requirements-live.txt "
-                "(hyperliquid-python-sdk)") from e
+                "(hyperliquid-python-sdk)"
+            ) from e
         self._signing = hl_signing
         self.account = HLAccount(c.private_key, c.account_address, self.api_url)
         log.info("[%s] %s", self.name, self.account.describe())
 
-    def share_nonces_with(self, other: "HLVenue") -> None:
+    def share_nonces_with(self, other: HLVenue) -> None:
         """One signer address must use one nonce sequence."""
-        if (self.account and other.account and
-                self.account.wallet.address == other.account.wallet.address):
+        if (
+            self.account
+            and other.account
+            and self.account.wallet.address == other.account.wallet.address
+        ):
             other.account.nonces = self.account.nonces
-            log.info("[%s]/[%s] same signer — shared nonce allocator",
-                     self.name, other.name)
+            log.info(
+                "[%s]/[%s] same signer — shared nonce allocator", self.name, other.name
+            )
 
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
         is_entropy = self.conf.hl_dex == "io"
         quota_coordinator = getattr(self, "quota_coordinator", None)
-        return [asyncio.create_task(
-            HLBookFeed(self.name, self.ws_url, self.coin, self.book,
-                       notify,
-                       purpose=("entropy-market-data"
-                                if is_entropy else "hyperliquid-market-data"),
-                       count_active=is_entropy,
-                       quota_coordinator=(
-                           quota_coordinator if is_entropy else None
-                       )).run(stop),
-            name=f"book-{self.key}")]
+        return [
+            asyncio.create_task(
+                HLBookFeed(
+                    self.name,
+                    self.ws_url,
+                    self.coin,
+                    self.book,
+                    notify,
+                    purpose=(
+                        "entropy-market-data"
+                        if is_entropy
+                        else "hyperliquid-market-data"
+                    ),
+                    count_active=is_entropy,
+                    quota_coordinator=(quota_coordinator if is_entropy else None),
+                ).run(stop),
+                name=f"book-{self.key}",
+            )
+        ]
 
     def ready_to_trade(self) -> bool:
         return self.account is not None
@@ -180,7 +211,7 @@ class HLVenue:
         max_dec = max(0, 6 - self.size_decimals)
         sig_dec = 4 - math.floor(math.log10(px))
         dec = max(0, min(max_dec, sig_dec))
-        f = 10.0 ** dec
+        f = 10.0**dec
         v = math.ceil(px * f - 1e-9) / f if round_up else math.floor(px * f + 1e-9) / f
         return round(v, 8)
 
@@ -188,34 +219,57 @@ class HLVenue:
 
     def _next_cloid(self):
         from hyperliquid.utils.types import Cloid
+
         self._cloid += 1
         return Cloid.from_int(self._cloid)
 
-    async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
-                         reduce_only: bool = False) -> dict:
+    async def send_taker(
+        self, *, is_buy: bool, qty: float, limit_px: float, reduce_only: bool = False
+    ) -> dict:
         assert self.account is not None and self.asset_id >= 0
         s = self._signing
         cloid = self._next_cloid()
-        order_req = {"coin": self.coin, "is_buy": is_buy, "sz": round(qty, 8),
-                     "limit_px": limit_px,
-                     "order_type": {"limit": {"tif": "Ioc"}},
-                     "reduce_only": reduce_only, "cloid": cloid}
+        order_req = {
+            "coin": self.coin,
+            "is_buy": is_buy,
+            "sz": round(qty, 8),
+            "limit_px": limit_px,
+            "order_type": {"limit": {"tif": "Ioc"}},
+            "reduce_only": reduce_only,
+            "cloid": cloid,
+        }
         try:
             wire = s.order_request_to_order_wire(order_req, self.asset_id)
             action = s.order_wires_to_order_action([wire])
             nonce = self.account.nonces.next()
-            sig = s.sign_l1_action(self.account.wallet, action, None, nonce,
-                                   None, self.account.is_mainnet)
-            payload = {"action": action, "nonce": nonce, "signature": sig,
-                       "vaultAddress": None, "expiresAfter": None}
+            sig = s.sign_l1_action(
+                self.account.wallet, action, None, nonce, None, self.account.is_mainnet
+            )
+            payload = {
+                "action": action,
+                "nonce": nonce,
+                "signature": sig,
+                "vaultAddress": None,
+                "expiresAfter": None,
+            }
         except Exception as e:
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": f"signing failed: {e!r}", "unresolved": False}
+            return {
+                "status": "send-failed",
+                "filled_base": 0.0,
+                "avg_px": None,
+                "err": f"signing failed: {e!r}",
+                "unresolved": False,
+            }
 
         body, err, unresolved = await self._post_exchange(payload)
         if err is not None:
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": err, "unresolved": False}
+            return {
+                "status": "send-failed",
+                "filled_base": 0.0,
+                "avg_px": None,
+                "err": err,
+                "unresolved": False,
+            }
         if not unresolved:
             res = self._parse(body)
             if not res.get("unresolved"):
@@ -224,9 +278,13 @@ class HLVenue:
         deadline = time.time() + self.settle_timeout
         while time.time() < deadline:
             try:
-                st = await self._info({"type": "orderStatus",
-                                       "user": self.account.query_address,
-                                       "oid": cloid.to_raw()})
+                st = await self._info(
+                    {
+                        "type": "orderStatus",
+                        "user": self.account.query_address,
+                        "oid": cloid.to_raw(),
+                    }
+                )
             except Exception:
                 st = None
             if st and st.get("status") == "order":
@@ -234,22 +292,36 @@ class HLVenue:
                 status = str(o.get("status", ""))
                 inner = o.get("order") or {}
                 try:
-                    filled = max(float(inner.get("origSz") or 0)
-                                 - float(inner.get("sz") or 0), 0.0)
+                    filled = max(
+                        float(inner.get("origSz") or 0) - float(inner.get("sz") or 0),
+                        0.0,
+                    )
                 except (TypeError, ValueError):
                     filled = 0.0
                 if status != "open":
-                    return {"status": status, "filled_base": filled,
-                            "avg_px": None, "err": None, "unresolved": False}
+                    return {
+                        "status": status,
+                        "filled_base": filled,
+                        "avg_px": None,
+                        "err": None,
+                        "unresolved": False,
+                    }
             await asyncio.sleep(0.5)
-        return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
-                "err": None, "unresolved": True}
+        return {
+            "status": "timeout",
+            "filled_base": 0.0,
+            "avg_px": None,
+            "err": None,
+            "unresolved": True,
+        }
 
     async def _post_exchange(self, payload: dict):
         try:
             async with self.session.post(
-                    self.api_url + "/exchange", json=payload,
-                    timeout=aiohttp.ClientTimeout(total=INFO_TIMEOUT)) as r:
+                self.api_url + "/exchange",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=INFO_TIMEOUT),
+            ) as r:
                 text = await r.text()
                 if r.status == 429:
                     return None, f"RATE_LIMITED: HTTP 429 {text[:150]}", False
@@ -258,7 +330,7 @@ class HLVenue:
                 if r.status >= 500:
                     return None, None, True
                 return json.loads(text), None, False
-        except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError):
+        except (TimeoutError, aiohttp.ClientError, json.JSONDecodeError):
             return None, None, True
 
     @staticmethod
@@ -267,8 +339,14 @@ class HLVenue:
             low = msg.lower()
             if "rate limit" in low or "too many" in low:
                 msg = "RATE_LIMITED: " + msg
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": msg, "unresolved": False}
+            return {
+                "status": "send-failed",
+                "filled_base": 0.0,
+                "avg_px": None,
+                "err": msg,
+                "unresolved": False,
+            }
+
         if body.get("status") == "err":
             return fail(str(body.get("response")))
         if body.get("status") != "ok":
@@ -279,19 +357,32 @@ class HLVenue:
             return fail(f"malformed response: {str(body)[:200]}")
         if "filled" in st:
             f = st["filled"]
-            return {"status": "filled",
-                    "filled_base": float(f.get("totalSz") or 0.0),
-                    "avg_px": float(f["avgPx"]) if f.get("avgPx") else None,
-                    "err": None, "unresolved": False}
+            return {
+                "status": "filled",
+                "filled_base": float(f.get("totalSz") or 0.0),
+                "avg_px": float(f["avgPx"]) if f.get("avgPx") else None,
+                "err": None,
+                "unresolved": False,
+            }
         if "error" in st:
             msg = str(st["error"])
             if "could not immediately match" in msg.lower():
-                return {"status": "canceled", "filled_base": 0.0, "avg_px": None,
-                        "err": None, "unresolved": False}
+                return {
+                    "status": "canceled",
+                    "filled_base": 0.0,
+                    "avg_px": None,
+                    "err": None,
+                    "unresolved": False,
+                }
             return fail(msg)
         if "resting" in st:
-            return {"status": "resting?", "filled_base": 0.0, "avg_px": None,
-                    "err": None, "unresolved": True}
+            return {
+                "status": "resting?",
+                "filled_base": 0.0,
+                "avg_px": None,
+                "err": None,
+                "unresolved": True,
+            }
         return fail(f"unknown status: {str(st)[:150]}")
 
     # -------------------------------------------------------------- accounts
@@ -320,13 +411,13 @@ class HLVenue:
                         if hist:
                             return float(hist[-1][1]), None
             except Exception as e:
-                log.debug("[%s] portfolio fetch failed, falling back: %r",
-                          self.name, e)
+                log.debug("[%s] portfolio fetch failed, falling back: %r", self.name, e)
         dexs = [self.conf.hl_dex] + ([""] if self.include_core_equity else [])
         eq = fr = 0.0
         for dex in dexs:
-            st = await self._info({"type": "clearinghouseState", "user": addr,
-                                   "dex": dex})
+            st = await self._info(
+                {"type": "clearinghouseState", "user": addr, "dex": dex}
+            )
             ms = st.get("marginSummary") or {}
             eq += float(ms.get("accountValue") or 0.0)
             fr += float(st.get("withdrawable") or 0.0)
@@ -335,8 +426,9 @@ class HLVenue:
     async def fetch_position(self) -> float:
         addr = self._query_address()
         assert addr is not None
-        st = await self._info({"type": "clearinghouseState", "user": addr,
-                               "dex": self.conf.hl_dex})
+        st = await self._info(
+            {"type": "clearinghouseState", "user": addr, "dex": self.conf.hl_dex}
+        )
         for ap in st.get("assetPositions") or []:
             pos = ap.get("position") or {}
             if pos.get("coin") == self.coin:

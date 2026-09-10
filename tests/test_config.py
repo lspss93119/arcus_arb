@@ -2,6 +2,7 @@
 
 Run:  python3 -m pytest tests/  (or  python3 tests/test_config.py)
 """
+
 import os
 import sys
 import tempfile
@@ -31,15 +32,12 @@ strategy:
 
 
 def load(yaml_text: str, symbol="SNDK", hedge="lighter-rh"):
-    return load_config(write_tmp(yaml_text), NO_ENV,
-                       symbol=symbol, hedge_venue=hedge)
+    return load_config(write_tmp(yaml_text), NO_ENV, symbol=symbol, hedge_venue=hedge)
 
 
 def test_example_config_loads():
-    example_file = os.path.join(os.path.dirname(__file__), "..",
-                                "config.example.yaml")
-    cfg = load_config(example_file, NO_ENV,
-                      symbol="SNDK", hedge_venue="lighter-rh")
+    example_file = os.path.join(os.path.dirname(__file__), "..", "config.example.yaml")
+    cfg = load_config(example_file, NO_ENV, symbol="SNDK", hedge_venue="lighter-rh")
     assert cfg.symbol == "SNDK"
     assert cfg.arcus.kind == "arcus" and cfg.arcus.label == "ARCUS"
     assert cfg.hedge_venue == "lighter-rh"
@@ -65,7 +63,7 @@ def test_minimal_defaults():
     assert cfg.strategy.lower_bps == 3.0
     assert cfg.hedge.label == "LIGHTER"
     assert cfg.hedge.lighter_profile.chain_id == 304
-    assert cfg.take_fraction == 0.5          # defaults kick in
+    assert cfg.take_fraction == 0.5  # defaults kick in
     assert cfg.recorder_enabled is True
     assert cfg.recorder_database == "data/market-history.sqlite"
 
@@ -99,7 +97,8 @@ strategy:
 
 
 def test_rolling_center_parameters_are_strictly_validated():
-    expect_error("""
+    expect_error(
+        """
 strategy:
   name: stable_basis
   params:
@@ -107,8 +106,11 @@ strategy:
     center_bps: -1.8
     upper_bps: 0.75
     lower_bps: 0.75
-""", "center_mode must be 'fixed' or 'rolling'")
-    expect_error("""
+""",
+        "center_mode must be 'fixed' or 'rolling'",
+    )
+    expect_error(
+        """
 strategy:
   name: stable_basis
   params:
@@ -117,8 +119,11 @@ strategy:
     center_window_hours: 0
     upper_bps: 0.75
     lower_bps: 0.75
-""", "center_window_hours")
-    expect_error("""
+""",
+        "center_window_hours",
+    )
+    expect_error(
+        """
 strategy:
   name: stable_basis
   params:
@@ -127,7 +132,9 @@ strategy:
     center_update_minutes: 0
     upper_bps: 0.75
     lower_bps: 0.75
-""", "center_update_minutes")
+""",
+        "center_update_minutes",
+    )
 
 
 def test_drifting_strategy_config_loads():
@@ -202,24 +209,28 @@ def expect_error(yaml_text: str, needle: str, **kw):
 
 
 def test_unknown_key_rejected():
-    expect_error(MINIMAL + "\nthresholdz:\n  x: 1\n",
-                 "unknown config key 'thresholdz'")
-    expect_error(MINIMAL + "\nsizing:\n  take_fractionn: 0.5\n",
-                 "sizing.take_fractionn")
+    expect_error(MINIMAL + "\nthresholdz:\n  x: 1\n", "unknown config key 'thresholdz'")
+    expect_error(
+        MINIMAL + "\nsizing:\n  take_fractionn: 0.5\n", "sizing.take_fractionn"
+    )
 
 
 def test_unknown_strategy_rejected():
-    expect_error("""
+    expect_error(
+        """
 strategy:
   name: unknown_basis
   params:
     upper_bps: 3
     lower_bps: 3
-""", "unknown strategy")
+""",
+        "unknown strategy",
+    )
 
 
 def test_strategy_specific_params_rejected():
-    expect_error("""
+    expect_error(
+        """
 strategy:
   name: drifting_basis
   params:
@@ -227,8 +238,11 @@ strategy:
     window_minutes: 60
     upper_bps: 3
     lower_bps: 3
-""", "center_bps")
-    expect_error("""
+""",
+        "center_bps",
+    )
+    expect_error(
+        """
 strategy:
   name: stable_basis
   params:
@@ -236,35 +250,44 @@ strategy:
     window_minutes: 60
     upper_bps: 3
     lower_bps: 3
-""", "window_minutes")
+""",
+        "window_minutes",
+    )
 
 
 def test_legacy_thresholds_get_actionable_migration_error():
-    expect_error("""
+    expect_error(
+        """
 thresholds:
   midline_bps: -1
   upper_bps: 3
   lower_bps: 3.5
-""", "strategy:")
+""",
+        "strategy:",
+    )
 
 
 def test_nonfinite_strategy_values_rejected():
-    expect_error("""
+    expect_error(
+        """
 strategy:
   name: stable_basis
   params:
     center_bps: .nan
     upper_bps: 3
     lower_bps: 3
-""", "finite")
+""",
+        "finite",
+    )
 
 
 def test_markets_no_longer_config_keys():
     # symbol / hedge_venue moved to --symbol / --hedge: leftovers in the
     # YAML must fail loudly, not silently override the flags
     expect_error("symbol: SNDK\n" + MINIMAL, "unknown config key 'symbol'")
-    expect_error("hedge_venue: tradexyz\n" + MINIMAL,
-                 "unknown config key 'hedge_venue'")
+    expect_error(
+        "hedge_venue: tradexyz\n" + MINIMAL, "unknown config key 'hedge_venue'"
+    )
 
 
 def test_bad_cli_markets():
@@ -277,13 +300,15 @@ def test_missing_thresholds():
 
 
 def test_nonpositive_band():
-    expect_error("strategy:\n"
-                 "  name: stable_basis\n"
-                 "  params:\n"
-                 "    center_bps: 5\n"
-                 "    upper_bps: 0\n"
-                 "    lower_bps: 3\n",
-                 "must be > 0")
+    expect_error(
+        "strategy:\n"
+        "  name: stable_basis\n"
+        "  params:\n"
+        "    center_bps: 5\n"
+        "    upper_bps: 0\n"
+        "    lower_bps: 3\n",
+        "must be > 0",
+    )
 
 
 if __name__ == "__main__":

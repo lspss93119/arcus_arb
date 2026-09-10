@@ -2,6 +2,7 @@
 
 Run:  python3 -m pytest tests/  (or  python3 tests/test_dashboard.py)
 """
+
 import os
 import sys
 import tempfile
@@ -51,8 +52,7 @@ strategy:
         raise ValueError(strategy_name)
     f.write(strategy)
     f.close()
-    return load_config(f.name, NO_ENV,
-                       symbol="SNDK", hedge_venue="lighter-rh")
+    return load_config(f.name, NO_ENV, symbol="SNDK", hedge_venue="lighter-rh")
 
 
 class StubVenue:
@@ -67,8 +67,9 @@ class StubVenue:
         self.book = OrderBook()
 
     def set_book(self, bid, ask):
-        self.book.apply_hl([[{"px": str(bid), "sz": "10"}],
-                            [{"px": str(ask), "sz": "10"}]])
+        self.book.apply_hl(
+            [[{"px": str(bid), "sz": "10"}], [{"px": str(ask), "sz": "10"}]]
+        )
 
 
 def render(eng, lang="en") -> str:
@@ -95,7 +96,7 @@ def test_renders_before_markets_resolve():
 
 def test_renders_key_numbers():
     eng = make_engine()
-    eng.entropy.set_book(100.14, 100.16)   # ~+15 bps rich vs hedge
+    eng.entropy.set_book(100.14, 100.16)  # ~+15 bps rich vs hedge
     eng.hedge.set_book(99.99, 100.01)
     # regression: a set last_trade_ts renders the "{s}s ago" cell — this
     # once collided with _t()'s own parameter name and crashed every frame
@@ -104,16 +105,38 @@ def test_renders_key_numbers():
     eng.entropy.equity, eng.entropy.start_equity = 1000.0, 990.0
     eng.hedge.equity, eng.hedge.start_equity = 500.0, 500.0
     eng.trades, eng.hedges = 7, 1
-    eng.recent_trades.append({
-        "ts": time.time(), "direction": "sell_entropy", "qty": 0.5,
-        "notional": 50.0, "prem_bps": 15.0, "exp": 0.07, "fill": 0.05,
-        "actual": 0.08,
-        "status": "filled/filled", "ok": True})
+    eng.recent_trades.append(
+        {
+            "ts": time.time(),
+            "direction": "sell_entropy",
+            "qty": 0.5,
+            "notional": 50.0,
+            "prem_bps": 15.0,
+            "exp": 0.07,
+            "fill": 0.05,
+            "actual": 0.08,
+            "status": "filled/filled",
+            "ok": True,
+        }
+    )
     out = render(eng)
-    for needle in ("ENTROPY", "RH", "SELL entropy", "BUY entropy",
-                   "100.14", "99.99", "mid premium", "midline",
-                   "7 / 1", "sell_entropy", "filled/filled",
-                   "$+10.00", "$+0.0800", "LIVE", "s ago"):
+    for needle in (
+        "ENTROPY",
+        "RH",
+        "SELL entropy",
+        "BUY entropy",
+        "100.14",
+        "99.99",
+        "mid premium",
+        "midline",
+        "7 / 1",
+        "sell_entropy",
+        "filled/filled",
+        "$+10.00",
+        "$+0.0800",
+        "LIVE",
+        "s ago",
+    ):
         assert needle in out, f"{needle!r} missing from render"
     assert "$+0.0500" not in out
     assert "render error" not in out
@@ -125,11 +148,20 @@ def test_renders_key_numbers():
 
 def test_trade_panel_displays_pending_actual_until_hedge_settles():
     eng = make_engine()
-    eng.recent_trades.append({
-        "ts": time.time(), "direction": "sell_entropy", "qty": 0.5,
-        "notional": 50.0, "prem_bps": 15.0, "exp": 0.07, "fill": 0.0,
-        "actual": None, "status": "hedge-unresolved", "ok": True,
-    })
+    eng.recent_trades.append(
+        {
+            "ts": time.time(),
+            "direction": "sell_entropy",
+            "qty": 0.5,
+            "notional": 50.0,
+            "prem_bps": 15.0,
+            "exp": 0.07,
+            "fill": 0.0,
+            "actual": None,
+            "status": "hedge-unresolved",
+            "ok": True,
+        }
+    )
     out = render(eng)
     assert "pending" in out
     assert "hedge-unresolved" in out
@@ -203,10 +235,25 @@ def test_renders_in_chinese():
     eng.trades, eng.hedges = 7, 1
     eng.last_trade_ts = time.time() - 42
     out = render(eng, lang="zh")
-    for needle in ("实盘", "运行中", "交易所", "买一 / 卖一", "持仓", "会话",
-                   "盈亏 (MTM)", "净敞口", "中间价溢价", "中枢", "区间",
-                   "卖出 entropy → 买入 RH", "买入 entropy → 卖出 RH",
-                   "门槛 bps", "暂无执行", "日志事件", "秒前"):
+    for needle in (
+        "实盘",
+        "运行中",
+        "交易所",
+        "买一 / 卖一",
+        "持仓",
+        "会话",
+        "盈亏 (MTM)",
+        "净敞口",
+        "中间价溢价",
+        "中枢",
+        "区间",
+        "卖出 entropy → 买入 RH",
+        "买入 entropy → 卖出 RH",
+        "门槛 bps",
+        "暂无执行",
+        "日志事件",
+        "秒前",
+    ):
         assert needle in out, f"{needle!r} missing from zh render"
     # numbers unchanged by translation: sell hurdle midline+upper = +6
     assert "+6.00" in out
@@ -219,8 +266,10 @@ def test_zh_stop_summary():
     eng = make_engine()
     eng.trades, eng.hedges = 3, 1
     dash = Dashboard(eng, BufferLogHandler(), "logs/engine.log", lang="zh")
-    assert dash._t(" — {t} trades / {h} hedges, session PnL ",
-                   t=3, h=1) == " —— 执行 3 / 对冲 1，会话盈亏 "
+    assert (
+        dash._t(" — {t} trades / {h} hedges, session PnL ", t=3, h=1)
+        == " —— 执行 3 / 对冲 1，会话盈亏 "
+    )
     assert dash._t("no such key stays english") == "no such key stays english"
 
 
@@ -230,7 +279,7 @@ def test_renders_record_only_and_empty_books():
     eng.hedge = StubVenue("hedge", "MAIN")
     eng.venues = {"entropy": eng.entropy, "hedge": eng.hedge}
     eng.markets_ready = True
-    out = render(eng)                      # books empty: everything is "—"
+    out = render(eng)  # books empty: everything is "—"
     assert "RECORD-ONLY" in out
     assert "render error" not in out
 

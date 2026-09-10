@@ -4,13 +4,13 @@ The runtime wiring lives in :mod:`entropy_arb.arcus_execution`; this module
 keeps quote math, fill accumulation, lifecycle transitions, and hard stops
 small enough to test without a network or an exchange account.
 """
+
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
-
 
 ARCUS_CALIBRATION_QTY = Decimal("0.01")
 RH_HEDGE_MIN_QTY = Decimal("0.01")
@@ -61,9 +61,7 @@ def expected_edge_bps(
         raise ValueError("prices must be > 0")
     arcus_rate = _rate(_decimal(arcus_fee_bps, "arcus_fee_bps"))
     rh_rate = _rate(_decimal(rh_fee_bps, "rh_fee_bps"))
-    allowance = _rate(
-        _decimal(rh_slippage_allowance_bps, "rh_slippage_allowance_bps")
-    )
+    allowance = _rate(_decimal(rh_slippage_allowance_bps, "rh_slippage_allowance_bps"))
     if side == "SELL":
         proceeds = arcus_price * (Decimal("1") - arcus_rate)
         hedge_cost = hedge_price * (Decimal("1") + rh_rate + allowance)
@@ -113,7 +111,9 @@ def build_quote_candidates(inputs: Any) -> list[QuoteCandidate]:
     arcus_ask = _field(inputs, "arcus_ask")
     rh_bid = _field(inputs, "rh_bid")
     rh_ask = _field(inputs, "rh_ask")
-    if not (arcus_bid > 0 and arcus_ask >= arcus_bid and rh_bid > 0 and rh_ask >= rh_bid):
+    if not (
+        arcus_bid > 0 and arcus_ask >= arcus_bid and rh_bid > 0 and rh_ask >= rh_bid
+    ):
         return []
 
     center_bps = _field(inputs, "center_bps")
@@ -122,9 +122,7 @@ def build_quote_candidates(inputs: Any) -> list[QuoteCandidate]:
     arcus_fee = _field(inputs, "arcus_maker_fee_bps")
     rh_fee = _field(inputs, "rh_taker_fee_bps")
     allowance = _field(inputs, "rh_slippage_allowance_bps")
-    quantity = _decimal(
-        getattr(inputs, "quantity", ARCUS_CALIBRATION_QTY), "quantity"
-    )
+    quantity = _decimal(getattr(inputs, "quantity", ARCUS_CALIBRATION_QTY), "quantity")
     if quantity <= 0 or quantity % step != 0:
         raise ValueError("calibration quantity must be an exact Arcus step multiple")
 
@@ -153,24 +151,30 @@ def build_quote_candidates(inputs: Any) -> list[QuoteCandidate]:
             continue
         # ALO safety is checked again by the network client immediately before
         # submission against the latest Arcus BBO.
-        edge = Decimal(str(expected_edge_bps(
-            side=side,
-            arcus_price=price,
-            hedge_price=hedge_price,
-            arcus_fee_bps=arcus_fee,
-            rh_fee_bps=rh_fee,
-            rh_slippage_allowance_bps=allowance,
-        )))
-        candidates.append(QuoteCandidate(
-            side=side,
-            price=price,
-            quantity=quantity,
-            hedge_side=hedge_side,
-            hedge_price=hedge_price,
-            fair_price=fair,
-            expected_edge_bps=edge,
-            expected_usd=(edge / Decimal("10000")) * price * quantity,
-        ))
+        edge = Decimal(
+            str(
+                expected_edge_bps(
+                    side=side,
+                    arcus_price=price,
+                    hedge_price=hedge_price,
+                    arcus_fee_bps=arcus_fee,
+                    rh_fee_bps=rh_fee,
+                    rh_slippage_allowance_bps=allowance,
+                )
+            )
+        )
+        candidates.append(
+            QuoteCandidate(
+                side=side,
+                price=price,
+                quantity=quantity,
+                hedge_side=hedge_side,
+                hedge_price=hedge_price,
+                fair_price=fair,
+                expected_edge_bps=edge,
+                expected_usd=(edge / Decimal("10000")) * price * quantity,
+            )
+        )
     return candidates
 
 
@@ -181,7 +185,10 @@ def choose_quote(candidates: list[QuoteCandidate]) -> QuoteCandidate | None:
         return None
     # Deterministic tie-breaker keeps a session one-sided without introducing
     # a preference that could masquerade as a tuned market-making policy.
-    return max(qualifying, key=lambda candidate: (candidate.expected_edge_bps, candidate.side == "SELL"))
+    return max(
+        qualifying,
+        key=lambda candidate: (candidate.expected_edge_bps, candidate.side == "SELL"),
+    )
 
 
 @dataclass
@@ -213,7 +220,9 @@ class FillAccumulator:
         self.unhedged_qty += quantity
         if self.unhedged_qty < self.rh_min_qty:
             return None
-        units = (self.unhedged_qty / self.rh_step).to_integral_value(rounding=ROUND_FLOOR)
+        units = (self.unhedged_qty / self.rh_step).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
         hedge_qty = units * self.rh_step
         if hedge_qty < self.rh_min_qty or hedge_qty > self.unhedged_qty:
             return None
@@ -258,7 +267,9 @@ class CalibrationLifecycle:
         if self.state not in self.TERMINAL and self.state != "CANCELED":
             raise RuntimeError("maximum one Arcus order may be live")
         self.state = "OPEN"
-        self.expected_edge_at_creation = _decimal(expected_edge_bps, "expected_edge_bps")
+        self.expected_edge_at_creation = _decimal(
+            expected_edge_bps, "expected_edge_bps"
+        )
         self.original_qty = _decimal(original_qty, "original_qty")
         self.filled_qty = Decimal("0")
         self.remaining_qty = self.original_qty
@@ -271,9 +282,10 @@ class CalibrationLifecycle:
             self.state = "CANCEL_SENT"
 
     def should_cancel(self, current_edge_bps: Decimal) -> bool:
-        return self.state in ("OPEN", "PARTIAL") and _decimal(
-            current_edge_bps, "current_edge_bps"
-        ) < CANCEL_EDGE_BPS
+        return (
+            self.state in ("OPEN", "PARTIAL")
+            and _decimal(current_edge_bps, "current_edge_bps") < CANCEL_EDGE_BPS
+        )
 
     def record_fill(self, quantity: Decimal) -> None:
         if self.state == "REJECTED":
@@ -290,7 +302,9 @@ class CalibrationLifecycle:
         if self.state not in self.TERMINAL:
             self.state = "PARTIAL"
 
-    def record_order_status(self, status: str, remaining_qty: Decimal | None = None) -> None:
+    def record_order_status(
+        self, status: str, remaining_qty: Decimal | None = None
+    ) -> None:
         normalized = status.upper()
         # A delayed non-terminal update must not reopen an order after a
         # terminal update has already won the local race.  Fills are handled
@@ -298,7 +312,9 @@ class CalibrationLifecycle:
         if self.state in self.TERMINAL and normalized in ("OPEN", "PARTIALLY_FILLED"):
             return
         if remaining_qty is not None:
-            self.remaining_qty = max(_decimal(remaining_qty, "remaining_qty"), Decimal("0"))
+            self.remaining_qty = max(
+                _decimal(remaining_qty, "remaining_qty"), Decimal("0")
+            )
         if normalized in ("OPEN", "PARTIALLY_FILLED"):
             self.state = (
                 "PARTIAL"
@@ -349,7 +365,9 @@ class SessionRisk:
 
     def on_arcus_fill(self, price: Decimal, quantity: Decimal) -> None:
         self.fill_events += 1
-        self.filled_notional_usd += abs(_decimal(price, "price") * _decimal(quantity, "quantity"))
+        self.filled_notional_usd += abs(
+            _decimal(price, "price") * _decimal(quantity, "quantity")
+        )
         if self.fill_events >= self.limits.max_fill_events:
             self.halt("max Arcus fill events reached")
         elif self.filled_notional_usd >= self.limits.max_filled_notional_usd:
@@ -410,7 +428,9 @@ class MarketHealth:
 class CalibrationPnL:
     actual_usd: Decimal = Decimal("0")
 
-    def add_arcus_fill(self, *, side: str, price: Decimal, quantity: Decimal, fee: Decimal) -> None:
+    def add_arcus_fill(
+        self, *, side: str, price: Decimal, quantity: Decimal, fee: Decimal
+    ) -> None:
         notional = _decimal(price, "price") * _decimal(quantity, "quantity")
         fee = _decimal(fee, "fee")
         if side.upper() == "SELL":
@@ -420,7 +440,9 @@ class CalibrationPnL:
         else:
             raise ValueError("side must be BUY or SELL")
 
-    def add_rh_hedge(self, *, side: str, price: Decimal, quantity: Decimal, fee: Decimal) -> None:
+    def add_rh_hedge(
+        self, *, side: str, price: Decimal, quantity: Decimal, fee: Decimal
+    ) -> None:
         notional = _decimal(price, "price") * _decimal(quantity, "quantity")
         fee = _decimal(fee, "fee")
         if side.upper() == "SELL":
