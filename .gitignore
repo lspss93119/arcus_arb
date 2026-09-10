@@ -7,6 +7,7 @@ logs/
 data/
 exports/
 *.log
+.worktrees/
 
 # python
 __pycache__/
