@@ -102,8 +102,12 @@ class ArcusVenue:
         self.exchange_symbol = metadata.symbol
         self.price_tick = float(Decimal(metadata.tick_size))
         self.size_step = float(Decimal(metadata.step_size))
-        self.price_decimals = max(0, -Decimal(metadata.tick_size).as_tuple().exponent)
-        self.size_decimals = max(0, -Decimal(metadata.step_size).as_tuple().exponent)
+        price_exponent = Decimal(metadata.tick_size).as_tuple().exponent
+        size_exponent = Decimal(metadata.step_size).as_tuple().exponent
+        if not isinstance(price_exponent, int) or not isinstance(size_exponent, int):
+            raise RuntimeError("Arcus tick/step size must be finite decimals")
+        self.price_decimals = max(0, -price_exponent)
+        self.size_decimals = max(0, -size_exponent)
         self.min_base = float(Decimal(metadata.min_order_size or "0"))
         self.min_quote = float(Decimal(metadata.min_order_notional or "0"))
         self.name = "ARCUS"

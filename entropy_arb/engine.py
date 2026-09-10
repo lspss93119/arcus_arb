@@ -25,6 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any, cast
 
 import aiohttp
 
@@ -138,13 +139,18 @@ class Engine:
         self.confirm_mainnet = confirm_mainnet
         self.allow_first_order = allow_first_order
         self.session: aiohttp.ClientSession | None = None
-        self.arcus = None
-        self.entropy = None
-        self.hedge = None
-        self.venues: dict[str, object] = {}
-        self.recorder: MinuteRecorder | None = None
-        self.reference: ReferenceRecorder | None = None
-        self.market_history: MarketHistoryStore | None = None
+        # Venue and recorder implementations intentionally share a runtime
+        # protocol but have different optional capabilities (Arcus recorders,
+        # authenticated account feeds, and mature strategy venues).  Keep the
+        # dynamic boundary explicit here; each adapter validates its own
+        # external JSON/SDK inputs before exposing state to the engine.
+        self.arcus: Any = None
+        self.entropy: Any = None
+        self.hedge: Any = None
+        self.venues: dict[str, Any] = {}
+        self.recorder: Any = None
+        self.reference: Any = None
+        self.market_history: Any = None
         self.markets_ready = False
         self.stop = asyncio.Event()
         self._update_evt = asyncio.Event()
@@ -230,29 +236,33 @@ class Engine:
     async def run(self) -> None:
         # Long keepalive so order-path connections survive quiet spells; the
         # keepalive loop pings inside this window to hold them open.
-        self.session = aiohttp.ClientSession(
+        session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(keepalive_timeout=75.0, ttl_dns_cache=300)
         )
+        self.session = session
         try:
             await self._run_inner()
         finally:
-            await self.session.close()
+            await session.close()
 
     def _make_venue(self, vc):
+        if self.session is None:
+            raise RuntimeError("HTTP session is not initialized")
+        session = self.session
         if getattr(vc, "key", None) == "arcus" or getattr(vc, "kind", None) == "arcus":
             return ArcusVenue(
                 vc,
-                self.session,
+                session,
                 rest_url=self.cfg.arcus_rest_url,
                 ws_url=self.cfg.arcus_ws_url,
             )
         if vc.kind == "lighter":
-            return LighterVenue(vc, self.session, self.cfg.settle_timeout_sec)
+            return LighterVenue(vc, session, self.cfg.settle_timeout_sec)
         return HLVenue(
             vc,
             self.cfg.hl_api_url,
             self.cfg.hl_ws_url,
-            self.session,
+            session,
             self.cfg.settle_timeout_sec,
             quota_coordinator=self.entropy_quota,
         )
@@ -1018,6 +1028,10 @@ class Engine:
         for v in self.venues.values():
             tasks += v.start_tasks(self.stop, self._update_evt.set, live)
         if cfg.recorder_enabled or self.record_only:
+            if self.market_history is None:
+                raise RuntimeError(
+                    "recorder requires an initialized market-history store"
+                )
             self.recorder = MinuteRecorder(
                 self.market_history,
                 self.entropy.book,
@@ -1430,18 +1444,19 @@ class Engine:
             sell.send_taker(is_buy=False, qty=plan.qty, limit_px=sell_bound),
             return_exceptions=True,
         )
-        binfo, sinfo = (
-            r
-            if isinstance(r, dict)
-            else {
+
+        def normalize_result(result: Any) -> dict[str, Any]:
+            if isinstance(result, dict):
+                return cast(dict[str, Any], result)
+            return {
                 "status": "send-failed",
                 "filled_base": 0.0,
                 "avg_px": None,
-                "err": repr(r),
+                "err": repr(result),
                 "unresolved": False,
             }
-            for r in res
-        )
+
+        binfo, sinfo = [normalize_result(result) for result in res]
         for v, info, side in ((buy, binfo, "buy"), (sell, sinfo, "sell")):
             if info.get("err"):
                 log.error("[%s] %s leg: %s", v.name, side, info["err"])

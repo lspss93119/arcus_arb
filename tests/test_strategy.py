@@ -143,6 +143,8 @@ def test_drifting_requires_90_percent_coverage():
     for i in range(0, 61, 2):
         s.update(1000.0 + i, 2.0)
     state = s.state()
+    assert state.warmup_span_sec is not None
+    assert state.coverage_ratio is not None
     assert state.warmup_span_sec >= 60
     assert state.coverage_ratio < 0.90
     assert state.ready is False
@@ -152,17 +154,23 @@ def test_drifting_uses_timestamp_window_and_causal_median():
     s = DriftingBasisStrategy(window_minutes=1, upper_bps=3.0, lower_bps=3.5)
     for i in range(61):
         s.update(1000.0 + i, 1.0 if i < 60 else 9.0)
-    assert s.state().ready is True
-    first_center = s.state().center_bps
+    state = s.state()
+    assert state.ready is True
+    assert state.center_bps is not None
+    first_center = state.center_bps
     s.update(1061.0, 9.0)
-    assert s.state().center_bps >= first_center
+    updated = s.state()
+    assert updated.center_bps is not None
+    assert updated.center_bps >= first_center
 
 
 def test_short_gap_does_not_reset_history():
     s = DriftingBasisStrategy(window_minutes=1, upper_bps=3.0, lower_bps=3.5)
     feed_seconds(s, 1000.0, 40, lambda i: 1.0)
     s.update(1060.0, 1.0)
-    assert s.state().warmup_span_sec >= 60
+    state = s.state()
+    assert state.warmup_span_sec is not None
+    assert state.warmup_span_sec >= 60
 
 
 def test_exactly_30_second_gap_preserves_history_without_reset():

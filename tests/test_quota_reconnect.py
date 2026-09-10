@@ -124,7 +124,7 @@ def test_main_quota_errors_use_dedicated_backoff_and_remain_bounded(caplog):
                 stop.set()
             return not feed_stop.is_set()
 
-        coordinator.wait_or_stop = wait_or_stop
+        setattr(coordinator, "wait_or_stop", wait_or_stop)
         feed = HLBookFeed(
             "ENTROPY",
             "wss://example.invalid/ws",
@@ -136,11 +136,11 @@ def test_main_quota_errors_use_dedicated_backoff_and_remain_bounded(caplog):
         from entropy_arb import feeds
 
         original_connect = feeds.ws_connect
-        feeds.ws_connect = connector
+        setattr(feeds, "ws_connect", connector)
         try:
             await feed.run(stop)
         finally:
-            feeds.ws_connect = original_connect
+            setattr(feeds, "ws_connect", original_connect)
         assert delays == [15.0, 30.0, 60.0, 120.0]
         assert connector.calls == 4
         assert active_entropy_ws_count() == 0

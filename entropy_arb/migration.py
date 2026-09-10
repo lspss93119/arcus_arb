@@ -82,6 +82,30 @@ class _FileSpec:
     timestamp: Callable[[object], int]
 
 
+def _sample_timestamp(row: object) -> int:
+    if not isinstance(row, SampleRow):
+        raise TypeError("sample parser returned an unexpected row type")
+    return row.timestamp_ms
+
+
+def _minute_timestamp(row: object) -> int:
+    if not isinstance(row, MinuteRow):
+        raise TypeError("minute parser returned an unexpected row type")
+    return row.minute_ts
+
+
+def _entropy_reference_timestamp(row: object) -> int:
+    if not isinstance(row, EntropyReferenceRow):
+        raise TypeError("entropy reference parser returned an unexpected row type")
+    return row.recv_ms
+
+
+def _hedge_reference_timestamp(row: object) -> int:
+    if not isinstance(row, HedgeReferenceRow):
+        raise TypeError("hedge reference parser returned an unexpected row type")
+    return row.recv_ms
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -187,43 +211,51 @@ def _hedge_reference_row(
 
 
 _SPECS = {
-    "samples": _FileSpec(
-        "samples", SAMPLE_HEADER, _sample_row, lambda row: row.timestamp_ms
-    ),
-    "minutes": _FileSpec(
-        "minutes", MINUTE_HEADER, _minute_row, lambda row: row.minute_ts
-    ),
+    "samples": _FileSpec("samples", SAMPLE_HEADER, _sample_row, _sample_timestamp),
+    "minutes": _FileSpec("minutes", MINUTE_HEADER, _minute_row, _minute_timestamp),
     "entropy_reference": _FileSpec(
         "entropy_reference",
         ENTROPY_REFERENCE_HEADER,
         _entropy_reference_row,
-        lambda row: row.recv_ms,
+        _entropy_reference_timestamp,
     ),
     "hedge_reference": _FileSpec(
         "hedge_reference",
         HEDGE_REFERENCE_HEADER,
         _hedge_reference_row,
-        lambda row: row.recv_ms,
+        _hedge_reference_timestamp,
     ),
 }
 
 
 def _report(
-    path: Path, dataset: str | None, *, status: str, message: str, **counts: object
+    path: Path,
+    dataset: str | None,
+    *,
+    status: str,
+    message: str,
+    source_rows: int = 0,
+    valid_rows: int = 0,
+    invalid_rows: int = 0,
+    already_existing: int = 0,
+    conflicting_key_rows: int = 0,
+    inserted_rows: int = 0,
+    min_timestamp: int | None = None,
+    max_timestamp: int | None = None,
 ) -> MigrationFileReport:
-    defaults: dict[str, object] = {
-        "source_rows": 0,
-        "valid_rows": 0,
-        "invalid_rows": 0,
-        "already_existing": 0,
-        "conflicting_key_rows": 0,
-        "inserted_rows": 0,
-        "min_timestamp": None,
-        "max_timestamp": None,
-    }
-    defaults.update(counts)
     return MigrationFileReport(
-        path=str(path), dataset=dataset, status=status, message=message, **defaults
+        path=str(path),
+        dataset=dataset,
+        source_rows=source_rows,
+        valid_rows=valid_rows,
+        invalid_rows=invalid_rows,
+        already_existing=already_existing,
+        conflicting_key_rows=conflicting_key_rows,
+        inserted_rows=inserted_rows,
+        min_timestamp=min_timestamp,
+        max_timestamp=max_timestamp,
+        status=status,
+        message=message,
     )
 
 
@@ -461,11 +493,13 @@ def migrate_directory(
             )
         ]
 
-    candidates = [
-        (path, _candidate_dataset(path))
-        for path in sorted(source.iterdir())
-        if path.is_file() and _candidate_dataset(path) is not None
-    ]
+    candidates: list[tuple[Path, str]] = []
+    for path in sorted(source.iterdir()):
+        if not path.is_file():
+            continue
+        dataset = _candidate_dataset(path)
+        if dataset is not None:
+            candidates.append((path, dataset))
     try:
         store = MarketHistoryStore(database)
     except Exception as exc:

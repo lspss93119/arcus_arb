@@ -42,6 +42,7 @@ def test_example_config_loads():
     assert cfg.arcus.kind == "arcus" and cfg.arcus.label == "ARCUS"
     assert cfg.hedge_venue == "lighter-rh"
     assert cfg.hedge.kind == "lighter"
+    assert cfg.hedge.lighter_profile is not None
     assert cfg.hedge.lighter_profile.chain_id == 466324
     assert cfg.arcus.symbol == "SNDK" and cfg.hedge.symbol == "SNDK"
     assert cfg.recorder_enabled and cfg.recorder_database

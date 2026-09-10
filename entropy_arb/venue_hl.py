@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import time
+from typing import Any
 
 import aiohttp
 
@@ -98,7 +99,7 @@ class HLVenue:
         self.min_base = 0.0
         self.min_quote = 10.0
         self._cloid = int(time.time() * 1000)
-        self._signing = None  # lazy hyperliquid-sdk signing module
+        self._signing: Any | None = None  # lazy hyperliquid-sdk signing module
         self.quota_coordinator = quota_coordinator
 
     async def _info(self, payload: dict):
@@ -145,9 +146,12 @@ class HLVenue:
 
     def init_signer(self) -> None:
         c = self.conf.hl_creds
-        assert c is not None and c.complete, f"[{self.name}] missing credentials"
+        if c is None or not c.complete or c.private_key is None:
+            raise RuntimeError(f"[{self.name}] missing credentials")
         try:
-            from hyperliquid.utils import signing as hl_signing
+            from hyperliquid.utils import (  # type: ignore[import-untyped]
+                signing as hl_signing,
+            )
         except ImportError as e:
             raise RuntimeError(
                 "live trading on Hyperliquid needs the official SDK — "
@@ -218,7 +222,7 @@ class HLVenue:
     # ------------------------------------------------------------- execution
 
     def _next_cloid(self):
-        from hyperliquid.utils.types import Cloid
+        from hyperliquid.utils.types import Cloid  # type: ignore[import-untyped]
 
         self._cloid += 1
         return Cloid.from_int(self._cloid)
@@ -228,6 +232,8 @@ class HLVenue:
     ) -> dict:
         assert self.account is not None and self.asset_id >= 0
         s = self._signing
+        if s is None:
+            raise RuntimeError(f"[{self.name}] signer is not initialized")
         cloid = self._next_cloid()
         order_req = {
             "coin": self.coin,

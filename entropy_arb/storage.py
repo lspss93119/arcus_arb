@@ -697,8 +697,8 @@ class MarketHistoryStore:
         self._db_lock = threading.Lock()
         self._flush_lock = threading.Lock()
         self._buffer_lock = threading.Lock()
-        self._buffers = {name: [] for name in _SPECS}
-        self._dropped_rows = {name: 0 for name in _SPECS}
+        self._buffers: dict[str, list[object]] = {name: [] for name in _SPECS}
+        self._dropped_rows: dict[str, int] = {name: 0 for name in _SPECS}
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         try:
             self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")

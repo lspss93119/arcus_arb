@@ -56,7 +56,9 @@ def validate_runtime_gates(
 
 
 def setup_logging(
-    level: str, log_file: str = None, extra_handler: logging.Handler = None
+    level: str,
+    log_file: str | None = None,
+    extra_handler: logging.Handler | None = None,
 ) -> None:
     root = logging.getLogger()
     root.setLevel(getattr(logging, level, logging.INFO))
@@ -68,7 +70,7 @@ def setup_logging(
         d = os.path.dirname(log_file)
         if d:
             os.makedirs(d, exist_ok=True)
-        h = logging.FileHandler(log_file)
+        h: logging.Handler = logging.FileHandler(log_file)
     else:
         h = logging.StreamHandler()
     h.setFormatter(fmt)

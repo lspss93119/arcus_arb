@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 from types import SimpleNamespace
+from typing import Any, cast
 
 from entropy_arb.book import OrderBook
 from entropy_arb.feeds import HLBookFeed
@@ -115,13 +116,13 @@ def test_market_feed_reconnect_has_no_overlapping_entropy_instances(caplog):
 
         original_connect = feeds.ws_connect
         original_sleep = feeds.asyncio.sleep
-        feeds.ws_connect = connector
-        feeds.asyncio.sleep = fake_sleep
+        setattr(feeds, "ws_connect", connector)
+        setattr(feeds.asyncio, "sleep", fake_sleep)
         try:
             await feed.run(stop)
         finally:
-            feeds.ws_connect = original_connect
-            feeds.asyncio.sleep = original_sleep
+            setattr(feeds, "ws_connect", original_connect)
+            setattr(feeds.asyncio, "sleep", original_sleep)
         assert connector.calls == 2
         assert max_active[0] == 1
         assert active_entropy_ws_count() == 0
@@ -176,13 +177,13 @@ def test_repeated_market_connect_failures_never_accumulate_active_instances():
 
         original_connect = feeds.ws_connect
         original_sleep = feeds.asyncio.sleep
-        feeds.ws_connect = connector
-        feeds.asyncio.sleep = fake_sleep
+        setattr(feeds, "ws_connect", connector)
+        setattr(feeds.asyncio, "sleep", fake_sleep)
         try:
             await feed.run(stop)
         finally:
-            feeds.ws_connect = original_connect
-            feeds.asyncio.sleep = original_sleep
+            setattr(feeds, "ws_connect", original_connect)
+            setattr(feeds.asyncio, "sleep", original_sleep)
         assert connector.calls == 4
         assert max_active[0] == 1
         assert active_entropy_ws_count() == 0
@@ -221,14 +222,14 @@ def test_market_feed_shutdown_closes_the_current_entropy_instance():
         from entropy_arb import feeds
 
         original_connect = feeds.ws_connect
-        feeds.ws_connect = connector
+        setattr(feeds, "ws_connect", connector)
         task = asyncio.create_task(feed.run(stop))
         try:
             await asyncio.wait_for(entered.wait(), timeout=0.5)
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         finally:
-            feeds.ws_connect = original_connect
+            setattr(feeds, "ws_connect", original_connect)
         assert socket.exited
         assert active_entropy_ws_count() == 0
 
@@ -264,7 +265,7 @@ def test_entropy_reference_is_one_loop_with_bounded_active_count():
 def test_normal_entropy_startup_has_one_market_and_one_reference_loop():
     async def scenario():
         stop = asyncio.Event()
-        venue = object.__new__(HLVenue)
+        venue = cast(Any, object.__new__(HLVenue))
         venue.conf = SimpleNamespace(hl_dex="io")
         venue.name = "ENTROPY"
         venue.key = "entropy"
@@ -278,14 +279,17 @@ def test_normal_entropy_startup_has_one_market_and_one_reference_loop():
             task.cancel()
         await asyncio.gather(*market_tasks, return_exceptions=True)
 
-        recorder = ReferenceRecorder(
-            symbol="SNDK",
-            hedge_key="lighter-rh",
-            entropy_ws_url="wss://example.invalid/ws",
-            entropy_coin="io:SNDK",
-            hedge_ws_url="wss://example.invalid/hedge",
-            hedge_market_id=32,
-            store=object(),
+        recorder = cast(
+            Any,
+            ReferenceRecorder(
+                symbol="SNDK",
+                hedge_key="lighter-rh",
+                entropy_ws_url="wss://example.invalid/ws",
+                entropy_coin="io:SNDK",
+                hedge_ws_url="wss://example.invalid/hedge",
+                hedge_market_id=32,
+                store=cast(Any, object()),
+            ),
         )
         calls = {"entropy": 0, "hedge": 0}
 

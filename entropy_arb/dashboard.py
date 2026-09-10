@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from typing import Literal
 
 from rich import box
 from rich.console import Console, Group
@@ -230,10 +231,11 @@ class Dashboard:
         if getattr(eng, "tiny_live", False) and getattr(eng, "arcus", None) is not None:
             return Group(self._header(), self._b0_panel(), self._events_panel())
         if self.console.width >= 100:
-            mid = Table.grid(expand=True)
-            mid.add_column(ratio=5)
-            mid.add_column(ratio=3)
-            mid.add_row(self._venues_panel(), self._session_panel())
+            grid = Table.grid(expand=True)
+            grid.add_column(ratio=5)
+            grid.add_column(ratio=3)
+            grid.add_row(self._venues_panel(), self._session_panel())
+            mid: Table | Group = grid
         else:
             mid = Group(self._venues_panel(), self._session_panel())
         return Group(
@@ -457,7 +459,7 @@ class Dashboard:
         eng, cfg = self.eng, self.eng.cfg
         now = time.time()
         t = Table(box=box.SIMPLE_HEAD, padding=(0, 1))
-        for col, j in (
+        columns: tuple[tuple[str, Literal["left", "right"]], ...] = (
             ("venue", "left"),
             ("bid / ask", "right"),
             ("spr bps", "right"),
@@ -466,7 +468,8 @@ class Dashboard:
             ("volume", "right"),
             ("equity", "right"),
             ("free", "right"),
-        ):
+        )
+        for col, j in columns:
             t.add_column(self._t(col), justify=j, no_wrap=True)
         vol_total = 0.0
         for v in eng.venues.values():

@@ -194,7 +194,7 @@ def test_lighter_account_limits_auth_failure_fails_closed() -> None:
         def create_auth_token_with_expiry(self):
             return None, "authentication failed"
 
-    venue = object.__new__(LighterVenue)
+    venue = cast(Any, object.__new__(LighterVenue))
     venue.name = "RH"
     venue.signer = FailedSigner()
     venue.conf = SimpleNamespace(
@@ -218,7 +218,7 @@ def test_lighter_account_limits_uses_authenticated_account_index() -> None:
         calls.append((path, params or {}, headers or {}))
         return _account_limits_payload()
 
-    venue = object.__new__(LighterVenue)
+    venue = cast(Any, object.__new__(LighterVenue))
     venue.name = "RH"
     venue.signer = Signer()
     venue.conf = SimpleNamespace(
@@ -424,7 +424,7 @@ def test_rolling_center_warmup_uses_zero_fallback_and_can_quote() -> None:
         center_window_hours=1.0,
         center_update_minutes=60,
     )
-    controller = object.__new__(CalibrationController)
+    controller = cast(Any, object.__new__(CalibrationController))
     controller.strategy = strategy
 
     assert controller.center_bps() == Decimal("0")
@@ -645,7 +645,7 @@ def test_controller_retains_old_context_through_cancel_fill_race(tmp_path) -> No
                 "fill_receive_ts_ms": 4,
             }
 
-    arcus_book = OrderBook()
+    arcus_book = cast(Any, OrderBook())
     arcus_book.bids = {99.0: 1.0}
     arcus_book.asks = {100.0: 1.0}
     arcus_book.ready = True
@@ -994,7 +994,7 @@ def test_required_account_channel_error_blocks_b0_market_health() -> None:
 
     ready = asyncio.Event()
     ready.set()
-    controller = object.__new__(CalibrationController)
+    controller = cast(Any, object.__new__(CalibrationController))
     controller.account_feed = SimpleNamespace(
         healthy=True,
         ready=ready,
@@ -1232,7 +1232,7 @@ def test_outside_rth_is_regime_telemetry_only() -> None:
 
 
 def test_b0_step_does_not_halt_on_outside_rth() -> None:
-    controller = object.__new__(CalibrationController)
+    controller = cast(Any, object.__new__(CalibrationController))
     controller.risk = SessionRisk(SessionLimits())
     controller.lifecycle = CalibrationLifecycle()
     controller.account_feed = SimpleNamespace(healthy=True)

@@ -9,6 +9,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -66,7 +67,7 @@ MARKET = {
     },
 }
 
-SNAPSHOT = {
+SNAPSHOT: dict[str, Any] = {
     "type": "subscribed",
     "channel": "l2OrderbookUpdates",
     "id": "SNDK-USD",
@@ -79,7 +80,7 @@ SNAPSHOT = {
     },
 }
 
-UPDATE = {
+UPDATE: dict[str, Any] = {
     "type": "channel_data",
     "channel": "l2OrderbookUpdates",
     "id": "SNDK-USD",
@@ -799,8 +800,10 @@ def test_arcus_recorder_records_bbo_and_attributes(tmp_path: Path) -> None:
         is_fresh_seconds=5,
     )
 
+    attributes = parse_arcus_market_attributes(ATTRIBUTES_MESSAGE, market_id=33)
+    assert attributes is not None
     recorder.record_attributes(
-        parse_arcus_market_attributes(ATTRIBUTES_MESSAGE, market_id=33),
+        attributes,
         local_receive_ts_ms=1002,
         local_receive_monotonic_ns=12,
         market_status="ONLINE",
@@ -837,7 +840,7 @@ def test_record_only_startup_uses_mocked_public_arcus_and_rh_feeds(
         hedge_venue="lighter-rh",
     )
     metadata = parse_arcus_market(MARKET)
-    arcus = ArcusVenue(cfg.arcus)
+    arcus = cast(Any, ArcusVenue(cfg.arcus))
     arcus.market = metadata
     arcus.exchange_symbol = metadata.symbol
     arcus.size_step = 0.0000001
@@ -884,8 +887,8 @@ def test_record_only_startup_uses_mocked_public_arcus_and_rh_feeds(
         arcus.started_live = live
         return []
 
-    arcus.load_market = fake_arcus_load  # type: ignore[method-assign]
-    arcus.start_tasks = fake_arcus_start  # type: ignore[method-assign]
+    arcus.load_market = fake_arcus_load
+    arcus.start_tasks = fake_arcus_start
     monkeypatch.setattr(
         Engine,
         "_make_venue",

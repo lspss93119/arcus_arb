@@ -160,7 +160,7 @@ class MinuteRecorder:
             return
         e_bid, e_ask = self.entropy_book.best_bid(), self.entropy_book.best_ask()
         h_bid, h_ask = self.hedge_book.best_bid(), self.hedge_book.best_ask()
-        if None in (e_bid, e_ask, h_bid, h_ask):
+        if e_bid is None or e_ask is None or h_bid is None or h_ask is None:
             return
         if self._agg is None:
             self._agg = _MinuteAgg(minute)

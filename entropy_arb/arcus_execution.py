@@ -24,7 +24,7 @@ import aiohttp
 try:
     from websockets.asyncio.client import connect as ws_connect
 except ImportError:  # pragma: no cover - compatibility with websockets < 14
-    from websockets import connect as ws_connect  # type: ignore
+    from websockets import connect as ws_connect
 
 from .arcus import ArcusMarketAttributes
 from .arcus_auth import (

@@ -154,7 +154,7 @@ def make_settlement_engine(
     eng._step, eng._min_base, eng._min_notional = 1e-4, 1e-4, 10.0
     eng.hedge.set_book(99.0, 100.0)
     eng.entropy.set_book(101.0, 102.0)
-    eng._log_csv = lambda *args, **kwargs: None
+    setattr(eng, "_log_csv", lambda *args, **kwargs: None)
     return eng
 
 
@@ -1366,7 +1366,7 @@ def test_no_strategy_wakeup_after_successful_reference_run():
             nonlocal evaluations
             evaluations += 1
 
-        eng._evaluate = tracked_evaluate
+        setattr(eng, "_evaluate", tracked_evaluate)
         eng.reference = SuccessfulReference()
         strategy_task = asyncio.create_task(eng._strategy_loop())
         await asyncio.sleep(0)

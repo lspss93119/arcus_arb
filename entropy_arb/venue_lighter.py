@@ -29,7 +29,7 @@ import aiohttp
 try:
     from websockets.asyncio.client import connect as ws_connect
 except ImportError:
-    from websockets import connect as ws_connect  # type: ignore
+    from websockets import connect as ws_connect
 
 from .book import OrderBook
 from .config import VenueConf
@@ -264,7 +264,7 @@ class LighterVenue:
         self.size_decimals = 4
         self.min_base = 0.0
         self.min_quote = 10.0
-        self.signer = None
+        self.signer: Any | None = None
         # ``fee_bps`` is usable by B0 only when its account/venue source has
         # been explicitly verified from authenticated accountLimits.  In
         # particular, zero is a valid verified fee and must not be confused
@@ -325,7 +325,14 @@ class LighterVenue:
 
     def init_signer(self) -> None:
         c = self.conf.lighter_creds
-        assert c is not None and c.complete, f"[{self.name}] missing credentials"
+        if (
+            c is None
+            or not c.complete
+            or c.account_index is None
+            or c.api_key_index is None
+            or c.api_private_key is None
+        ):
+            raise RuntimeError(f"[{self.name}] missing credentials")
         try:
             from lighter import SignerClient
         except ImportError as e:
@@ -400,11 +407,16 @@ class LighterVenue:
             )
         ]
         if live:
+            c = self.conf.lighter_creds
+            if c is None or c.account_index is None or self.signer is None:
+                raise RuntimeError(
+                    f"[{self.name}] live account feed requires credentials and signer"
+                )
             self.orders_feed = AccountOrdersFeed(
                 self.name,
                 self.profile.ws_url,
                 self.market_id,
-                self.conf.lighter_creds.account_index,
+                c.account_index,
                 self.signer,
             )
             tasks.append(
@@ -456,7 +468,8 @@ class LighterVenue:
 
         order_send_ts_ms = time.time_ns() // 1_000_000
         coi = self._next_coi()
-        fut = self.orders_feed.watch(coi) if self.orders_feed else None
+        feed = self.orders_feed
+        fut = feed.watch(coi) if feed is not None else None
         base_amount = int(round(qty * 10**self.size_decimals))
         price = int(round(limit_px * 10**self.price_decimals))
         try:
@@ -473,7 +486,8 @@ class LighterVenue:
             )
         except Exception as e:
             if fut is not None:
-                self.orders_feed.unwatch(coi)
+                assert feed is not None
+                feed.unwatch(coi)
             msg = f"{type(e).__name__}: {e}"
             if getattr(e, "status", None) == 429 or "(429)" in str(e):
                 msg = "RATE_LIMITED: " + msg
@@ -488,7 +502,8 @@ class LighterVenue:
         ack_ts_ms = time.time_ns() // 1_000_000
         if err is not None or (getattr(resp, "code", 200) or 200) != 200:
             if fut is not None:
-                self.orders_feed.unwatch(coi)
+                assert feed is not None
+                feed.unwatch(coi)
             msg = (
                 str(err)
                 if err is not None
@@ -528,7 +543,8 @@ class LighterVenue:
                 "fill_receive_ts_ms": info.get("fill_receive_ts_ms"),
             }
         except TimeoutError:
-            self.orders_feed.unwatch(coi)
+            assert feed is not None
+            feed.unwatch(coi)
             log.warning(
                 "[%s] no settle confirmation for coi %d in %.1fs",
                 self.name,

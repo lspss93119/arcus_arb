@@ -17,7 +17,7 @@ from typing import Any
 try:
     from websockets.asyncio.client import connect as ws_connect
 except ImportError:
-    from websockets import connect as ws_connect  # type: ignore
+    from websockets import connect as ws_connect
 
 from .arcus import (
     ARCUS_BOOK_LEVELS,
@@ -78,7 +78,7 @@ class ArcusBookFeed:
 
     async def subscribe_public(self, websocket) -> None:
         """Subscribe to the three required public channels, once each."""
-        messages = [
+        messages: list[dict[str, Any]] = [
             {
                 "type": "subscribe",
                 "channel": "l2OrderbookUpdates",

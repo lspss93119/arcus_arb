@@ -23,7 +23,7 @@ from collections.abc import Callable
 try:
     from websockets.asyncio.client import connect as ws_connect
 except ImportError:
-    from websockets import connect as ws_connect  # type: ignore
+    from websockets import connect as ws_connect
 
 from .book import OrderBook
 from .entropy_quota import EntropyQuotaCoordinator, is_entropy_quota_error
@@ -277,6 +277,7 @@ class HLBookFeed:
                 quota_failure = coordinator is not None and is_entropy_quota_error(e)
                 reconnect_delay = backoff
                 if quota_failure:
+                    assert coordinator is not None
                     if connected_for >= coordinator.main_healthy_required_sec:
                         quota_attempt = 0
                     quota_attempt += 1

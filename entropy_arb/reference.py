@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import time
-from typing import Any
+from typing import Any, Protocol
 
 from .entropy_quota import EntropyQuotaCoordinator, is_entropy_quota_error
 from .storage import EntropyReferenceRow, HedgeReferenceRow, MarketHistoryStore
@@ -14,7 +14,7 @@ from .ws_lifecycle import EntropyWebSocketLifecycle
 try:
     from websockets.asyncio.client import connect as ws_connect
 except ImportError:
-    from websockets import connect as ws_connect  # type: ignore
+    from websockets import connect as ws_connect
 
 log = logging.getLogger("reference")
 
@@ -40,6 +40,13 @@ def reference_paths(
 
 class ReferenceParseError(ValueError):
     """A relevant reference frame cannot produce a complete valid row."""
+
+
+class ReferenceWriter(Protocol):
+    @property
+    def enabled(self) -> bool: ...
+
+    def write(self, row: tuple[Any, ...]) -> None: ...
 
 
 def _positive_float(value: Any, field: str) -> float:
@@ -179,7 +186,7 @@ class _ReferenceStoreWriter:
 
 
 class EntropyReferenceStoreWriter(_ReferenceStoreWriter):
-    def write(self, row: tuple[object, ...]) -> None:
+    def write(self, row: tuple[Any, ...]) -> None:
         if self.enabled:
             recv_ms, oracle_px, mark_px = row
             self.store.append_entropy_reference(
@@ -194,7 +201,7 @@ class EntropyReferenceStoreWriter(_ReferenceStoreWriter):
 
 
 class HedgeReferenceStoreWriter(_ReferenceStoreWriter):
-    def write(self, row: tuple[object, ...]) -> None:
+    def write(self, row: tuple[Any, ...]) -> None:
         if self.enabled:
             recv_ms, server_ms, index_px, mark_px = row
             self.store.append_hedge_reference(
@@ -215,7 +222,7 @@ class HLReferenceFeed:
         name: str,
         ws_url: str,
         coin: str,
-        writer: _ReferenceStoreWriter,
+        writer: ReferenceWriter,
         *,
         connect=ws_connect,
         clock_ns=time.time_ns,
@@ -340,7 +347,7 @@ class LighterReferenceFeed:
         name: str,
         ws_url: str,
         market_id: int,
-        writer: _ReferenceStoreWriter,
+        writer: ReferenceWriter,
         *,
         connect=ws_connect,
         clock_ns=time.time_ns,

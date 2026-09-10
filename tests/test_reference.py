@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import sqlite3
+from typing import Any
 
 import pytest
 
@@ -70,7 +71,7 @@ class FakeConnect:
         return self.websocket
 
 
-HL_REFERENCE_FRAME = {
+HL_REFERENCE_FRAME: dict[str, Any] = {
     "channel": "activeAssetCtx",
     "data": {
         "coin": "io:SNDK",
@@ -83,7 +84,7 @@ HL_REFERENCE_FRAME = {
     },
 }
 
-LIGHTER_REFERENCE_FRAME = {
+LIGHTER_REFERENCE_FRAME: dict[str, Any] = {
     "channel": "market_stats:139",
     "market_stats": {
         "market_id": 139,
@@ -200,7 +201,7 @@ def test_recv_ms_is_captured_before_json_and_parser(monkeypatch):
             calls.append("write")
             original_write(row)
 
-        writer.write = tracked_write
+        setattr(writer, "write", tracked_write)
         feed = HLReferenceFeed(
             "ENTROPY",
             "wss://example.invalid/ws",
@@ -522,7 +523,9 @@ def test_parse_lighter_reference_for_mainnet_and_rh(message_type, market_id):
 
 def test_lighter_positive_integer_timestamp_has_no_wall_clock_gate():
     msg = {**LIGHTER_REFERENCE_FRAME, "timestamp": 1}
-    assert parse_lighter_reference(msg, market_id=139)[0] == 1
+    parsed = parse_lighter_reference(msg, market_id=139)
+    assert parsed is not None
+    assert parsed[0] == 1
 
 
 def test_hl_wrong_coin_and_irrelevant_channel_return_none():
