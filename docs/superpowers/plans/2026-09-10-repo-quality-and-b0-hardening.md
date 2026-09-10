@@ -36,11 +36,11 @@
 - Produces Ruff, pytest, and Mypy configuration consumed by local commands and CI.
 - Changes only names/imports/formatting; no runtime behavior.
 
-- [ ] **Step 1: Capture the baseline**
+- [x] **Step 1: Capture the baseline**
 
 Run `ruff check .` and `ruff format --check .`. Expected baseline: 4 lint errors and 41 files requiring formatting.
 
-- [ ] **Step 2: Add minimal tool configuration**
+- [x] **Step 2: Add minimal tool configuration**
 
 Create `pyproject.toml` with:
 
@@ -55,6 +55,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -76,11 +77,11 @@ coverage>=7.0
 types-PyYAML>=6.0
 ~~~
 
-- [ ] **Step 3: Fix the reported lint issues**
+- [x] **Step 3: Fix the reported lint issues**
 
 Rename the Hyperliquid snapshot comprehension variable from `l` to `level`, remove the two unused imports, then run `ruff check . --fix` and `ruff format .`.
 
-- [ ] **Step 4: Verify Task 1**
+- [x] **Step 4: Verify Task 1**
 
 Run:
 
@@ -107,31 +108,31 @@ Expected: zero Ruff/format errors and all existing tests pass.
 - Preserve public venue methods and dataclass fields.
 - Use concrete annotations for Engine optional venues/recorders, typed protocols for venue operations, and `Mapping[str, Any]` only at JSON/SDK ingress.
 
-- [ ] **Step 1: Capture the exact Mypy baseline**
+- [x] **Step 1: Capture the exact Mypy baseline**
 
 Run `mypy entropy_arb tests`; expected baseline is the observed 233 errors across 14 files. Do not suppress them.
 
-- [ ] **Step 2: Fix low-risk local annotations**
+- [x] **Step 2: Fix low-risk local annotations**
 
 Annotate the storage buffer, narrow nullable recorder values after existing readiness checks, type migration row objects before timestamp access, and make `main.py` optional parameters and handler variables explicit. Run the affected tests and Mypy after each file group.
 
-- [ ] **Step 3: Fix parser and reference-feed boundaries**
+- [x] **Step 3: Fix parser and reference-feed boundaries**
 
 Introduce typed local mappings for parsed JSON fields, validate numeric values before conversion, make the reference writer protocol expose the method actually called, and narrow the optional quota coordinator before use.
 
-- [ ] **Step 4: Fix venue adapter boundaries**
+- [x] **Step 4: Fix venue adapter boundaries**
 
 Keep third-party SDK imports at the adapter boundary. Add explicit credential/config guards and typed signer optionals. Use narrowly scoped import annotations only for packages without usable stubs, while retaining fail-closed credential behavior.
 
-- [ ] **Step 5: Type the Engine state machine**
+- [x] **Step 5: Type the Engine state machine**
 
 Add class-level annotations for optional Arcus, reference, recorder, store, and venue collections. Use a shared venue protocol or precise union where methods differ. Narrow optionals after initialization gates instead of using unsafe non-null assertions.
 
-- [ ] **Step 6: Correct test-only typing**
+- [x] **Step 6: Correct test-only typing**
 
 Annotate mutable test doubles and replace invalid method assignments with typed stubs or boundary casts. Keep tests asserting real behavior.
 
-- [ ] **Step 7: Verify Task 2**
+- [x] **Step 7: Verify Task 2**
 
 Run:
 
@@ -155,23 +156,23 @@ Expected: Mypy exits 0 and all tests pass. Remaining errors must be fixed at the
 - `CalibrationController.reconcile()` remains asynchronous and idempotent.
 - Existing `CalibrationTelemetry` and `SessionRisk` fail-closed semantics remain unchanged.
 
-- [ ] **Step 1: Write the RED regression test**
+- [x] **Step 1: Write the RED regression test**
 
 Add a test with a fake `ArcusAccountRest` whose `open_orders()` or `fills()` raises an exception with an empty string. Assert that reconciliation halts with a diagnostic containing the exception class, operation, and safe response context, without calling order mutation or hedge methods. Run only the test and confirm it fails because the current halt reason is `Arcus reconciliation failed:` without actionable detail.
 
-- [ ] **Step 2: Trace the failing boundary**
+- [x] **Step 2: Trace the failing boundary**
 
 Use the fake to identify whether the failure is transport, response shape parsing, or lifecycle ordering. Do not log credential-bearing URLs or perform live requests.
 
-- [ ] **Step 3: Implement the smallest root-cause fix**
+- [x] **Step 3: Implement the smallest root-cause fix**
 
 Preserve the exception as the cause, include a stable operation label and exception type in the fail-closed halt reason, and correct parser/ordering behavior only if the RED test proves it is the source. Keep cancellation, terminal reconciliation, and idempotent fill handling intact.
 
-- [ ] **Step 4: Add safety assertions**
+- [x] **Step 4: Add safety assertions**
 
 Cover successful reconciliation, empty response, malformed response, transport failure, cancel/fill race, no duplicate hedge, and no replacement quote after halt using temporary stores/fakes.
 
-- [ ] **Step 5: Verify Task 3**
+- [x] **Step 5: Verify Task 3**
 
 ~~~bash
 python3 -m pytest -q tests/test_phase_b0.py
@@ -189,23 +190,23 @@ Expected: the new test passes, all B0 safety tests remain green, and no live ord
 - Modify: `requirements-live.txt`, `README.md`, `README.zh-CN.md`, `.env.example`
 - Local-only: `.env` mode `600`
 
-- [ ] **Step 1: Add CI**
+- [x] **Step 1: Add CI**
 
 Create a Python 3.11/3.12 matrix that installs `requirements-dev.txt` and runs pytest, Ruff, format check, Mypy, compileall, and `git diff --check`. Do not install live requirements, load `.env`, or run live flags.
 
-- [ ] **Step 2: Make the live SDK reproducible**
+- [x] **Step 2: Make the live SDK reproducible**
 
 Inspect the installed/known-good Lighter SDK revision and official repository refs. Update `requirements-live.txt` to an exact verified commit only when compatibility is confirmed; otherwise document the blocker instead of inventing a SHA.
 
-- [ ] **Step 3: Document credential safety**
+- [x] **Step 3: Document credential safety**
 
 Add bilingual instructions that `.env` is ignored, must be owner-readable only via `chmod 600 .env`, and must never appear in logs, config, or commits. Keep `.env.example` value-free.
 
-- [ ] **Step 4: Apply local permission hardening**
+- [x] **Step 4: Apply local permission hardening**
 
 Run `chmod 600 .env` and verify with `stat -f "%Sp %OLp %N" .env`; do not stage `.env`.
 
-- [ ] **Step 5: Verify Task 4**
+- [x] **Step 5: Verify Task 4**
 
 Check workflow/config discovery, run the full quality suite, run `git diff --check`, and inspect the diff for credential values.
 

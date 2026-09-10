@@ -25,6 +25,33 @@ Use `--no-dashboard` for plain logs. The recorder writes to the independent
 `data/market-history.sqlite` database by default; it never opens the source
 project's database.
 
+## Local safety and quality checks
+
+`.env` and `config.yaml` are ignored by Git. Keep real credentials only in the
+local `.env`, never in source, logs, or commits, and restrict the file before a
+B0 preflight:
+
+```bash
+chmod 600 .env
+stat -f "%Sp %OLp %N" .env
+```
+
+Developer checks use only local tests and static analysis; CI does not install
+the live SDK, load `.env`, or invoke a live flag:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest -q
+ruff check .
+ruff format --check .
+python3 -m mypy entropy_arb tests main.py
+python3 -m compileall -q main.py entropy_arb tests
+```
+
+The optional live SDK is pinned in `requirements-live.txt` to the reviewed
+Lighter Python SDK v1.1.2 commit. Installing it does not authorize network
+trading; the runtime gates and fresh preflight remain mandatory.
+
 For B0 preflight only, configure the existing Arcus Ed25519 API identity and
 the existing Lighter-RH credentials in a local, ignored `.env`, then run. The
 canonical Arcus variables are `ARCUS_ACCOUNT_ADDRESS`, `ARCUS_ACCOUNT_INDEX`,

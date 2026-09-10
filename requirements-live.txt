@@ -10,8 +10,10 @@ hyperliquid-python-sdk>=0.9
 eth-account>=0.10
 
 # Lighter signing (only needed with --hedge lighter / lighter-rh).
-# Installs from the SDK's current main; for reproducible deploys, append a
-# known-good commit: ...lighter-python.git@<commit-sha>
-# 仅当 --hedge 为 lighter / lighter-rh 时需要。默认安装 SDK 最新主分支；
-# 如需可复现部署，可在末尾固定 commit：...lighter-python.git@<commit-sha>
-lighter-sdk @ git+https://github.com/elliottech/lighter-python.git
+# v1.1.2 was checked against the SignerClient/order and endpoint-profile
+# interfaces used by this repository; keep the immutable commit for deploy
+# reproducibility. Live API validation is still an explicit separate gate.
+# 仅当 --hedge 为 lighter / lighter-rh 时需要。v1.1.2 已静态核对本仓库使用的
+# SignerClient/order 与 endpoint profile 接口；部署固定 immutable commit，实盘
+# API 验证仍是独立的明确 gate。
+lighter-sdk @ git+https://github.com/elliottech/lighter-python.git@6957dd8a1b36894ca9580be0d51de30aeea3bd4a

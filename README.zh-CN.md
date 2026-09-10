@@ -24,6 +24,32 @@ python3 main.py --config config.yaml --symbol SNDK \
 `--no-dashboard` 可切换到普通日志。默认写入独立的
 `data/market-history.sqlite`，不会读写 `entropy-arb` 的数据库。
 
+## 本地安全与质量检查
+
+`.env` 与 `config.yaml` 已被 Git 忽略。真实凭证只能放在本地 `.env`，不得
+写入 source、日志或 commit；执行 B0 预检前请先限制文件权限：
+
+```bash
+chmod 600 .env
+stat -f "%Sp %OLp %N" .env
+```
+
+开发检查只执行本地测试与静态分析；CI 不安装实盘 SDK、不读取 `.env`，也不
+调用任何实盘 flag：
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest -q
+ruff check .
+ruff format --check .
+python3 -m mypy entropy_arb tests main.py
+python3 -m compileall -q main.py entropy_arb tests
+```
+
+可选的实盘 SDK 已在 `requirements-live.txt` 固定到审查过的 Lighter Python
+SDK v1.1.2 commit。安装 SDK 不代表获准联网交易；运行时 gates 与新鲜的
+preflight 仍然必须通过。
+
 B0 预检才需要在本地、已被 Git 忽略的 `.env` 中配置现有 Arcus Ed25519 API
 身份与现有 Lighter-RH 凭证，然后运行。Arcus 的 canonical 变量是
 `ARCUS_ACCOUNT_ADDRESS`、`ARCUS_ACCOUNT_INDEX`、`ARCUS_API_KEY` 与

@@ -1247,6 +1247,15 @@ class CalibrationController:
         finally:
             await self.shutdown()
 
+    def _halt_reconciliation_failure(self, operation: str, exc: Exception) -> None:
+        detail = str(exc).strip() or repr(exc)
+        reason = (
+            f"Arcus reconciliation {operation} failed ({type(exc).__name__}): {detail}"
+        )
+        log.exception("%s", reason)
+        self.risk.on_telemetry_failure(reason)
+        self._record_halt()
+
     async def reconcile(self) -> None:
         """Refresh known calibration orders after a cancel/fill race."""
         if not self._order_contexts:
@@ -1257,14 +1266,17 @@ class CalibrationController:
                 self.metadata.symbol,
                 self.maker.credentials.account_index,
             )
+        except Exception as exc:
+            self._halt_reconciliation_failure("open_orders", exc)
+            return
+        try:
             fills = await self.account_rest.fills(
                 self.maker.credentials.account_address,
                 self.metadata.symbol,
                 self.maker.credentials.account_index,
             )
         except Exception as exc:
-            self.risk.on_telemetry_failure(f"Arcus reconciliation failed: {exc}")
-            self._record_halt()
+            self._halt_reconciliation_failure("fills", exc)
             return
 
         # The REST fills endpoint is newest-first.  Dispatch oldest-first so

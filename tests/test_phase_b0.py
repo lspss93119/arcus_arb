@@ -759,6 +759,83 @@ def test_controller_retains_old_context_through_cancel_fill_race(tmp_path) -> No
     store.close()
 
 
+@pytest.mark.parametrize("failing_operation", ("open_orders", "fills"))
+def test_reconcile_empty_exception_records_operation_and_type(
+    tmp_path, failing_operation: str
+) -> None:
+    class EmptyReconciliationError(RuntimeError):
+        pass
+
+    class FailingRest:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def open_orders(self, *args, **kwargs):
+            self.calls.append("open_orders")
+            if failing_operation == "open_orders":
+                raise EmptyReconciliationError()
+            return []
+
+        async def fills(self, *args, **kwargs):
+            self.calls.append("fills")
+            if failing_operation == "fills":
+                raise EmptyReconciliationError()
+            return []
+
+    class NoMutationMaker:
+        def __init__(self) -> None:
+            self.credentials = _credentials()
+            self.place_calls = 0
+            self.cancel_calls = 0
+
+    class NoMutationHedge:
+        size_decimals = 2
+        min_base = 0.0
+        fee_bps = 1.0
+        hedge_calls = 0
+
+    rest = FailingRest()
+    maker = NoMutationMaker()
+    hedge = NoMutationHedge()
+    store = MarketHistoryStore(tmp_path / "reconciliation.sqlite")
+    controller = CalibrationController(
+        arcus=SimpleNamespace(),
+        hedge=hedge,
+        maker=cast(ArcusMakerClient, maker),
+        account_feed=SimpleNamespace(healthy=True),
+        account_rest=cast(ArcusAccountRest, rest),
+        account_state=ArcusAccountState(startup_watermark_us=0),
+        metadata=SimpleNamespace(
+            market_id=33,
+            symbol="SNDK-USD",
+            tick_size="0.01",
+            step_size="0.01",
+        ),
+        fee_tier=ArcusFeeTier(1, "base", 20, 100),
+        strategy=SimpleNamespace(state=lambda: SimpleNamespace(center_bps=0.0)),
+        store=store,
+        allow_first_order=False,
+        staleness_sec=10.0,
+    )
+    cast(Any, controller)._order_contexts = {"client:pending": object()}
+
+    asyncio.run(controller.reconcile())
+
+    reason = controller.risk.halt_reason or ""
+    assert f"reconciliation {failing_operation} failed" in reason
+    assert "EmptyReconciliationError" in reason
+    assert "EmptyReconciliationError()" in reason
+    assert rest.calls == (
+        ["open_orders"]
+        if failing_operation == "open_orders"
+        else ["open_orders", "fills"]
+    )
+    assert maker.place_calls == 0
+    assert maker.cancel_calls == 0
+    assert hedge.hedge_calls == 0
+    store.close()
+
+
 def test_maximum_one_arcus_order() -> None:
     lifecycle = CalibrationLifecycle()
     lifecycle.mark_placed(expected_edge_bps=Decimal("4.2"))
