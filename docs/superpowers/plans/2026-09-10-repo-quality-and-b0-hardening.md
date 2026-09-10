@@ -214,7 +214,7 @@ Check workflow/config discovery, run the full quality suite, run `git diff --che
 
 ### Task 5: Final verification and handoff
 
-- [ ] **Step 1: Run the complete matrix**
+- [x] **Step 1: Run the complete matrix**
 
 ~~~bash
 python3 -m pytest -q
@@ -225,11 +225,11 @@ python3 -m compileall -q main.py entropy_arb tests
 git diff --check
 ~~~
 
-- [ ] **Step 2: Verify safety boundaries**
+- [x] **Step 2: Verify safety boundaries**
 
 Confirm the diff contains no live CLI invocation, credential values, threshold changes, order mutation bypass, or database deletion/overwrite.
 
-- [ ] **Step 3: Verify repository state**
+- [x] **Step 3: Verify repository state**
 
 ~~~bash
 git status --short --branch
