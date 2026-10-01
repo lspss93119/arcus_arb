@@ -1529,6 +1529,41 @@ def test_arcus_maker_client_sends_only_publicly_documented_alo_payload() -> None
     assert rpc.requests[0][1]["timeInForce"] == "ALO"
 
 
+def test_arcus_maker_volume_mode_accepts_vp_prefix_and_nonfixed_quantity() -> None:
+    class FakeRpc:
+        async def post(self, method, payload, signature, timestamp):
+            return {"status": 202, "result": {"orderId": "vp-order"}}
+
+    class FakeSigner:
+        @staticmethod
+        def sign_typed(payload):
+            return "signature"
+
+    client = ArcusMakerClient(
+        credentials=_credentials(),
+        signer=cast(Any, FakeSigner()),
+        rpc=FakeRpc(),
+        client_prefix="vp-",
+        fixed_quantity=None,
+    )
+
+    async def run() -> None:
+        ack = await client.place_alo(
+            market_id=33,
+            side="SELL",
+            price=Decimal("100.00"),
+            quantity=Decimal("0.123"),
+            tick_size=Decimal("0.01"),
+            step_size=Decimal("0.001"),
+            best_bid=Decimal("99.90"),
+            best_ask=Decimal("100.00"),
+            client_id="vp-session-1",
+        )
+        assert ack.order_id == "vp-order"
+
+    asyncio.run(run())
+
+
 def test_account_rpc_rejects_unsupported_mutations_locally() -> None:
     class FakeWebSocket:
         async def send(self, message: str) -> None:

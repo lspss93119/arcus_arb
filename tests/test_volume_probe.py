@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -17,7 +18,7 @@ from entropy_arb.volume_probe import (
 
 
 def _quantity(**overrides) -> Decimal:
-    values = dict(
+    values: dict[str, Any] = dict(
         clip_usd=Decimal("9.99"),
         arcus_bid=Decimal("99.90"),
         arcus_ask=Decimal("100.10"),

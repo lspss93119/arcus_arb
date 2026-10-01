@@ -541,11 +541,19 @@ class ArcusMakerClient:
         signer: ArcusSigner,
         rpc: Any = None,
         ws_url: str = "wss://api.arcus.xyz/v1/ws",
+        client_prefix: str = "b0-",
+        fixed_quantity: Decimal | None = ARCUS_CALIBRATION_QTY,
     ) -> None:
+        if not client_prefix:
+            raise ValueError("Arcus client prefix must not be empty")
         self.credentials = credentials
         self.signer = signer
         self.rpc = rpc
         self.ws_url = ws_url
+        self.client_prefix = client_prefix
+        self.fixed_quantity = (
+            Decimal(fixed_quantity) if fixed_quantity is not None else None
+        )
         self.orders_sent = 0
         self._known_order_ids: set[str] = set()
 
@@ -588,14 +596,16 @@ class ArcusMakerClient:
     ) -> ArcusOrderAck:
         self.validate_calibration_order_type("LIMIT", "ALO")
         side = side.upper()
-        if not client_id.startswith("b0-"):
+        if not client_id.startswith(self.client_prefix):
             raise ArcusOrderError(
-                "Phase B0 Arcus clientId must use the b0- calibration prefix"
+                f"Arcus clientId must use the {self.client_prefix} prefix"
             )
-        if Decimal(quantity) != ARCUS_CALIBRATION_QTY:
-            raise ArcusOrderError(
-                f"B0 Arcus quantity is fixed at {ARCUS_CALIBRATION_QTY} SNDK"
-            )
+        if self.fixed_quantity is not None and Decimal(quantity) != self.fixed_quantity:
+            if self.client_prefix == "b0-":
+                raise ArcusOrderError(
+                    f"B0 Arcus quantity is fixed at {ARCUS_CALIBRATION_QTY} SNDK"
+                )
+            raise ArcusOrderError(f"Arcus quantity is fixed at {self.fixed_quantity}")
         if self.would_cross(side, price, best_bid, best_ask):
             raise ArcusAloWouldCross(
                 "Arcus ALO quote would cross current BBO; no taker fallback"
@@ -655,9 +665,9 @@ class ArcusMakerClient:
             raise ValueError("cancel requires exactly one Arcus order or client id")
         if market_id is None:
             raise ValueError("market_id is required for an Arcus cancel")
-        if client_id is not None and not client_id.startswith("b0-"):
+        if client_id is not None and not client_id.startswith(self.client_prefix):
             raise ArcusOrderError(
-                "Phase B0 refuses to cancel a non-calibration Arcus clientId"
+                f"Arcus refuses to cancel a non-{self.client_prefix} clientId"
             )
         if order_id is not None and order_id not in self._known_order_ids:
             raise ArcusOrderError("Phase B0 refuses to cancel an unknown Arcus orderId")
@@ -704,7 +714,11 @@ class ArcusAccountFeed:
         on_connect: Callback | None = None,
         startup_state: ArcusAccountState | None = None,
         api_key: str | None = None,
+        client_prefix: str = "b0-",
+        fixed_quantity: Decimal | None = ARCUS_CALIBRATION_QTY,
     ) -> None:
+        if not client_prefix:
+            raise ValueError("Arcus client prefix must not be empty")
         self.account_address = account_address
         self.market_display_name = market_display_name
         self.ws_url = ws_url
@@ -716,6 +730,10 @@ class ArcusAccountFeed:
         self.on_connect = on_connect
         self.startup_state = startup_state
         self.api_key = api_key
+        self.client_prefix = client_prefix
+        self.fixed_quantity = (
+            Decimal(fixed_quantity) if fixed_quantity is not None else None
+        )
         self.ready = asyncio.Event()
         self.healthy = False
         self.websocket: Any = None
@@ -820,25 +838,28 @@ class ArcusAccountFeed:
             ):
                 raise ArcusOrderError("Phase B0 Arcus placeOrder requires LIMIT+ALO")
             client_id = payload.get("clientId")
-            if not isinstance(client_id, str) or not client_id.startswith("b0-"):
+            if not isinstance(client_id, str) or not client_id.startswith(
+                self.client_prefix
+            ):
                 raise ArcusOrderError(
-                    "Phase B0 Arcus placeOrder requires a b0- clientId"
+                    f"Arcus placeOrder requires a {self.client_prefix} clientId"
                 )
-            try:
-                quantity = Decimal(str(payload.get("quantity")))
-            except Exception as exc:
-                raise ArcusOrderError(
-                    "Phase B0 Arcus quantity must be the fixed calibration size"
-                ) from exc
-            if quantity != ARCUS_CALIBRATION_QTY:
-                raise ArcusOrderError(
-                    f"B0 Arcus quantity is fixed at {ARCUS_CALIBRATION_QTY} SNDK"
-                )
+            if self.fixed_quantity is not None:
+                try:
+                    quantity = Decimal(str(payload.get("quantity")))
+                except Exception as exc:
+                    raise ArcusOrderError(
+                        "B0 Arcus quantity must be the fixed calibration size"
+                    ) from exc
+                if quantity != self.fixed_quantity:
+                    raise ArcusOrderError(
+                        f"B0 Arcus quantity is fixed at {ARCUS_CALIBRATION_QTY} SNDK"
+                    )
         elif payload.get("clientId") is not None and not str(
             payload["clientId"]
-        ).startswith("b0-"):
+        ).startswith(self.client_prefix):
             raise ArcusOrderError(
-                "Phase B0 Arcus cancel refuses a non-calibration clientId"
+                f"Arcus cancel refuses a non-{self.client_prefix} clientId"
             )
         websocket = self.websocket
         if websocket is None or not self.healthy:

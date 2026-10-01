@@ -10,12 +10,12 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
 
 
-class ProbeStatus(str, Enum):
+class ProbeStatus(StrEnum):
     COMPLETED = "COMPLETED"
     TIMEOUT = "TIMEOUT"
     HALTED = "HALTED"
@@ -23,7 +23,7 @@ class ProbeStatus(str, Enum):
     PREORDER_ONLY = "PREORDER_ONLY"
 
 
-class ProbeState(str, Enum):
+class ProbeState(StrEnum):
     FLAT = "FLAT"
     BUILD = "BUILD"
     HEDGED = "HEDGED"
@@ -47,9 +47,7 @@ class ProbeStateMachine:
             (ProbeState.FLAT, ProbeState.HALTED, ProbeState.RECONCILIATION_REQUIRED)
         ),
         ProbeState.DONE: frozenset(),
-        ProbeState.HALTED: frozenset(
-            (ProbeState.RECONCILIATION_REQUIRED,)
-        ),
+        ProbeState.HALTED: frozenset((ProbeState.RECONCILIATION_REQUIRED,)),
         ProbeState.RECONCILIATION_REQUIRED: frozenset(),
     }
 

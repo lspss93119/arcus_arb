@@ -152,6 +152,18 @@ class _ArcusFeeRecord:
     matched_in_risk: bool = False
 
 
+@dataclass(frozen=True)
+class HedgeExecutionResult:
+    """Authoritative RH fill data exposed to the volume-probe wrapper."""
+
+    filled_qty: Decimal
+    avg_px: Decimal
+    fee: Decimal
+    realized_slippage_bps: Decimal
+    fill_to_hedge_send_ms: int | None
+    fill_to_rh_fill_ms: int
+
+
 class CalibrationTelemetry:
     """Append-only B0 lifecycle writer backed by the existing WAL store."""
 
@@ -297,7 +309,10 @@ class CalibrationController:
         rh_fee_bps: Decimal | None = None,
         session_id: str | None = None,
         session_limits: SessionLimits | None = None,
+        client_prefix: str = "b0-",
     ) -> None:
+        if not client_prefix:
+            raise ValueError("Arcus client prefix must not be empty")
         self.arcus = arcus
         self.hedge = hedge
         self.maker = maker
@@ -315,7 +330,8 @@ class CalibrationController:
             else _decimal(getattr(hedge, "fee_bps", 0), "RH fee")
         )
         self.rh_account_limits = getattr(hedge, "account_limits", None)
-        self.session_id = session_id or f"b0-{uuid.uuid4().hex[:12]}"
+        self.order_prefix = client_prefix
+        self.session_id = session_id or f"{client_prefix}{uuid.uuid4().hex[:12]}"
         self.limits = session_limits or SessionLimits()
         self.risk = SessionRisk(self.limits)
         self.pnl = CalibrationPnL()
@@ -326,10 +342,15 @@ class CalibrationController:
             rh_step,
             _decimal(getattr(hedge, "min_base", 0), "RH min base"),
         )
-        if rh_min > ARCUS_CALIBRATION_QTY:
+        if rh_min > self.limits.max_order_qty:
+            if client_prefix == "b0-":
+                raise RuntimeError(
+                    f"RH minimum executable quantity {rh_min} exceeds fixed "
+                    f"Arcus calibration quantity {ARCUS_CALIBRATION_QTY}"
+                )
             raise RuntimeError(
-                f"RH minimum executable quantity {rh_min} exceeds fixed "
-                f"Arcus calibration quantity {ARCUS_CALIBRATION_QTY}"
+                f"RH minimum executable quantity {rh_min} exceeds probe "
+                f"quantity {self.limits.max_order_qty}"
             )
         self.accumulator = FillAccumulator(rh_min_qty=rh_min, rh_step=rh_step)
         self.lifecycle = CalibrationLifecycle()
@@ -343,7 +364,7 @@ class CalibrationController:
             session_limits=self.limits,
             context_provider=self._telemetry_context,
         )
-        self.calibration_prefix = f"b0-{self.session_id[-8:]}-"
+        self.calibration_prefix = f"{client_prefix}{self.session_id[-8:]}-"
         self.current_execution_id: str | None = None
         self.current_candidate: QuoteCandidate | None = None
         self._execution_number = 0
@@ -360,6 +381,7 @@ class CalibrationController:
         # fills includes all of their Arcus proceeds/costs exactly once.
         self._matched_pnl_checkpoint = Decimal("0")
         self._last_hedge_matched = False
+        self.last_hedge_result: HedgeExecutionResult | None = None
 
     def center_source(self) -> str:
         """Return the center provenance used by the current B0 calculation."""
@@ -533,7 +555,7 @@ class CalibrationController:
             arcus_maker_fee_bps=self.arcus_maker_fee_bps,
             rh_taker_fee_bps=self.rh_taker_fee_bps,
             rh_slippage_allowance_bps=RH_HEDGE_SLIPPAGE_ALLOWANCE_BPS,
-            quantity=ARCUS_CALIBRATION_QTY,
+            quantity=self.limits.max_order_qty,
         )
 
     def proposed_quote(self) -> QuoteCandidate | None:
@@ -753,11 +775,13 @@ class CalibrationController:
     async def on_fill(self, fill: ArcusUserFill) -> None:
         context = self._context_for_fill(fill)
         if context is None and (
-            not fill.is_snapshot and fill.client_id and fill.client_id.startswith("b0-")
+            not fill.is_snapshot
+            and fill.client_id
+            and fill.client_id.startswith(self.order_prefix)
         ):
             # A stale calibration order must never be silently ignored if it
             # fills during startup cancellation or reconnect recovery.
-            self.risk.halt("fill received for an unknown B0 clientId")
+            self.risk.halt(f"fill received for an unknown {self.order_prefix} clientId")
             self.telemetry.record(
                 "unexpected_fill",
                 client_id=fill.client_id,
@@ -914,6 +938,7 @@ class CalibrationController:
         expected_at_fill: Decimal | None,
         context: _OrderContext,
     ) -> None:
+        self.last_hedge_result = None
         if not self.hedge.book.is_fresh(self.staleness_sec):
             await self._hedge_failure("RH market feed is stale")
             return
@@ -1008,6 +1033,14 @@ class CalibrationController:
             else None
         )
         fill_to_fill_ms = max(0, time.monotonic_ns() - send_mono) // 1_000_000
+        self.last_hedge_result = HedgeExecutionResult(
+            filled_qty=filled_qty,
+            avg_px=avg_px_decimal,
+            fee=rh_fee_decimal,
+            realized_slippage_bps=realized_slippage,
+            fill_to_hedge_send_ms=fill_to_send_ms,
+            fill_to_rh_fill_ms=fill_to_fill_ms,
+        )
         if filled_qty < instruction.quantity:
             self.accumulator.unhedged_qty += instruction.quantity - filled_qty
             self.risk.halt("RH hedge partially filled")
@@ -1177,6 +1210,16 @@ class CalibrationController:
             expected_usd=_text(candidate.expected_usd),
             account_sequence_id=self.account_state.account_sequence_id,
         )
+
+    async def place_quote(self, candidate: QuoteCandidate) -> None:
+        """Place one already-validated LIMIT+ALO candidate.
+
+        B0 continues to use :meth:`step`; the volume probe uses this narrow
+        boundary so it can choose a fresh best-side candidate without
+        inheriting B0's edge-selection policy.
+        """
+
+        await self._place_quote(candidate)
 
     def _current_order_edge(self) -> Decimal | None:
         if not self.current_candidate or not self.lifecycle.client_id:
