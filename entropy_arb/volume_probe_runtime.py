@@ -178,10 +178,13 @@ class VolumeProbeController:
 
     def _halt(self, reason: str) -> None:
         self._failure_reason = reason
+        if self.state in (ProbeState.DONE, ProbeState.RECONCILIATION_REQUIRED):
+            self.machine.state = ProbeState.RECONCILIATION_REQUIRED
+            self._status = ProbeStatus.RECONCILIATION_REQUIRED
+            return
         if self.state not in (
             ProbeState.HALTED,
             ProbeState.RECONCILIATION_REQUIRED,
-            ProbeState.DONE,
         ):
             self.machine.transition(ProbeState.HALTED)
         self._status = (
@@ -376,8 +379,6 @@ class VolumeProbeController:
                 "final positions/orders/residual are not flat"
             )
             if self.state is not ProbeState.RECONCILIATION_REQUIRED:
-                if self.state is ProbeState.DONE:
-                    raise RuntimeError("completed probe cannot be made non-flat")
                 self.machine.transition(ProbeState.RECONCILIATION_REQUIRED)
             self._status = ProbeStatus.RECONCILIATION_REQUIRED
             return self._status
@@ -491,7 +492,12 @@ class VolumeProbeController:
                 arcus_fee=arcus_fee,
                 hedge=hedge,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
+            reason = str(exc) or "Arcus fill could not be assigned to a probe phase"
+            halt = getattr(self.executor.risk, "halt", None)
+            if callable(halt):
+                halt(reason)
+            self._halt(reason)
             cancel = getattr(self.executor, "cancel_outstanding", None)
             if callable(cancel):
                 with contextlib.suppress(Exception):
@@ -681,8 +687,15 @@ class VolumeProbeController:
                 self.metrics.finished_at = _now_text()
             self.metrics.round_seconds = time.monotonic() - started
             self._sync_metrics()
-            if self.writer is not None:
-                self.writer.append(self.metrics)
-            self._metrics_written = True
-            stop.set()
+            try:
+                if self.writer is not None:
+                    self.writer.append(self.metrics)
+                self._metrics_written = True
+            except Exception as exc:
+                self._failure_reason = (
+                    self._failure_reason or f"round log append failed: {exc}"
+                )
+                self._status = ProbeStatus.RECONCILIATION_REQUIRED
+            finally:
+                stop.set()
         return self._status
