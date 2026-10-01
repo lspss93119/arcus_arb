@@ -29,7 +29,11 @@ from entropy_arb.engine import Engine
 
 
 def validate_runtime_gates(
-    record_only: bool, tiny_live: bool, confirm_mainnet: bool
+    record_only: bool,
+    tiny_live: bool,
+    confirm_mainnet: bool,
+    *,
+    volume_probe: bool = False,
 ) -> str:
     """Validate the explicit runtime mode gates before loading credentials.
 
@@ -40,7 +44,15 @@ def validate_runtime_gates(
     """
     if record_only and tiny_live:
         raise ValueError("--record-only and --tiny-live are mutually exclusive")
-    if confirm_mainnet and not tiny_live:
+    if volume_probe and (record_only or tiny_live):
+        raise ValueError(
+            "--volume-probe is mutually exclusive with --record-only and --tiny-live"
+        )
+    if volume_probe and not confirm_mainnet:
+        raise ValueError(
+            "--volume-probe requires the explicit --confirm-mainnet acknowledgement"
+        )
+    if confirm_mainnet and not tiny_live and not volume_probe:
         raise ValueError("--confirm-mainnet requires --tiny-live")
     if tiny_live and not confirm_mainnet:
         raise ValueError(
@@ -50,9 +62,9 @@ def validate_runtime_gates(
         return "record-only"
     if tiny_live:
         return "tiny-live"
-    raise ValueError(
-        "pass --record-only, or pass both --tiny-live and --confirm-mainnet"
-    )
+    if volume_probe:
+        return "volume-probe"
+    raise ValueError("pass --record-only, or pass one live mode with --confirm-mainnet")
 
 
 def setup_logging(
@@ -91,6 +103,12 @@ async def amain(
     tiny_live: bool = False,
     confirm_mainnet: bool = False,
     approve_first_order: bool = False,
+    volume_probe: bool = False,
+    probe_clip_usd: float | None = None,
+    probe_side: str | None = None,
+    probe_reprice_sec: float = 30.0,
+    probe_max_runtime_sec: int = 1800,
+    probe_max_loss_usd: float = 10.0,
 ) -> None:
     eng = Engine(
         cfg,
@@ -98,6 +116,12 @@ async def amain(
         tiny_live=tiny_live,
         confirm_mainnet=confirm_mainnet,
         allow_first_order=approve_first_order,
+        volume_probe=volume_probe,
+        probe_clip_usd=probe_clip_usd,
+        probe_side=probe_side,
+        probe_reprice_sec=probe_reprice_sec,
+        probe_max_runtime_sec=probe_max_runtime_sec,
+        probe_max_loss_usd=probe_max_loss_usd,
     )
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -157,15 +181,50 @@ def main() -> None:
         "calibration; never live-by-default",
     )
     p.add_argument(
+        "--volume-probe",
+        action="store_true",
+        help="one-shot Arcus maker/RH hedge/unwind probe; independently gated",
+    )
+    p.add_argument(
         "--confirm-mainnet",
         action="store_true",
-        help="required acknowledgement for --tiny-live mainnet account access",
+        help="required acknowledgement for --tiny-live or --volume-probe account access",
     )
     p.add_argument(
         "--approve-first-order",
         action="store_true",
         help="separate human approval gate; permits the first B0 "
         "mainnet ALO only after preflight (use deliberately)",
+    )
+    p.add_argument(
+        "--probe-clip-usd",
+        type=float,
+        default=None,
+        help="required approximate USD notional for one volume-probe clip",
+    )
+    p.add_argument(
+        "--probe-side",
+        choices=("buy", "sell"),
+        default=None,
+        help="required volume-probe build side on Arcus",
+    )
+    p.add_argument(
+        "--probe-reprice-sec",
+        type=float,
+        default=30.0,
+        help="volume-probe maker reprice interval (default: 30)",
+    )
+    p.add_argument(
+        "--probe-max-runtime-sec",
+        type=int,
+        default=1800,
+        help="volume-probe maximum runtime (default: 1800)",
+    )
+    p.add_argument(
+        "--probe-max-loss-usd",
+        type=float,
+        default=10.0,
+        help="volume-probe realized-loss cap (default: 10)",
     )
     p.add_argument(
         "--cn",
@@ -186,16 +245,61 @@ def main() -> None:
     args = p.parse_args()
 
     try:
-        validate_runtime_gates(args.record_only, args.tiny_live, args.confirm_mainnet)
+        validate_runtime_gates(
+            args.record_only,
+            args.tiny_live,
+            args.confirm_mainnet,
+            volume_probe=args.volume_probe,
+        )
     except ValueError as e:
         print(f"runtime mode error: {e}", file=sys.stderr)
         sys.exit(2)
-    if args.approve_first_order and not args.tiny_live:
+    if args.approve_first_order and not (args.tiny_live or args.volume_probe):
         print(
-            "runtime mode error: --approve-first-order requires --tiny-live",
+            "runtime mode error: --approve-first-order requires --tiny-live "
+            "or --volume-probe",
             file=sys.stderr,
         )
         sys.exit(2)
+    if not args.volume_probe and (
+        args.probe_clip_usd is not None or args.probe_side is not None
+    ):
+        print(
+            "runtime mode error: --probe-clip-usd and --probe-side require "
+            "--volume-probe",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.volume_probe:
+        if args.probe_clip_usd is None or args.probe_clip_usd <= 0:
+            print(
+                "runtime mode error: --volume-probe requires --probe-clip-usd > 0",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if args.probe_side is None:
+            print(
+                "runtime mode error: --volume-probe requires --probe-side",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if args.probe_reprice_sec <= 0:
+            print(
+                "runtime mode error: --probe-reprice-sec must be > 0", file=sys.stderr
+            )
+            sys.exit(2)
+        if args.probe_max_runtime_sec <= 0:
+            print(
+                "runtime mode error: --probe-max-runtime-sec must be > 0",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if args.probe_max_loss_usd <= 0:
+            print(
+                "runtime mode error: --probe-max-loss-usd must be > 0",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     try:
         cfg = load_config(
@@ -235,6 +339,12 @@ def main() -> None:
                 tiny_live=args.tiny_live,
                 confirm_mainnet=args.confirm_mainnet,
                 approve_first_order=args.approve_first_order,
+                volume_probe=args.volume_probe,
+                probe_clip_usd=args.probe_clip_usd,
+                probe_side=args.probe_side,
+                probe_reprice_sec=args.probe_reprice_sec,
+                probe_max_runtime_sec=args.probe_max_runtime_sec,
+                probe_max_loss_usd=args.probe_max_loss_usd,
                 use_dashboard=use_dashboard,
                 force_tty=force_tty,
                 log_buffer=log_buffer,

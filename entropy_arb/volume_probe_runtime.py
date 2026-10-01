@@ -1,0 +1,603 @@
+"""One-shot BUILD/HEDGE/UNWIND controller for the V1 volume probe.
+
+This module composes the existing :class:`CalibrationController`.  It owns
+only the second phase and round lifecycle; Arcus identity, fill correlation,
+RH IOC hedging, and reconciliation remain in the B0 controller.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+import uuid
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
+
+from .calibration import QuoteCandidate
+from .calibration_runtime import CalibrationController, HedgeExecutionResult
+from .volume_probe import (
+    ProbeCandidate,
+    ProbeConfig,
+    ProbeRoundMetrics,
+    ProbeState,
+    ProbeStateMachine,
+    ProbeStatus,
+    VolumeProbeRoundWriter,
+    build_probe_candidate,
+    unwind_side,
+)
+
+
+def _now_text() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _decimal(value: Any, field: str) -> Decimal:
+    try:
+        result = Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"{field} must be a finite decimal") from exc
+    if not result.is_finite():
+        raise ValueError(f"{field} must be a finite decimal")
+    return result
+
+
+@dataclass
+class _PhaseMetrics:
+    base_qty: Decimal = Decimal("0")
+    hedged_qty: Decimal = Decimal("0")
+    arcus_notional: Decimal = Decimal("0")
+    rh_notional: Decimal = Decimal("0")
+    arcus_fees: Decimal = Decimal("0")
+    rh_fees: Decimal = Decimal("0")
+    fill_events: int = 0
+    reprices: int = 0
+    first_quote_at: str | None = None
+    first_fill_at: str | None = None
+    completed_at: str | None = None
+    fill_to_send_ms: list[int] = field(default_factory=list)
+    fill_to_fill_ms: list[int] = field(default_factory=list)
+    max_slippage_bps: Decimal = Decimal("0")
+
+    @property
+    def arcus_avg_px(self) -> Decimal | None:
+        if self.base_qty == 0:
+            return None
+        return self.arcus_notional / self.base_qty
+
+    @property
+    def rh_avg_px(self) -> Decimal | None:
+        if self.hedged_qty == 0:
+            return None
+        return self.rh_notional / self.hedged_qty
+
+    @property
+    def avg_fill_to_send_ms(self) -> float | None:
+        if not self.fill_to_send_ms:
+            return None
+        return sum(self.fill_to_send_ms) / len(self.fill_to_send_ms)
+
+    @property
+    def avg_fill_to_fill_ms(self) -> float | None:
+        if not self.fill_to_fill_ms:
+            return None
+        return sum(self.fill_to_fill_ms) / len(self.fill_to_fill_ms)
+
+
+class VolumeProbeController:
+    """Coordinate exactly one maker build and one maker unwind.
+
+    The controller is deliberately usable with a small fake executor in unit
+    tests.  In production ``executor`` is a configured
+    :class:`CalibrationController` whose callbacks are attached to the Arcus
+    account feed.
+    """
+
+    def __init__(
+        self,
+        *,
+        executor: CalibrationController,
+        config: ProbeConfig,
+        symbol: str,
+        session_id: str | None = None,
+        writer: VolumeProbeRoundWriter | None = None,
+        tolerance: Decimal = Decimal("0"),
+    ) -> None:
+        self.executor = executor
+        self.config = config
+        self.symbol = symbol
+        self.session_id = session_id or f"vp-{uuid.uuid4().hex[:12]}"
+        self.writer = writer
+        self.tolerance = _decimal(tolerance, "quantity tolerance")
+        if self.tolerance < 0:
+            raise ValueError("quantity tolerance must be >= 0")
+        self.machine = ProbeStateMachine()
+        self.phase: str | None = None
+        self.phase_target_qty: Decimal | None = None
+        self.build_base_qty = Decimal("0")
+        self.unwind_target_qty: Decimal | None = None
+        self.unwind_base_qty = Decimal("0")
+        self._order_placed_mono: float | None = None
+        self._round_started_mono = time.monotonic()
+        self._phase_started_mono: dict[str, float] = {}
+        self._phase_completed_mono: dict[str, float] = {}
+        self._failure_reason: str | None = None
+        self._status: ProbeStatus | None = None
+        self._phase_metrics = {
+            "build": _PhaseMetrics(),
+            "unwind": _PhaseMetrics(),
+        }
+        self.metrics = ProbeRoundMetrics(
+            session_id=self.session_id,
+            symbol=symbol,
+            probe_side=config.probe_side,
+            clip_usd=config.clip_usd,
+            started_at=_now_text(),
+        )
+
+    @property
+    def state(self) -> ProbeState:
+        return self.machine.state
+
+    @property
+    def failure_reason(self) -> str | None:
+        return self._failure_reason
+
+    @property
+    def status(self) -> ProbeStatus | None:
+        return self._status
+
+    @property
+    def reprice_allowed(self) -> bool:
+        """Only permit a new quote after the prior order is terminal."""
+
+        return not bool(getattr(self.executor, "has_live_order", False)) and not bool(
+            getattr(self.executor, "_terminal_reconcile_pending", False)
+        )
+
+    def _phase(self) -> _PhaseMetrics:
+        if self.phase not in self._phase_metrics:
+            raise RuntimeError("volume-probe phase is not active")
+        return self._phase_metrics[self.phase]
+
+    def _halt(self, reason: str) -> None:
+        self._failure_reason = reason
+        if self.state not in (
+            ProbeState.HALTED,
+            ProbeState.RECONCILIATION_REQUIRED,
+            ProbeState.DONE,
+        ):
+            self.machine.transition(ProbeState.HALTED)
+        self._status = (
+            ProbeStatus.TIMEOUT
+            if "timeout" in reason.lower() or "runtime" in reason.lower()
+            else ProbeStatus.HALTED
+        )
+
+    def begin_build(self, quantity: Decimal) -> None:
+        quantity = _decimal(quantity, "build quantity")
+        if quantity <= 0:
+            raise ValueError("build quantity must be > 0")
+        self.machine.transition(ProbeState.BUILD)
+        self.phase = "build"
+        self.phase_target_qty = quantity
+        self._phase_started_mono["build"] = time.monotonic()
+        self.metrics.build_first_quote_at = None
+
+    def begin_unwind(self) -> None:
+        if self.state is not ProbeState.HEDGED:
+            raise RuntimeError("cannot begin unwind before BUILD is fully hedged")
+        if self.build_base_qty <= self.tolerance:
+            raise RuntimeError("cannot unwind a zero build quantity")
+        self.machine.transition(ProbeState.UNWIND)
+        self.phase = "unwind"
+        self.phase_target_qty = self.build_base_qty
+        self.unwind_target_qty = self.build_base_qty
+        self._phase_started_mono["unwind"] = time.monotonic()
+        self.metrics.unwind_started_at = _now_text()
+
+    def finish_unwind(self) -> None:
+        if self.state is not ProbeState.UNWIND:
+            raise RuntimeError("cannot finish unwind outside UNWIND")
+        if self.unwind_base_qty + self.tolerance < (self.unwind_target_qty or 0):
+            raise RuntimeError("unwind quantity is below the actual build target")
+        self._phase().completed_at = _now_text()
+        self.metrics.unwind_complete_at = self._phase().completed_at
+        started = self._phase_started_mono.get("unwind")
+        if started is not None:
+            self.metrics.unwind_seconds = time.monotonic() - started
+        self._phase_completed_mono["unwind"] = time.monotonic()
+        self.machine.transition(ProbeState.FLAT)
+        self.phase = None
+        self.phase_target_qty = None
+
+    def record_reprice(self) -> None:
+        if not self.reprice_allowed:
+            raise RuntimeError(
+                "cannot reprice before Arcus order reaches terminal state"
+            )
+        if self.phase in self._phase_metrics:
+            self._phase_metrics[self.phase].reprices += 1
+
+    def _record_fill_metrics(
+        self,
+        *,
+        arcus_side: str,
+        arcus_price: Decimal,
+        arcus_quantity: Decimal,
+        arcus_fee: Decimal | None,
+        hedge: HedgeExecutionResult | None,
+    ) -> None:
+        phase = self._phase()
+        quantity = _decimal(arcus_quantity, "Arcus fill quantity")
+        price = _decimal(arcus_price, "Arcus fill price")
+        phase.base_qty += quantity
+        phase.arcus_notional += price * quantity
+        phase.arcus_fees += _decimal(arcus_fee or 0, "Arcus fee")
+        phase.fill_events += 1
+        now = _now_text()
+        if phase.first_fill_at is None:
+            phase.first_fill_at = now
+        if hedge is not None:
+            expected_side = "BUY" if arcus_side.upper() == "SELL" else "SELL"
+            if hedge.hedge_side != expected_side:
+                self._halt("RH hedge side did not oppose Arcus fill")
+                raise RuntimeError(self._failure_reason or "RH hedge side mismatch")
+            if hedge.filled_qty + self.tolerance < quantity:
+                self._halt("RH hedge partial fill")
+                raise RuntimeError(self._failure_reason or "RH hedge partial fill")
+            phase.hedged_qty += hedge.filled_qty
+            phase.rh_notional += hedge.avg_px * hedge.filled_qty
+            phase.rh_fees += hedge.fee
+            if hedge.fill_to_hedge_send_ms is not None:
+                phase.fill_to_send_ms.append(hedge.fill_to_hedge_send_ms)
+            phase.fill_to_fill_ms.append(hedge.fill_to_rh_fill_ms)
+            phase.max_slippage_bps = max(
+                phase.max_slippage_bps, hedge.realized_slippage_bps
+            )
+        if self.phase == "build":
+            self.build_base_qty = phase.base_qty
+            target = self.phase_target_qty
+            if (
+                target is not None
+                and phase.base_qty + self.tolerance >= target
+                and phase.hedged_qty + self.tolerance >= phase.base_qty
+            ):
+                phase.completed_at = now
+                self.metrics.build_complete_at = now
+                self._phase_completed_mono["build"] = time.monotonic()
+                self.machine.transition(ProbeState.HEDGED)
+        elif self.phase == "unwind":
+            self.unwind_base_qty = phase.base_qty
+
+    def record_hedged_fill(
+        self,
+        *,
+        arcus_side: str,
+        arcus_price: Decimal,
+        arcus_quantity: Decimal,
+        arcus_fee: Decimal | None,
+        hedge: HedgeExecutionResult | None,
+        allow_unhedged: bool = False,
+    ) -> None:
+        if self.state not in (ProbeState.BUILD, ProbeState.UNWIND):
+            raise RuntimeError("fill received outside BUILD or UNWIND")
+        if hedge is None and not allow_unhedged:
+            reason = str(
+                getattr(getattr(self.executor, "risk", None), "halt_reason", None)
+                or "RH hedge unresolved"
+            )
+            self._halt(reason)
+            raise RuntimeError(f"volume probe halted: {reason}")
+        self._record_fill_metrics(
+            arcus_side=arcus_side,
+            arcus_price=arcus_price,
+            arcus_quantity=arcus_quantity,
+            arcus_fee=arcus_fee,
+            hedge=hedge,
+        )
+
+    def candidate(self, *, best_bid: Decimal, best_ask: Decimal) -> ProbeCandidate:
+        if self.phase not in ("build", "unwind"):
+            raise RuntimeError("no active volume-probe quote phase")
+        target = self.phase_target_qty
+        if target is None:
+            raise RuntimeError("volume-probe phase has no target quantity")
+        remaining = target - self._phase().base_qty
+        if remaining <= self.tolerance:
+            raise RuntimeError("volume-probe phase has no remaining quantity")
+        side = (
+            self.config.probe_side
+            if self.phase == "build"
+            else unwind_side(self.config.probe_side)
+        )
+        return build_probe_candidate(
+            probe_side=side,
+            quantity=remaining,
+            best_bid=best_bid,
+            best_ask=best_ask,
+        )
+
+    def finalize_positions(
+        self,
+        *,
+        arcus_position: Decimal,
+        rh_position: Decimal,
+        arcus_open_orders: Iterable[Any],
+        rh_open_orders: Iterable[Mapping[str, Any]],
+    ) -> ProbeStatus:
+        arcus = _decimal(arcus_position, "final Arcus position")
+        rh = _decimal(rh_position, "final RH position")
+        arcus_orders = tuple(arcus_open_orders)
+        rh_orders = tuple(rh_open_orders)
+        self.metrics.final_arcus_position = arcus
+        self.metrics.final_rh_position = rh
+        residual = _decimal(
+            getattr(self.executor.accumulator, "residual_exposure", 0),
+            "FillAccumulator residual",
+        )
+        if (
+            abs(arcus) > self.tolerance
+            or abs(rh) > self.tolerance
+            or abs(residual) > self.tolerance
+            or arcus_orders
+            or rh_orders
+            or self.state is ProbeState.RECONCILIATION_REQUIRED
+            or (
+                self.state is not ProbeState.FLAT
+                and self.state is not ProbeState.HALTED
+            )
+        ):
+            self._failure_reason = self._failure_reason or (
+                "final positions/orders/residual are not flat"
+            )
+            if self.state is not ProbeState.RECONCILIATION_REQUIRED:
+                if self.state is ProbeState.DONE:
+                    raise RuntimeError("completed probe cannot be made non-flat")
+                self.machine.transition(ProbeState.RECONCILIATION_REQUIRED)
+            self._status = ProbeStatus.RECONCILIATION_REQUIRED
+            return self._status
+        if self.state is ProbeState.HALTED:
+            return self._status or ProbeStatus.HALTED
+        self.machine.transition(ProbeState.DONE)
+        self.metrics.finished_at = _now_text()
+        self._status = ProbeStatus.COMPLETED
+        return self._status
+
+    def _runtime_candidate(self) -> QuoteCandidate:
+        book = self.executor.arcus.book
+        bid = _decimal(book.best_bid(), "Arcus best bid")
+        ask = _decimal(book.best_ask(), "Arcus best ask")
+        probe = self.candidate(best_bid=bid, best_ask=ask)
+        hedge_book = self.executor.hedge.book
+        hedge_bid = _decimal(hedge_book.best_bid(), "RH best bid")
+        hedge_ask = _decimal(hedge_book.best_ask(), "RH best ask")
+        hedge_price = hedge_ask if probe.hedge_side == "BUY" else hedge_bid
+        return QuoteCandidate(
+            side=probe.arcus_side,
+            price=probe.price,
+            quantity=probe.quantity,
+            hedge_side=probe.hedge_side,
+            hedge_price=hedge_price,
+            fair_price=probe.price,
+            expected_edge_bps=Decimal("0"),
+            expected_usd=Decimal("0"),
+        )
+
+    async def place_next_quote(self) -> None:
+        if not self.reprice_allowed:
+            raise RuntimeError("cannot place a second volume-probe order")
+        candidate = self._runtime_candidate()
+        phase = self._phase()
+        if phase.first_quote_at is None:
+            phase.first_quote_at = _now_text()
+        await self.executor.place_quote(candidate)
+        self._order_placed_mono = time.monotonic()
+
+    async def on_fill(self, fill: Any) -> None:
+        before = int(getattr(self.executor.risk, "fill_events", 0))
+        await self.executor.on_fill(fill)
+        after = int(getattr(self.executor.risk, "fill_events", 0))
+        if after == before:
+            return
+        fee_record = getattr(self.executor, "_arcus_fee_records", {}).get(
+            getattr(fill, "trade_id", None)
+        )
+        fee = getattr(fee_record, "fee_used", None)
+        hedge = getattr(self.executor, "last_hedge_result", None)
+        if getattr(self.executor.risk, "halted", False) and hedge is None:
+            self._halt(
+                str(
+                    getattr(self.executor.risk, "halt_reason", None)
+                    or "executor halted"
+                )
+            )
+            return
+        self.record_hedged_fill(
+            arcus_side=fill.side,
+            arcus_price=fill.price,
+            arcus_quantity=fill.quantity,
+            arcus_fee=fee if fee is not None else fill.fee,
+            hedge=hedge,
+            allow_unhedged=hedge is None,
+        )
+
+    async def on_order(self, update: Any) -> None:
+        await self.executor.on_order(update)
+
+    async def on_disconnect(self) -> None:
+        await self.executor.on_disconnect()
+        self._halt(
+            str(getattr(self.executor.risk, "halt_reason", None) or "Arcus disconnect")
+        )
+
+    async def on_connect(self) -> None:
+        await self.executor.on_connect()
+
+    async def _cancel_terminal(self) -> bool:
+        await self.executor.cancel_outstanding()
+        deadline = time.monotonic() + min(self.config.reprice_sec, 15.0)
+        while not self.reprice_allowed:
+            await self.executor.reconcile()
+            if self.reprice_allowed:
+                return True
+            if time.monotonic() >= deadline:
+                self._halt("Arcus order terminal reconciliation unresolved")
+                return False
+            await asyncio.sleep(0.05)
+        return True
+
+    def _sync_metrics(self) -> None:
+        build = self._phase_metrics["build"]
+        unwind = self._phase_metrics["unwind"]
+        self.metrics.build_base_qty = build.base_qty or None
+        self.metrics.build_first_quote_at = build.first_quote_at
+        self.metrics.build_first_fill_at = build.first_fill_at
+        self.metrics.build_complete_at = build.completed_at
+        self.metrics.build_arcus_avg_px = build.arcus_avg_px
+        self.metrics.build_rh_avg_px = build.rh_avg_px
+        self.metrics.build_reprices = build.reprices
+        self.metrics.build_fill_events = build.fill_events
+        self.metrics.unwind_base_qty = unwind.base_qty or None
+        self.metrics.unwind_complete_at = unwind.completed_at
+        self.metrics.unwind_arcus_avg_px = unwind.arcus_avg_px
+        self.metrics.unwind_rh_avg_px = unwind.rh_avg_px
+        self.metrics.unwind_reprices = unwind.reprices
+        self.metrics.unwind_fill_events = unwind.fill_events
+        self.metrics.arcus_fees = build.arcus_fees + unwind.arcus_fees
+        self.metrics.rh_fees = build.rh_fees + unwind.rh_fees
+        self.metrics.max_rh_slippage_bps = max(
+            build.max_slippage_bps, unwind.max_slippage_bps
+        )
+        lat_send = build.fill_to_send_ms + unwind.fill_to_send_ms
+        lat_fill = build.fill_to_fill_ms + unwind.fill_to_fill_ms
+        self.metrics.avg_fill_to_hedge_send_ms = (
+            sum(lat_send) / len(lat_send) if lat_send else None
+        )
+        self.metrics.avg_fill_to_rh_fill_ms = (
+            sum(lat_fill) / len(lat_fill) if lat_fill else None
+        )
+        pnl = getattr(self.executor, "pnl", None)
+        self.metrics.realized_round_pnl_usd = getattr(pnl, "actual_usd", None)
+        build_started = self._phase_started_mono.get("build")
+        build_completed = self._phase_completed_mono.get("build")
+        if build_started is not None and build_completed is not None:
+            self.metrics.build_seconds = max(0.0, build_completed - build_started)
+
+    async def run(
+        self,
+        stop: asyncio.Event,
+        *,
+        quantity: Decimal,
+        final_state_reader: Callable[
+            [], Awaitable[tuple[Decimal, Decimal, list[Any], list[Mapping[str, Any]]]]
+        ],
+    ) -> ProbeStatus:
+        started = time.monotonic()
+        try:
+            if self.state is ProbeState.FLAT:
+                self.begin_build(quantity)
+            elif self.state is not ProbeState.BUILD:
+                raise RuntimeError("volume probe is not ready to start BUILD")
+            await self.place_next_quote()
+            while not stop.is_set():
+                self.executor.risk.check_runtime()
+                if getattr(self.executor.risk, "halted", False):
+                    reason = str(
+                        getattr(self.executor.risk, "halt_reason", None)
+                        or "executor halted"
+                    )
+                    self._halt(reason)
+                    await self._cancel_terminal()
+                    try:
+                        final = await final_state_reader()
+                        self.finalize_positions(
+                            arcus_position=final[0],
+                            rh_position=final[1],
+                            arcus_open_orders=final[2],
+                            rh_open_orders=final[3],
+                        )
+                    except Exception as exc:
+                        self._failure_reason = f"final reconciliation failed: {exc}"
+                        self.machine.state = ProbeState.RECONCILIATION_REQUIRED
+                        self._status = ProbeStatus.RECONCILIATION_REQUIRED
+                    break
+                health = self.executor.market_health()
+                if not health.can_quote:
+                    self.executor.risk.halt("volume-probe market health gate failed")
+                    self._halt("volume-probe market health gate failed")
+                    await self._cancel_terminal()
+                    break
+                if self.state is ProbeState.HEDGED and self.reprice_allowed:
+                    self.begin_unwind()
+                    await self.place_next_quote()
+                elif (
+                    self.state is ProbeState.UNWIND and not self.executor.has_live_order
+                ):
+                    if self._phase().base_qty + self.tolerance >= (
+                        self.phase_target_qty or 0
+                    ):
+                        self.finish_unwind()
+                        final = await final_state_reader()
+                        self.finalize_positions(
+                            arcus_position=final[0],
+                            rh_position=final[1],
+                            arcus_open_orders=final[2],
+                            rh_open_orders=final[3],
+                        )
+                        break
+                    if self.reprice_allowed:
+                        await self.place_next_quote()
+                elif (
+                    self.state is ProbeState.BUILD and not self.executor.has_live_order
+                ):
+                    if self.reprice_allowed:
+                        await self.place_next_quote()
+                elif self.executor.has_live_order:
+                    if (
+                        self._order_placed_mono is not None
+                        and time.monotonic() - self._order_placed_mono
+                        >= self.config.reprice_sec
+                    ):
+                        if await self._cancel_terminal() and self.state in (
+                            ProbeState.BUILD,
+                            ProbeState.UNWIND,
+                        ):
+                            self.record_reprice()
+                            await self.place_next_quote()
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=0.05)
+                except TimeoutError:
+                    pass
+        except TimeoutError:
+            self._halt("volume-probe runtime timeout")
+            await self._cancel_terminal()
+        except Exception as exc:
+            self._halt(str(exc))
+            if not self.reprice_allowed:
+                await self._cancel_terminal()
+        finally:
+            if self._status is None:
+                if self.state is ProbeState.HALTED:
+                    self._status = (
+                        ProbeStatus.TIMEOUT
+                        if "runtime" in (self._failure_reason or "")
+                        else ProbeStatus.HALTED
+                    )
+                elif self.state is ProbeState.DONE:
+                    self._status = ProbeStatus.COMPLETED
+                else:
+                    self._status = ProbeStatus.RECONCILIATION_REQUIRED
+            self.metrics.status = self._status
+            self.metrics.failure_reason = self._failure_reason
+            if self.metrics.finished_at is None:
+                self.metrics.finished_at = _now_text()
+            self.metrics.round_seconds = time.monotonic() - started
+            self._sync_metrics()
+            if self.writer is not None:
+                self.writer.append(self.metrics)
+            stop.set()
+        return self._status

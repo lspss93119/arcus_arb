@@ -156,6 +156,7 @@ class _ArcusFeeRecord:
 class HedgeExecutionResult:
     """Authoritative RH fill data exposed to the volume-probe wrapper."""
 
+    hedge_side: str
     filled_qty: Decimal
     avg_px: Decimal
     fee: Decimal
@@ -773,6 +774,7 @@ class CalibrationController:
                 self._record_halt()
 
     async def on_fill(self, fill: ArcusUserFill) -> None:
+        self.last_hedge_result = None
         context = self._context_for_fill(fill)
         if context is None and (
             not fill.is_snapshot
@@ -1034,6 +1036,7 @@ class CalibrationController:
         )
         fill_to_fill_ms = max(0, time.monotonic_ns() - send_mono) // 1_000_000
         self.last_hedge_result = HedgeExecutionResult(
+            hedge_side=instruction.hedge_side,
             filled_qty=filled_qty,
             avg_px=avg_px_decimal,
             fee=rh_fee_decimal,

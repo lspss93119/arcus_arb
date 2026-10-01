@@ -24,6 +24,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
 
@@ -39,6 +40,10 @@ from .arcus_execution import (
 )
 from .arcus_recorder import ArcusMarketRecorder
 from .book import ArbPlan, floor_step, plan_arb
+from .calibration import (
+    RH_HEDGE_MIN_QTY,
+    SessionLimits,
+)
 from .calibration_runtime import (
     CalibrationController,
     fetch_lighter_open_orders,
@@ -54,6 +59,12 @@ from .strategy import RollingCenterUpdate, StrategyState, build_strategy
 from .venue_arcus import ArcusVenue
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
+from .volume_probe import (
+    ProbeConfig,
+    VolumeProbeRoundWriter,
+    compute_probe_quantity,
+)
+from .volume_probe_runtime import VolumeProbeController
 
 log = logging.getLogger("engine")
 
@@ -130,6 +141,12 @@ class Engine:
         tiny_live: bool = False,
         confirm_mainnet: bool = False,
         allow_first_order: bool = False,
+        volume_probe: bool = False,
+        probe_clip_usd: float | None = None,
+        probe_side: str | None = None,
+        probe_reprice_sec: float = 30.0,
+        probe_max_runtime_sec: int = 1800,
+        probe_max_loss_usd: float = 10.0,
     ) -> None:
         self.cfg = cfg
         self.strategy = build_strategy(cfg.strategy)
@@ -138,6 +155,12 @@ class Engine:
         self.tiny_live = tiny_live
         self.confirm_mainnet = confirm_mainnet
         self.allow_first_order = allow_first_order
+        self.volume_probe = volume_probe
+        self.probe_clip_usd = probe_clip_usd
+        self.probe_side = probe_side
+        self.probe_reprice_sec = probe_reprice_sec
+        self.probe_max_runtime_sec = probe_max_runtime_sec
+        self.probe_max_loss_usd = probe_max_loss_usd
         self.session: aiohttp.ClientSession | None = None
         # Venue and recorder implementations intentionally share a runtime
         # protocol but have different optional capabilities (Arcus recorders,
@@ -195,6 +218,7 @@ class Engine:
         # append-only file beside the configured engine log.
         self.execution_telemetry_csv: str | None = None
         self.calibration: CalibrationController | None = None
+        self.volume_probe_controller: VolumeProbeController | None = None
 
     # ------------------------------------------------------------- utilities
 
@@ -488,6 +512,407 @@ class Engine:
                 if self.calibration.risk.halted
                 else "",
             )
+
+    async def _run_arcus_volume_probe(self, arcus: ArcusVenue) -> None:
+        """Run one explicitly approved Arcus maker/RH hedge/unwind round."""
+        if not self.volume_probe or not self.confirm_mainnet:
+            raise RuntimeError(
+                "volume probe requires --volume-probe and --confirm-mainnet"
+            )
+        if self.session is None:
+            raise RuntimeError("HTTP session is not initialized")
+        if self.probe_clip_usd is None or self.probe_side is None:
+            raise RuntimeError(
+                "volume probe requires --probe-clip-usd and --probe-side"
+            )
+
+        cfg = self.cfg
+        self.arcus = arcus
+        self.entropy = arcus
+        self.hedge = self._make_venue(cfg.hedge)
+        self.venues = {"arcus": self.arcus, "hedge": self.hedge}
+        tasks: list[asyncio.Task] = []
+        executor: CalibrationController | None = None
+        controller: VolumeProbeController | None = None
+        account_feed: ArcusAccountFeed | None = None
+        writer = VolumeProbeRoundWriter()
+        credentials: ArcusCredentials | None = None
+        maker: ArcusMakerClient | None = None
+        account_rest: ArcusAccountRest | None = None
+        startup_state: ArcusAccountState | None = None
+        metadata: Any = None
+        try:
+            metadata, _ = await asyncio.gather(
+                self.arcus.load_market(), self.hedge.load_market()
+            )
+            self.markets_ready = True
+            if metadata.status != "ONLINE":
+                raise RuntimeError(
+                    f"Arcus {metadata.symbol} market status={metadata.status}; "
+                    "aborting volume probe"
+                )
+
+            self.market_history = MarketHistoryStore(cfg.recorder_database)
+            self.recorder = ArcusMarketRecorder(
+                self.market_history,
+                symbol=cfg.symbol,
+                arcus_book=self.arcus.book,
+                rh_book=self.hedge.book,
+                hedge=cfg.hedge_venue,
+                is_fresh_seconds=cfg.staleness_sec,
+            )
+            self.recorder.record_metadata(metadata)
+            self.arcus.set_market_data_sinks(
+                self.recorder.record_trade,
+                lambda attributes, receive_ms, monotonic_ns: (
+                    self.recorder.record_attributes(
+                        attributes,
+                        receive_ms,
+                        monotonic_ns,
+                        market_status=metadata.status,
+                    )
+                ),
+                self.recorder.record_l2_event,
+            )
+            await self._bootstrap_rolling_center()
+
+            credentials = ArcusCredentials.from_env()
+            signer = ArcusSigner(credentials)
+            if not cfg.creds_complete:
+                raise RuntimeError(
+                    "volume probe requires Lighter-RH credentials in .env: "
+                    "LIGHTER_ACCOUNT_INDEX, LIGHTER_API_KEY_INDEX, and "
+                    "LIGHTER_API_PRIVATE_KEY"
+                )
+            if not isinstance(self.hedge, LighterVenue):
+                raise RuntimeError("volume probe requires Lighter-RH")
+            lighter_hedge = self.hedge
+            lighter_hedge.init_signer()
+            rh_account_limits = await lighter_hedge.fetch_account_limits()
+            rh_fee_bps = resolve_verified_rh_fee_bps(lighter_hedge, rh_account_limits)
+            account_rest = ArcusAccountRest(self.session, rest_url=cfg.arcus_rest_url)
+            fee_table = await account_rest.fee_tiers()
+            startup_state = ArcusAccountState(
+                startup_watermark_us=time.time_ns() // 1000
+            )
+            arcus_position = await account_rest.position(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            rh_position = Decimal(str(await self.hedge.fetch_position()))
+            rh_open_orders = await fetch_lighter_open_orders(self.hedge)
+            if rh_open_orders:
+                raise RuntimeError(
+                    "RH open order exists; aborting volume probe without touching it"
+                )
+            ArcusAccountState.validate_starting_inventory(arcus_position, rh_position)
+            arcus_open_orders = await account_rest.open_orders(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            stale_probe = startup_state.validate_startup_orders(
+                arcus_open_orders, calibration_prefix="vp-"
+            )
+
+            account_feed = ArcusAccountFeed(
+                credentials.account_address,
+                metadata.symbol,
+                ws_url=cfg.arcus_ws_url,
+                account_index=credentials.account_index,
+                startup_state=startup_state,
+                api_key=credentials.api_key,
+                client_prefix="vp-",
+                fixed_quantity=None,
+            )
+            maker = ArcusMakerClient(
+                credentials=credentials,
+                signer=signer,
+                rpc=account_feed,
+                ws_url=cfg.arcus_ws_url,
+                client_prefix="vp-",
+                fixed_quantity=None,
+            )
+            tasks += self.arcus.start_tasks(self.stop, self._update_evt.set, False)
+            tasks += self.hedge.start_tasks(self.stop, self._update_evt.set, True)
+            tasks.append(
+                asyncio.create_task(account_feed.run(self.stop), name="acct-arcus-vp")
+            )
+            tasks.append(
+                asyncio.create_task(self._storage_flush_loop(), name="storage-flush")
+            )
+            tasks.append(
+                asyncio.create_task(self.recorder.run(self.stop), name="recorder")
+            )
+
+            await self._wait_b0_account_state(account_feed)
+            await self._wait_b0_market_state()
+            account_fee = account_feed.latest_fee_tier
+            fee_tier = resolve_arcus_account_fee_tier(fee_table, account_fee)
+            if fee_tier is None:
+                raise RuntimeError(
+                    "Arcus account fee tier could not be resolved; aborting volume probe"
+                )
+            bid = self.arcus.book.best_bid()
+            ask = self.arcus.book.best_ask()
+            if bid is None or ask is None:
+                raise RuntimeError(
+                    "fresh Arcus BBO is unavailable; aborting volume probe"
+                )
+            arcus_bid = Decimal(str(bid))
+            arcus_ask = Decimal(str(ask))
+            rh_step = Decimal(1).scaleb(-int(self.hedge.size_decimals))
+            rh_min = max(
+                RH_HEDGE_MIN_QTY,
+                rh_step,
+                Decimal(str(self.hedge.min_base)),
+            )
+            quantity = compute_probe_quantity(
+                clip_usd=Decimal(str(self.probe_clip_usd)),
+                arcus_bid=arcus_bid,
+                arcus_ask=arcus_ask,
+                probe_side=self.probe_side,
+                arcus_step=Decimal(metadata.step_size),
+                arcus_min_size=(
+                    Decimal(metadata.min_order_size)
+                    if metadata.min_order_size is not None
+                    else None
+                ),
+                arcus_max_size=(
+                    Decimal(metadata.max_order_size)
+                    if metadata.max_order_size is not None
+                    else None
+                ),
+                arcus_min_notional=(
+                    Decimal(metadata.min_order_notional)
+                    if metadata.min_order_notional is not None
+                    else None
+                ),
+                rh_step=rh_step,
+                rh_min_size=rh_min,
+            )
+            limits = SessionLimits(
+                max_filled_notional_usd=max(
+                    Decimal("500"),
+                    quantity * ((arcus_bid + arcus_ask) / Decimal("2")) * 2
+                    + Decimal("1"),
+                ),
+                max_loss_usd=Decimal(str(self.probe_max_loss_usd)),
+                max_runtime_seconds=self.probe_max_runtime_sec,
+                max_order_qty=quantity,
+            )
+            executor = CalibrationController(
+                arcus=self.arcus,
+                hedge=self.hedge,
+                maker=maker,
+                account_feed=account_feed,
+                account_rest=account_rest,
+                account_state=startup_state,
+                metadata=metadata,
+                fee_tier=fee_tier,
+                strategy=self.strategy,
+                store=self.market_history,
+                allow_first_order=True,
+                staleness_sec=cfg.staleness_sec,
+                rh_fee_bps=rh_fee_bps,
+                session_limits=limits,
+                client_prefix="vp-",
+            )
+            controller = VolumeProbeController(
+                executor=executor,
+                config=ProbeConfig(
+                    clip_usd=Decimal(str(self.probe_clip_usd)),
+                    probe_side=self.probe_side,
+                    reprice_sec=self.probe_reprice_sec,
+                    max_runtime_sec=self.probe_max_runtime_sec,
+                    max_loss_usd=Decimal(str(self.probe_max_loss_usd)),
+                ),
+                symbol=metadata.symbol,
+                writer=writer,
+                tolerance=min(Decimal(metadata.step_size), rh_step),
+            )
+            self.calibration = executor
+            self.volume_probe_controller = controller
+            account_feed.on_fill = controller.on_fill
+            account_feed.on_order = controller.on_order
+            account_feed.on_disconnect = controller.on_disconnect
+            account_feed.on_connect = controller.on_connect
+
+            for stale_order in stale_probe:
+                if stale_order.client_id is None:
+                    raise RuntimeError("known vp- Arcus order has no clientId")
+                await maker.cancel_calibration_order(
+                    market_id=metadata.market_id,
+                    client_id=stale_order.client_id,
+                )
+                log.warning(
+                    "[volume-probe] canceled stale Arcus order clientId=%s orderId=%s",
+                    stale_order.client_id,
+                    stale_order.order_id,
+                )
+            if stale_probe:
+                cancel_deadline = time.monotonic() + 15.0
+                while time.monotonic() < cancel_deadline:
+                    remaining = await account_rest.open_orders(
+                        credentials.account_address,
+                        metadata.symbol,
+                        credentials.account_index,
+                    )
+                    if not any(
+                        (
+                            stale.order_id is not None
+                            and stale.order_id == order.order_id
+                        )
+                        or (
+                            stale.client_id is not None
+                            and stale.client_id == order.client_id
+                        )
+                        for stale in stale_probe
+                        for order in remaining
+                    ):
+                        break
+                    await asyncio.sleep(1.0)
+                else:
+                    raise RuntimeError(
+                        "stale vp- Arcus order did not reach terminal state"
+                    )
+                stale_fills = await account_rest.fills(
+                    credentials.account_address,
+                    metadata.symbol,
+                    credentials.account_index,
+                )
+                stale_order_ids = {
+                    order.order_id
+                    for order in stale_probe
+                    if order.order_id is not None
+                }
+                stale_client_ids = {
+                    order.client_id
+                    for order in stale_probe
+                    if order.client_id is not None
+                }
+                if any(
+                    fill.created_at_us is not None
+                    and fill.created_at_us > startup_state.startup_watermark_us
+                    and (
+                        fill.order_id in stale_order_ids
+                        or fill.client_id in stale_client_ids
+                    )
+                    for fill in stale_fills
+                ):
+                    raise RuntimeError(
+                        "stale vp- Arcus order filled during startup cancellation"
+                    )
+
+            fresh_arcus_open_orders = await account_rest.open_orders(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            if fresh_arcus_open_orders:
+                startup_state.validate_startup_orders(
+                    fresh_arcus_open_orders, calibration_prefix="vp-"
+                )
+                raise RuntimeError(
+                    "Arcus vp- order remains open after cancellation; aborting"
+                )
+            arcus_position = await account_rest.position(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            rh_position = Decimal(str(await self.hedge.fetch_position()))
+            rh_open_orders = await fetch_lighter_open_orders(self.hedge)
+            if rh_open_orders:
+                raise RuntimeError(
+                    "RH open order appeared during volume-probe preflight; aborting"
+                )
+            ArcusAccountState.validate_starting_inventory(arcus_position, rh_position)
+
+            controller.begin_build(quantity)
+            proposed = controller.candidate(
+                best_bid=arcus_bid,
+                best_ask=arcus_ask,
+            )
+            log.info(
+                "[volume-probe pre-order] side=%s price=%s qty=%s notional=%s "
+                "hedge_side=%s TIF=ALO reprice=%ss max_runtime=%ss max_loss=$%s",
+                proposed.arcus_side,
+                proposed.price,
+                proposed.quantity,
+                proposed.notional_usd,
+                proposed.hedge_side,
+                self.probe_reprice_sec,
+                self.probe_max_runtime_sec,
+                self.probe_max_loss_usd,
+            )
+            if not self.allow_first_order:
+                controller.metrics.status = "PREORDER_ONLY"
+                controller.metrics.final_arcus_position = arcus_position
+                controller.metrics.final_rh_position = rh_position
+                controller.metrics.finished_at = datetime.now(UTC).isoformat()
+                writer.append(controller.metrics)
+                log.warning(
+                    "[volume-probe] pre-order STOP: no Arcus order submitted; "
+                    "use --approve-first-order only after human review"
+                )
+                return
+
+            async def final_state_reader():
+                assert account_rest is not None and credentials is not None
+                final_arcus = await account_rest.position(
+                    credentials.account_address,
+                    metadata.symbol,
+                    credentials.account_index,
+                )
+                final_rh = Decimal(str(await self.hedge.fetch_position()))
+                final_arcus_orders = await account_rest.open_orders(
+                    credentials.account_address,
+                    metadata.symbol,
+                    credentials.account_index,
+                )
+                final_rh_orders = await fetch_lighter_open_orders(self.hedge)
+                return final_arcus, final_rh, final_arcus_orders, final_rh_orders
+
+            tasks.append(
+                asyncio.create_task(
+                    controller.run(
+                        self.stop,
+                        quantity=quantity,
+                        final_state_reader=final_state_reader,
+                    ),
+                    name="arcus-volume-probe",
+                )
+            )
+            await self.stop.wait()
+        finally:
+            self.stop.set()
+            probe_task = next(
+                (task for task in tasks if task.get_name() == "arcus-volume-probe"),
+                None,
+            )
+            if probe_task is not None and not probe_task.done():
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(probe_task, timeout=20.0)
+            if executor is not None:
+                with contextlib.suppress(Exception):
+                    await executor.shutdown()
+            for task in tasks:
+                if task is not probe_task:
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for venue in self.venues.values():
+                with contextlib.suppress(Exception):
+                    await venue.close()
+            if self.market_history is not None:
+                if self.calibration is not None:
+                    with contextlib.suppress(Exception):
+                        await self.calibration.telemetry.flush()
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self.market_history.flush)
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self.market_history.close)
 
     async def _run_arcus_tiny_live(self, arcus: ArcusVenue) -> None:
         """Run B0 preflight and, only after the separate approval flag, B0.
@@ -923,8 +1348,17 @@ class Engine:
 
     async def _run_inner(self) -> None:
         cfg = self.cfg
+        if self.volume_probe and (self.record_only or self.tiny_live):
+            raise RuntimeError(
+                "volume probe is mutually exclusive with record-only and tiny-live"
+            )
         selected = self._make_venue(getattr(cfg, "arcus", cfg.entropy))
+        if self.volume_probe and not isinstance(selected, ArcusVenue):
+            raise RuntimeError("volume probe requires an Arcus primary venue")
         if isinstance(selected, ArcusVenue):
+            if self.volume_probe:
+                await self._run_arcus_volume_probe(selected)
+                return
             if self.tiny_live:
                 await self._run_arcus_tiny_live(selected)
                 return

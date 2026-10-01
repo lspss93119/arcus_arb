@@ -38,7 +38,14 @@ class ProbeStateMachine:
     state: ProbeState = ProbeState.FLAT
 
     _ALLOWED = {
-        ProbeState.FLAT: frozenset((ProbeState.BUILD, ProbeState.DONE)),
+        ProbeState.FLAT: frozenset(
+            (
+                ProbeState.BUILD,
+                ProbeState.DONE,
+                ProbeState.HALTED,
+                ProbeState.RECONCILIATION_REQUIRED,
+            )
+        ),
         ProbeState.BUILD: frozenset(
             (ProbeState.HEDGED, ProbeState.HALTED, ProbeState.RECONCILIATION_REQUIRED)
         ),
@@ -73,17 +80,21 @@ class ProbeConfig:
     def __post_init__(self) -> None:
         clip = _decimal(self.clip_usd, "probe_clip_usd")
         loss = _decimal(self.max_loss_usd, "probe_max_loss_usd")
+        reprice = _decimal(self.reprice_sec, "probe_reprice_sec")
+        runtime = _decimal(self.max_runtime_sec, "probe_max_runtime_sec")
         side = _side(self.probe_side)
         if clip <= 0:
             raise ValueError("probe_clip_usd must be > 0")
-        if self.reprice_sec <= 0:
+        if reprice <= 0:
             raise ValueError("probe_reprice_sec must be > 0")
-        if self.max_runtime_sec <= 0:
+        if runtime <= 0 or runtime != runtime.to_integral_value():
             raise ValueError("probe_max_runtime_sec must be > 0")
         if loss <= 0:
             raise ValueError("probe_max_loss_usd must be > 0")
         object.__setattr__(self, "clip_usd", clip)
         object.__setattr__(self, "max_loss_usd", loss)
+        object.__setattr__(self, "reprice_sec", float(reprice))
+        object.__setattr__(self, "max_runtime_sec", int(runtime))
         object.__setattr__(self, "probe_side", side.lower())
 
 
