@@ -22,6 +22,7 @@ import csv
 import logging
 import os
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -61,6 +62,8 @@ from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
 from .volume_probe import (
     ProbeConfig,
+    ProbeRoundMetrics,
+    ProbeStatus,
     VolumeProbeRoundWriter,
     compute_probe_quantity,
 )
@@ -541,11 +544,24 @@ class Engine:
         account_rest: ArcusAccountRest | None = None
         startup_state: ArcusAccountState | None = None
         metadata: Any = None
+        arcus_position: Decimal | None = None
+        rh_position: Decimal | None = None
+        round_logged = False
+        probe_session_id = f"vp-{uuid.uuid4().hex[:12]}"
+        preflight_metrics = ProbeRoundMetrics(
+            session_id=probe_session_id,
+            symbol=cfg.symbol,
+            probe_side=str(self.probe_side),
+            clip_usd=Decimal(str(self.probe_clip_usd)),
+            started_at=datetime.now(UTC).isoformat(),
+            status=ProbeStatus.HALTED,
+        )
         try:
             metadata, _ = await asyncio.gather(
                 self.arcus.load_market(), self.hedge.load_market()
             )
             self.markets_ready = True
+            preflight_metrics.symbol = metadata.symbol
             if metadata.status != "ONLINE":
                 raise RuntimeError(
                     f"Arcus {metadata.symbol} market status={metadata.status}; "
@@ -729,6 +745,7 @@ class Engine:
                     max_loss_usd=Decimal(str(self.probe_max_loss_usd)),
                 ),
                 symbol=metadata.symbol,
+                session_id=probe_session_id,
                 writer=writer,
                 tolerance=min(Decimal(metadata.step_size), rh_step),
             )
@@ -853,6 +870,7 @@ class Engine:
                 controller.metrics.final_rh_position = rh_position
                 controller.metrics.finished_at = datetime.now(UTC).isoformat()
                 writer.append(controller.metrics)
+                round_logged = True
                 log.warning(
                     "[volume-probe] pre-order STOP: no Arcus order submitted; "
                     "use --approve-first-order only after human review"
@@ -886,6 +904,10 @@ class Engine:
                 )
             )
             await self.stop.wait()
+            round_logged = controller.metrics_written
+        except Exception as exc:
+            preflight_metrics.failure_reason = str(exc) or type(exc).__name__
+            raise
         finally:
             self.stop.set()
             probe_task = next(
@@ -895,6 +917,25 @@ class Engine:
             if probe_task is not None and not probe_task.done():
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(probe_task, timeout=20.0)
+            if controller is not None and controller.metrics_written:
+                round_logged = True
+            if not round_logged:
+                if controller is not None:
+                    preflight_metrics.session_id = controller.session_id
+                    preflight_metrics.symbol = controller.symbol
+                    preflight_metrics.probe_side = controller.config.probe_side
+                    preflight_metrics.clip_usd = controller.config.clip_usd
+                    preflight_metrics.failure_reason = (
+                        preflight_metrics.failure_reason
+                        or controller.failure_reason
+                        or "volume probe aborted before round completion"
+                    )
+                    if controller.status is not None:
+                        preflight_metrics.status = controller.status
+                preflight_metrics.final_arcus_position = arcus_position
+                preflight_metrics.final_rh_position = rh_position
+                preflight_metrics.finished_at = datetime.now(UTC).isoformat()
+                writer.append(preflight_metrics)
             if executor is not None:
                 with contextlib.suppress(Exception):
                     await executor.shutdown()

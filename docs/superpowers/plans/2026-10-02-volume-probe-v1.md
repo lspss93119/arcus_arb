@@ -41,27 +41,27 @@
 - Consumes: `Decimal`, Arcus metadata values, `QuoteCandidate` only where useful for existing telemetry compatibility.
 - Produces: `ProbeSide`, `ProbeState`, `ProbeStatus`, `ProbeConfig`, `ProbeCandidate`, `compute_probe_quantity(...)`, `build_probe_candidate(...)`, `unwind_side(...)`, `ProbeRoundMetrics`, and `VolumeProbeRoundWriter.append(...)`.
 
-- [ ] **Step 1: Write failing pure tests**
+- [x] **Step 1: Write failing pure tests**
 
   Add tests for USD-to-step quantity, min/max/min-notional/RH validation, BUY-at-best-bid and SELL-at-best-ask, non-crossing ALO safety, side reversal, state transition guards, and stable CSV header/status serialization.
 
-- [ ] **Step 2: Run the focused tests to verify RED**
+- [x] **Step 2: Run the focused tests to verify RED**
 
   Run: `python3 -m pytest -q tests/test_volume_probe.py`
 
   Expected: collection or assertion failures because the new module/interfaces do not exist.
 
-- [ ] **Step 3: Implement the pure rules**
+- [x] **Step 3: Implement the pure rules**
 
   Use Decimal floor rounding. Compute mid from fresh Arcus bid/ask, reject invalid/stale inputs before producing a candidate, validate both venue grids and all available Arcus constraints, set build hedge side to the opposite side, and construct unwind candidates with the exact reverse side. Keep the CSV writer append-only, create only its parent directory, and emit the exact round fields from the spec.
 
-- [ ] **Step 4: Run focused tests to verify GREEN**
+- [x] **Step 4: Run focused tests to verify GREEN**
 
   Run: `python3 -m pytest -q tests/test_volume_probe.py`
 
   Expected: all pure volume-probe tests pass with no live/network fixture.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
   git add entropy_arb/volume_probe.py tests/test_volume_probe.py
@@ -81,27 +81,27 @@
 - Consumes: Task 1 `ProbeCandidate`/quantity rules.
 - Produces: `ArcusMakerClient(client_prefix="b0-", fixed_quantity=Decimal("0.01"))`, generic controller prefix/quantity hooks, and a public probe placement/hedge-result boundary used by Task 3.
 
-- [ ] **Step 1: Write failing regression tests**
+- [x] **Step 1: Write failing regression tests**
 
   Add tests proving a volume maker accepts `vp-` and an arbitrary validated quantity, rejects non-`vp-` cancels/placements, exposes authoritative hedge result metrics for the probe wrapper, and still rejects B0 quantity/prefix changes. Add a test that real `on_fill` uses `FillAccumulator` and sends the opposite RH side.
 
-- [ ] **Step 2: Run the focused tests to verify RED**
+- [x] **Step 2: Run the focused tests to verify RED**
 
   Run: `python3 -m pytest -q tests/test_phase_b0.py tests/test_volume_probe.py`
 
   Expected: new volume-specific assertions fail while existing B0 tests remain green.
 
-- [ ] **Step 3: Implement the minimal generic hooks**
+- [x] **Step 3: Implement the minimal generic hooks**
 
   Add optional maker prefix/fixed-quantity settings with B0-compatible defaults; make controller order quantity/prefix configurable through `SessionLimits`/constructor; replace only hardcoded B0 checks that must be shared; expose one narrow placement method and last authoritative hedge result/latency record. Keep B0 error semantics and defaults unchanged.
 
-- [ ] **Step 4: Run the focused tests to verify GREEN**
+- [x] **Step 4: Run the focused tests to verify GREEN**
 
   Run: `python3 -m pytest -q tests/test_phase_b0.py tests/test_volume_probe.py`
 
   Expected: existing B0 suite and new plumbing tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
   git add entropy_arb/arcus_execution.py entropy_arb/calibration_runtime.py entropy_arb/calibration.py tests/test_phase_b0.py tests/test_volume_probe.py
@@ -122,27 +122,27 @@
 - Consumes: Task 1 pure rules/writer and Task 2 generic B0 execution hooks.
 - Produces: `VolumeProbeController` with `run(stop)`, callbacks compatible with `ArcusAccountFeed`, `pre_order_state(...)`, and final status/metrics; CLI arguments and `validate_runtime_gates(...)` support for the independent mode.
 
-- [ ] **Step 1: Write failing controller/gate tests**
+- [x] **Step 1: Write failing controller/gate tests**
 
   Cover all mode combinations, required probe args/defaults, pre-order-only no-mutation behavior, BUILD partial fill followed by opposite RH hedge, BUILD→HEDGED→UNWIND, correct reverse unwind quantity, cancel/reconcile before reprice, timeout/partial/unresolved halt, completed flat final state, non-flat reconciliation-required final state, and record-only credential-free behavior.
 
-- [ ] **Step 2: Run focused tests to verify RED**
+- [x] **Step 2: Run focused tests to verify RED**
 
   Run: `python3 -m pytest -q tests/test_phase_b0.py tests/test_volume_probe.py`
 
   Expected: new controller and gate tests fail because the mode is not wired.
 
-- [ ] **Step 3: Implement the controller and runtime wiring**
+- [x] **Step 3: Implement the controller and runtime wiring**
 
   Implement one-shot BUILD/UNWIND orchestration around the inherited callback and reconciliation path. Start only with a fresh BBO and healthy account/public feeds; recognize/cancel only stale `vp-` orders; abort on unknown Arcus/RH orders or non-flat startup positions; pass `vp-` to the maker; never place two orders; require terminal cancellation before replacement; stop additions on every health/hedge/loss/runtime failure; re-read final positions/orders and classify `COMPLETED` only when fully flat. Add `--probe-clip-usd`, `--probe-side`, `--probe-reprice-sec`, `--probe-max-runtime-sec`, and `--probe-max-loss-usd`, with the exact gates. Append one round row in `finally`.
 
-- [ ] **Step 4: Run focused tests to verify GREEN**
+- [x] **Step 4: Run focused tests to verify GREEN**
 
   Run: `python3 -m pytest -q tests/test_phase_b0.py tests/test_volume_probe.py`
 
   Expected: all existing B0 and new volume-probe tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
   git add main.py entropy_arb/engine.py entropy_arb/calibration_runtime.py tests/test_phase_b0.py tests/test_volume_probe.py
@@ -160,27 +160,27 @@
 - Consumes: Task 3 CLI behavior and statuses.
 - Produces: shortest preflight and approved-round examples, explicit non-goals, and a checked implementation plan.
 
-- [ ] **Step 1: Write failing documentation/CLI smoke assertions**
+- [x] **Step 1: Write failing documentation/CLI smoke assertions**
 
   Add local parser/gate assertions for the exact README commands and verify the plan's required status/field names are represented in code tests.
 
-- [ ] **Step 2: Run the assertions to verify RED**
+- [x] **Step 2: Run the assertions to verify RED**
 
   Run: `python3 -m pytest -q tests/test_phase_b0.py tests/test_volume_probe.py`
 
   Expected: the new documentation-facing assertion fails until the README and final status wiring are complete.
 
-- [ ] **Step 3: Update README and mark the plan complete**
+- [x] **Step 3: Update README and mark the plan complete**
 
   Document both `PREORDER_ONLY` and approved one-round commands, the `vp-`/maker-only safety boundary, the CSV path/statuses, and the five explicitly deferred features. Do not claim live execution or add a mainnet call.
 
-- [ ] **Step 4: Run the full verification suite**
+- [x] **Step 4: Run the full verification suite**
 
   Run: `python3 -m pytest -q && ruff check . && ruff format --check . && python3 -m mypy entropy_arb tests main.py && python3 -m compileall -q main.py entropy_arb tests && git diff --check`
 
   Expected: all tests pass, Ruff/mypy/compileall/diff checks exit 0. Any unavailable tool is reported explicitly, but pytest is always run.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
   git add README.md docs/superpowers/specs/2026-10-02-volume-probe-v1-design.md docs/superpowers/plans/2026-10-02-volume-probe-v1.md

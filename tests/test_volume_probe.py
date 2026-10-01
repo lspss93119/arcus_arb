@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -240,6 +241,64 @@ def test_unresolved_hedge_halts_without_advancing_to_unwind() -> None:
     assert controller.state is ProbeState.HALTED
 
 
+def test_active_phase_rejects_fill_from_the_other_direction() -> None:
+    controller = _probe_controller(side="sell")
+    controller.begin_build(Decimal("0.1"))
+    with pytest.raises(RuntimeError, match="does not match"):
+        controller.record_hedged_fill(
+            arcus_side="BUY",
+            arcus_price=Decimal("100"),
+            arcus_quantity=Decimal("0.1"),
+            arcus_fee=Decimal("0.01"),
+            hedge=_hedge(side="SELL", qty="0.1"),
+        )
+    assert controller.state is ProbeState.HALTED
+
+
+def test_subminimum_arcus_fill_stays_pending_without_advancing_to_unwind() -> None:
+    class FakeRisk:
+        fill_events = 0
+        halted = False
+        halt_reason = None
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.risk = FakeRisk()
+            self.accumulator = SimpleNamespace(residual_exposure=Decimal("0"))
+            self.last_hedge_result = None
+            self._arcus_fee_records: dict[str, Any] = {}
+
+        def _context_for_fill(self, fill: Any) -> object:
+            return object()
+
+        async def on_fill(self, fill: Any) -> None:
+            self.risk.fill_events += 1
+            self.accumulator.residual_exposure = fill.quantity
+
+    executor = FakeExecutor()
+    controller = VolumeProbeController(
+        executor=cast(Any, executor),
+        config=ProbeConfig(clip_usd=Decimal("10"), probe_side="sell"),
+        symbol="HYPE-USD",
+    )
+    controller.begin_build(Decimal("0.1"))
+    asyncio.run(
+        controller.on_fill(
+            SimpleNamespace(
+                trade_id="trade-1",
+                is_snapshot=False,
+                side="SELL",
+                price=Decimal("100"),
+                quantity=Decimal("0.005"),
+                fee=Decimal("0.01"),
+            )
+        )
+    )
+    assert controller.state is ProbeState.BUILD
+    assert controller.build_base_qty == Decimal("0.005")
+    assert controller.status is None
+
+
 def test_reprice_requires_cancel_terminal_barrier() -> None:
     controller = _probe_controller()
     controller.begin_build(Decimal("0.1"))
@@ -469,3 +528,20 @@ def test_volume_probe_runtime_gates_are_independent_from_b0() -> None:
         validate_runtime_gates(True, False, True, volume_probe=True)
     with pytest.raises(ValueError, match="mutually exclusive"):
         validate_runtime_gates(False, True, True, volume_probe=True)
+
+
+def test_readme_documents_preflight_and_approved_volume_probe_commands() -> None:
+    readme = Path("README.md").read_text()
+    assert "--volume-probe" in readme
+    assert "--confirm-mainnet" in readme
+    assert "--probe-side sell" in readme
+    assert "--probe-clip-usd 10" in readme
+    assert "--approve-first-order" in readme
+    for deferred in (
+        "multiple clip target builder",
+        "funding direction",
+        "hold",
+        "repeated rounds",
+        "automatic market selection",
+    ):
+        assert deferred in readme

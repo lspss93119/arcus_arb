@@ -69,6 +69,46 @@ state, then stops before `placeOrder` unless the separate first-order approval
 flag is deliberately supplied after a human review. No wallet generation or
 API-key registration is performed.
 
+## One-shot volume probe V1
+
+The volume probe is an independent, one-round Arcus maker → Lighter-RH hedge
+→ Arcus maker-unwind path. It is not B0 and cannot be combined with
+`--record-only` or `--tiny-live`. The mandatory `--confirm-mainnet` flag only
+acknowledges that account/live endpoints may be contacted; the default mode
+still performs preflight only and does not call Arcus `placeOrder`:
+
+```bash
+python3 main.py --config config.yaml --symbol SNDK \
+  --hedge lighter-rh --volume-probe --confirm-mainnet \
+  --probe-side sell --probe-clip-usd 10 --no-dashboard
+```
+
+Preflight validates fresh public/account state, executable venue grids, the
+Arcus best-side LIMIT+ALO proposal, and the RH hedge side. It logs one
+`PREORDER_ONLY` row to `logs/volume_probe_rounds.csv` and exits before any
+Arcus order mutation. To deliberately run exactly one approved round, add the
+separate approval flag only after reviewing the proposal:
+
+```bash
+python3 main.py --config config.yaml --symbol SNDK \
+  --hedge lighter-rh --volume-probe --confirm-mainnet \
+  --probe-side sell --probe-clip-usd 10 --approve-first-order --no-dashboard
+```
+
+The approved path uses `vp-` client IDs, Arcus maker-only LIMIT+ALO quotes,
+immediate authoritative RH IOC hedges, terminal cancel reconciliation before
+reprice, and a single `BUILD -> HEDGED -> UNWIND -> FLAT` round. It never
+uses a taker fallback or an emergency market close. The append-only round log
+uses the statuses `COMPLETED`, `TIMEOUT`, `HALTED`,
+`RECONCILIATION_REQUIRED`, and `PREORDER_ONLY`; any non-flat final read is
+reported as reconciliation-required rather than forced flat.
+
+The V1 scope deliberately defers a multiple clip target builder, funding direction,
+markout/hold, repeated rounds, and automatic market selection.
+There is no funding-direction optimization, no configurable hold period, and
+no mainnet probe is part of repository verification; tests use local fakes and
+static checks only.
+
 ## Arcus public API used
 
 The implementation follows the official documentation at

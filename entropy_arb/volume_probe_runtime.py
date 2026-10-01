@@ -8,6 +8,7 @@ RH IOC hedging, and reconciliation remain in the B0 controller.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -111,6 +112,7 @@ class VolumeProbeController:
         self.symbol = symbol
         self.session_id = session_id or f"vp-{uuid.uuid4().hex[:12]}"
         self.writer = writer
+        self._metrics_written = False
         self.tolerance = _decimal(tolerance, "quantity tolerance")
         if self.tolerance < 0:
             raise ValueError("quantity tolerance must be >= 0")
@@ -149,6 +151,17 @@ class VolumeProbeController:
     @property
     def status(self) -> ProbeStatus | None:
         return self._status
+
+    @property
+    def metrics_written(self) -> bool:
+        return self._metrics_written
+
+    def _expected_arcus_side(self) -> str | None:
+        if self.phase == "build":
+            return self.config.probe_side.upper()
+        if self.phase == "unwind":
+            return unwind_side(self.config.probe_side).upper()
+        return None
 
     @property
     def reprice_allowed(self) -> bool:
@@ -285,6 +298,14 @@ class VolumeProbeController:
     ) -> None:
         if self.state not in (ProbeState.BUILD, ProbeState.UNWIND):
             raise RuntimeError("fill received outside BUILD or UNWIND")
+        expected_side = self._expected_arcus_side()
+        if expected_side is not None and arcus_side.upper() != expected_side:
+            reason = (
+                f"Arcus fill side {arcus_side!r} does not match "
+                f"{self.phase} side {expected_side}"
+            )
+            self._halt(reason)
+            raise RuntimeError(f"volume probe halted: {reason}")
         if hedge is None and not allow_unhedged:
             reason = str(
                 getattr(getattr(self.executor, "risk", None), "halt_reason", None)
@@ -398,32 +419,91 @@ class VolumeProbeController:
         self._order_placed_mono = time.monotonic()
 
     async def on_fill(self, fill: Any) -> None:
+        context_lookup = getattr(self.executor, "_context_for_fill", None)
+        if callable(context_lookup) and context_lookup(fill) is None:
+            # The account stream is account-scoped.  A new fill that cannot be
+            # tied to this probe is an identity ambiguity, not a harmless
+            # unrelated event; stop before the inherited controller can
+            # ignore it.
+            if not bool(getattr(fill, "is_snapshot", False)):
+                reason = "unknown Arcus fill identity during volume probe"
+                halt = getattr(self.executor.risk, "halt", None)
+                if callable(halt):
+                    halt(reason)
+                self._halt(reason)
+                cancel = getattr(self.executor, "cancel_outstanding", None)
+                if callable(cancel):
+                    with contextlib.suppress(Exception):
+                        await cancel()
+                return
         before = int(getattr(self.executor.risk, "fill_events", 0))
         await self.executor.on_fill(fill)
         after = int(getattr(self.executor.risk, "fill_events", 0))
         if after == before:
+            if getattr(self.executor.risk, "halted", False):
+                self._halt(
+                    str(
+                        getattr(self.executor.risk, "halt_reason", None)
+                        or "executor halted"
+                    )
+                )
             return
         fee_record = getattr(self.executor, "_arcus_fee_records", {}).get(
             getattr(fill, "trade_id", None)
         )
         fee = getattr(fee_record, "fee_used", None)
         hedge = getattr(self.executor, "last_hedge_result", None)
-        if getattr(self.executor.risk, "halted", False) and hedge is None:
+        arcus_fee = fee if fee is not None else getattr(fill, "fee", None)
+        if hedge is None:
+            residual = _decimal(
+                getattr(self.executor.accumulator, "residual_exposure", 0),
+                "FillAccumulator residual",
+            )
+            if getattr(self.executor.risk, "halted", False) or residual <= 0:
+                reason = str(
+                    getattr(self.executor.risk, "halt_reason", None)
+                    or "RH hedge unresolved"
+                )
+                self._halt(reason)
+                cancel = getattr(self.executor, "cancel_outstanding", None)
+                if callable(cancel):
+                    with contextlib.suppress(Exception):
+                        await cancel()
+                return
+            # The inherited FillAccumulator intentionally holds a sub-minimum
+            # Arcus fill until a later same-side fill makes one executable RH
+            # IOC.  Record that pending exposure, but never treat it as
+            # hedged or advance to UNWIND.
+            self.record_hedged_fill(
+                arcus_side=fill.side,
+                arcus_price=fill.price,
+                arcus_quantity=fill.quantity,
+                arcus_fee=arcus_fee,
+                hedge=None,
+                allow_unhedged=True,
+            )
+            return
+        try:
+            self.record_hedged_fill(
+                arcus_side=fill.side,
+                arcus_price=fill.price,
+                arcus_quantity=fill.quantity,
+                arcus_fee=arcus_fee,
+                hedge=hedge,
+            )
+        except RuntimeError:
+            cancel = getattr(self.executor, "cancel_outstanding", None)
+            if callable(cancel):
+                with contextlib.suppress(Exception):
+                    await cancel()
+            return
+        if getattr(self.executor.risk, "halted", False):
             self._halt(
                 str(
                     getattr(self.executor.risk, "halt_reason", None)
                     or "executor halted"
                 )
             )
-            return
-        self.record_hedged_fill(
-            arcus_side=fill.side,
-            arcus_price=fill.price,
-            arcus_quantity=fill.quantity,
-            arcus_fee=fee if fee is not None else fill.fee,
-            hedge=hedge,
-            allow_unhedged=hedge is None,
-        )
 
     async def on_order(self, update: Any) -> None:
         await self.executor.on_order(update)
@@ -486,6 +566,10 @@ class VolumeProbeController:
         build_completed = self._phase_completed_mono.get("build")
         if build_started is not None and build_completed is not None:
             self.metrics.build_seconds = max(0.0, build_completed - build_started)
+        unwind_started = self._phase_started_mono.get("unwind")
+        unwind_completed = self._phase_completed_mono.get("unwind")
+        if unwind_started is not None and unwind_completed is not None:
+            self.metrics.unwind_seconds = max(0.0, unwind_completed - unwind_started)
 
     async def run(
         self,
@@ -599,5 +683,6 @@ class VolumeProbeController:
             self._sync_metrics()
             if self.writer is not None:
                 self.writer.append(self.metrics)
+            self._metrics_written = True
             stop.set()
         return self._status

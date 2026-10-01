@@ -67,8 +67,10 @@ does not change.
 Existing SQLite `arcus_calibration_events` remains unchanged. Each probe round
 appends one row to `logs/volume_probe_rounds.csv` with session, timing, build and
 unwind fills/reprices, fees/PnL, latency/slippage, final positions, status, and
-failure reason. Status values include `COMPLETED`, `TIMEOUT`, `HALTED`,
-`RECONCILIATION_REQUIRED`, and `PREORDER_ONLY`.
+failure reason. A preflight failure before order placement is also recorded as
+`HALTED` so failed invocations remain auditable. Status values include
+`COMPLETED`, `TIMEOUT`, `HALTED`, `RECONCILIATION_REQUIRED`, and
+`PREORDER_ONLY`.
 
 ## Verification
 

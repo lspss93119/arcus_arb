@@ -193,7 +193,7 @@ def main() -> None:
     p.add_argument(
         "--approve-first-order",
         action="store_true",
-        help="separate human approval gate; permits the first B0 "
+        help="separate human approval gate; permits the first B0 or volume-probe "
         "mainnet ALO only after preflight (use deliberately)",
     )
     p.add_argument(
