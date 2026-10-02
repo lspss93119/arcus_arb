@@ -61,11 +61,11 @@
 - Produces `FillAccumulator.pending_hedge_qty: Decimal` and an unresolved-exposure value used by runtime/finalization.
 - Produces narrow reserve, authoritative-settle, and pre-send-rollback operations; no retry behavior.
 
-- [ ] **Step 1: Add `pending_hedge_qty` and lifecycle methods**
+- [x] **Step 1: Add `pending_hedge_qty` and lifecycle methods**
 
   Make `add_fill()` move eligible quantity from `unhedged_qty` to `pending_hedge_qty`. Keep min-quote ineligible fills entirely unhedged. Add methods to settle a reserved instruction with authoritative `filled_qty`, restore a definitive unfilled quantity, and roll back a reservation that was never sent. Validate quantities and never allow pending to become negative.
 
-- [ ] **Step 2: Preserve side/reset and residual compatibility**
+- [x] **Step 2: Preserve side/reset and residual compatibility**
 
   Treat `unhedged_qty + pending_hedge_qty` as unresolved exposure for existing safety gates, while keeping the raw fields available for exact assertions. `reset_if_flat()` clears the side only when both are zero.
 
