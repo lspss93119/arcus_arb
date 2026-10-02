@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 from .arcus_execution import (
     ArcusAccountRest,
@@ -26,6 +27,7 @@ from .arcus_execution import (
     ArcusFeeTier,
     ArcusMakerClient,
     ArcusOrderUpdate,
+    ArcusRateLimited,
     ArcusUserFill,
 )
 from .calibration import (
@@ -51,6 +53,17 @@ log = logging.getLogger("arcus-calibration")
 
 RH_API_URL = "https://api.rh.lighter.xyz"
 RH_PROFILE_NAME = "robinhood"
+RECONCILIATION_BACKOFF_INITIAL_SEC = 1.0
+RECONCILIATION_BACKOFF_CAP_SEC = 5.0
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    """Outcome of one bounded Arcus reconciliation attempt."""
+
+    status: Literal["success", "rate_limited", "failed"]
+    retry_after: float | None = None
+    error: Exception | None = None
 
 
 def _decimal(value: Any, field: str) -> Decimal:
@@ -383,6 +396,9 @@ class CalibrationController:
         self._cancel_sent = False
         self._cancel_pending = False
         self._last_recorded_halt_reason: str | None = None
+        self._reconcile_next_allowed_mono = 0.0
+        self._reconcile_backoff_sec = RECONCILIATION_BACKOFF_INITIAL_SEC
+        self._reconciliation_required_reason: str | None = None
         # Arcus cash-flow is recorded when each fill arrives, but the session
         # loss cap is realized only as the corresponding RH hedge completes.
         # Keep a checkpoint so a hedge that unlocks accumulated sub-minimum
@@ -1334,37 +1350,93 @@ class CalibrationController:
         finally:
             await self.shutdown()
 
+    @property
+    def reconciliation_required(self) -> bool:
+        return self._reconciliation_required_reason is not None
+
+    def mark_reconciliation_required(self, reason: str) -> None:
+        """Permanently block further REST reconciliation for this session."""
+
+        if self._reconciliation_required_reason is None:
+            self._reconciliation_required_reason = reason
+            self.risk.halt(reason)
+            self._record_halt()
+
+    def _rate_limited_reconciliation(
+        self, exc: ArcusRateLimited
+    ) -> ReconciliationResult:
+        delay = exc.retry_after
+        if delay is None or not math.isfinite(delay):
+            delay = min(
+                RECONCILIATION_BACKOFF_CAP_SEC,
+                self._reconcile_backoff_sec,
+            )
+        else:
+            delay = max(RECONCILIATION_BACKOFF_INITIAL_SEC, delay)
+        self._reconcile_next_allowed_mono = time.monotonic() + delay
+        self._reconcile_backoff_sec = min(
+            RECONCILIATION_BACKOFF_CAP_SEC,
+            self._reconcile_backoff_sec * 2.0,
+        )
+        log.warning(
+            "[ARCUS] reconciliation rate limited; retry in %.1fs",
+            delay,
+        )
+        return ReconciliationResult(
+            status="rate_limited",
+            retry_after=delay,
+            error=exc,
+        )
+
     def _halt_reconciliation_failure(self, operation: str, exc: Exception) -> None:
         detail = str(exc).strip() or repr(exc)
         reason = (
             f"Arcus reconciliation {operation} failed ({type(exc).__name__}): {detail}"
         )
         log.exception("%s", reason)
+        self._reconciliation_required_reason = (
+            self._reconciliation_required_reason or reason
+        )
         self.risk.on_telemetry_failure(reason)
         self._record_halt()
 
-    async def reconcile(self) -> None:
+    async def reconcile(self) -> ReconciliationResult:
         """Refresh known calibration orders after a cancel/fill race."""
+        if self._reconciliation_required_reason is not None:
+            return ReconciliationResult(
+                status="failed",
+                error=RuntimeError(self._reconciliation_required_reason),
+            )
         if not self._order_contexts:
-            return
+            return ReconciliationResult(status="success")
+        retry_after = self._reconcile_next_allowed_mono - time.monotonic()
+        if retry_after > 0:
+            return ReconciliationResult(
+                status="rate_limited",
+                retry_after=retry_after,
+            )
         try:
             orders = await self.account_rest.open_orders(
                 self.maker.credentials.account_address,
                 self.metadata.symbol,
                 self.maker.credentials.account_index,
             )
+        except ArcusRateLimited as exc:
+            return self._rate_limited_reconciliation(exc)
         except Exception as exc:
             self._halt_reconciliation_failure("open_orders", exc)
-            return
+            return ReconciliationResult(status="failed", error=exc)
         try:
             fills = await self.account_rest.fills(
                 self.maker.credentials.account_address,
                 self.metadata.symbol,
                 self.maker.credentials.account_index,
             )
+        except ArcusRateLimited as exc:
+            return self._rate_limited_reconciliation(exc)
         except Exception as exc:
             self._halt_reconciliation_failure("fills", exc)
-            return
+            return ReconciliationResult(status="failed", error=exc)
 
         # The REST fills endpoint is newest-first.  Dispatch oldest-first so
         # multiple fills recovered from a cancel/disconnect race preserve the
@@ -1402,20 +1474,36 @@ class CalibrationController:
             and self._current_context.lifecycle.state in CalibrationLifecycle.TERMINAL
         ):
             self._terminal_reconcile_pending = False
+        self._reconcile_next_allowed_mono = 0.0
+        self._reconcile_backoff_sec = RECONCILIATION_BACKOFF_INITIAL_SEC
+        return ReconciliationResult(status="success")
 
     async def shutdown(self) -> None:
+        if self._reconciliation_required_reason is not None:
+            await self.telemetry.flush()
+            return
         if self.has_live_order:
             await self.cancel_outstanding()
         deadline = time.monotonic() + 15.0
         while (
             self.has_live_order or self._terminal_reconcile_pending
         ) and time.monotonic() < deadline:
-            await self.reconcile()
+            result = await self.reconcile()
+            if result.status == "failed":
+                break
             if self.has_live_order or self._terminal_reconcile_pending:
-                await asyncio.sleep(1.0)
+                delay = result.retry_after or 1.0
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(delay, remaining))
         if self.has_live_order or self._terminal_reconcile_pending:
-            self.risk.halt("Arcus shutdown reconciliation unresolved")
-            self._record_halt()
+            self.mark_reconciliation_required(
+                "Arcus shutdown reconciliation unresolved"
+            )
+            log.warning(
+                "[ARCUS] reconciliation unresolved after bounded retries; stopping"
+            )
         await self.telemetry.flush()
 
     def _halt_reconciled(self) -> bool:
@@ -1423,7 +1511,10 @@ class CalibrationController:
         return bool(
             getattr(self.account_feed, "healthy", False)
             and not self.has_live_order
-            and not self._terminal_reconcile_pending
+            and (
+                not self._terminal_reconcile_pending
+                or self._reconciliation_required_reason is not None
+            )
         )
 
 

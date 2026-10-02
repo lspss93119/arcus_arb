@@ -14,12 +14,14 @@ from entropy_arb.arcus_execution import (
     ArcusFeeTier,
     ArcusMakerClient,
     ArcusOrderUpdate,
+    ArcusRateLimited,
     ArcusUserFill,
 )
 from entropy_arb.calibration import FillAccumulator, QuoteCandidate, SessionLimits
 from entropy_arb.calibration_runtime import (
     CalibrationController,
     HedgeExecutionResult,
+    ReconciliationResult,
 )
 from entropy_arb.storage import MarketHistoryStore
 from entropy_arb.volume_probe import (
@@ -37,6 +39,158 @@ from entropy_arb.volume_probe import (
 )
 from entropy_arb.volume_probe_runtime import VolumeProbeController
 from main import validate_runtime_gates
+
+
+def test_arcus_account_rest_exposes_429_retry_after_without_request_details() -> None:
+    class Response:
+        status = 429
+        headers = {"Retry-After": "2.5"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self):
+            raise AssertionError("429 response body must not be required")
+
+        def raise_for_status(self):
+            raise AssertionError("429 must be handled before raise_for_status")
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    async def exercise() -> None:
+        rest = ArcusAccountRest(cast(Any, Session()), rest_url="https://secret.invalid")
+        with pytest.raises(ArcusRateLimited) as caught:
+            await rest.get("/v1/fills", {"address": "secret-address"})
+        assert caught.value.retry_after == 2.5
+        assert "secret" not in str(caught.value)
+
+    asyncio.run(exercise())
+
+
+def test_arcus_account_rest_429_without_retry_after_is_explicit() -> None:
+    class Response:
+        status = 429
+        headers: dict[str, str] = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self):
+            return {}
+
+        def raise_for_status(self):
+            raise AssertionError("429 must be handled before raise_for_status")
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    async def exercise() -> None:
+        rest = ArcusAccountRest(cast(Any, Session()))
+        with pytest.raises(ArcusRateLimited) as caught:
+            await rest.get("/v1/openOrders", {})
+        assert caught.value.retry_after is None
+
+    asyncio.run(exercise())
+
+
+def test_arcus_account_rest_non_429_keeps_http_failure_behavior() -> None:
+    class Response:
+        status = 503
+        headers: dict[str, str] = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self):
+            return {}
+
+        def raise_for_status(self):
+            raise RuntimeError("http 503")
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    async def exercise() -> None:
+        rest = ArcusAccountRest(cast(Any, Session()))
+        with pytest.raises(RuntimeError, match="http 503"):
+            await rest.get("/v1/fills", {})
+
+    asyncio.run(exercise())
+
+
+def test_reconcile_rate_limit_result_keeps_pending_and_uses_bounded_backoff(
+    tmp_path, monkeypatch
+) -> None:
+    stack = _reconciliation_probe_stack(tmp_path, with_probe=False)
+    executor = stack.executor
+    executor._terminal_reconcile_pending = True
+    executor._order_contexts = {"client:pending": object()}
+    clock = [100.0]
+    monkeypatch.setattr(
+        "entropy_arb.calibration_runtime.time.monotonic", lambda: clock[0]
+    )
+
+    class RateLimitedRest:
+        def __init__(self) -> None:
+            self.open_orders_calls = 0
+            self.fills_calls = 0
+
+        async def open_orders(self, *args: Any, **kwargs: Any):
+            self.open_orders_calls += 1
+            if self.open_orders_calls < 3:
+                raise ArcusRateLimited()
+            return []
+
+        async def fills(self, *args: Any, **kwargs: Any):
+            self.fills_calls += 1
+            return []
+
+    rest = RateLimitedRest()
+    executor.account_rest = cast(ArcusAccountRest, rest)
+
+    async def exercise() -> None:
+        first = await executor.reconcile()
+        assert isinstance(first, ReconciliationResult)
+        assert first.status == "rate_limited"
+        assert first.retry_after == 1.0
+        assert executor._terminal_reconcile_pending is True
+        assert rest.open_orders_calls == 1
+        assert rest.fills_calls == 0
+        assert executor.risk.halted is False
+        assert executor.step is not None
+        assert await executor.step() is None
+        assert rest.open_orders_calls == 1
+        clock[0] += 1.0
+
+        second = await executor.reconcile()
+        assert second.status == "rate_limited"
+        assert second.retry_after == 2.0
+        assert rest.open_orders_calls == 2
+        clock[0] += 2.0
+
+        third = await executor.reconcile()
+        assert third.status == "success"
+        assert rest.open_orders_calls == 3
+        assert rest.fills_calls == 1
+        assert executor._terminal_reconcile_pending is True
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
 
 
 def _quantity(**overrides) -> Decimal:
@@ -547,6 +701,59 @@ def test_reconcile_routes_recovered_build_and_unwind_fills_once(tmp_path) -> Non
         executor.telemetry.store.close()
 
 
+def test_reconcile_fills_rate_limit_waits_before_retrying_fills(
+    tmp_path, monkeypatch
+) -> None:
+    stack = _reconciliation_probe_stack(tmp_path, with_probe=False)
+    executor = stack.executor
+    executor._terminal_reconcile_pending = True
+    executor._order_contexts = {"client:pending": object()}
+    clock = [100.0]
+    monkeypatch.setattr(
+        "entropy_arb.calibration_runtime.time.monotonic", lambda: clock[0]
+    )
+
+    class RateLimitedFillsRest:
+        def __init__(self) -> None:
+            self.open_orders_calls = 0
+            self.fills_calls = 0
+
+        async def open_orders(self, *args: Any, **kwargs: Any):
+            self.open_orders_calls += 1
+            return []
+
+        async def fills(self, *args: Any, **kwargs: Any):
+            self.fills_calls += 1
+            if self.fills_calls == 1:
+                raise ArcusRateLimited()
+            return []
+
+    rest = RateLimitedFillsRest()
+    executor.account_rest = cast(ArcusAccountRest, rest)
+
+    async def exercise() -> None:
+        first = await executor.reconcile()
+        assert first.status == "rate_limited"
+        assert rest.open_orders_calls == 1
+        assert rest.fills_calls == 1
+
+        gated = await executor.reconcile()
+        assert gated.status == "rate_limited"
+        assert rest.open_orders_calls == 1
+        assert rest.fills_calls == 1
+
+        clock[0] += 1.0
+        success = await executor.reconcile()
+        assert success.status == "success"
+        assert rest.open_orders_calls == 2
+        assert rest.fills_calls == 2
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
 def test_b0_reconcile_without_probe_observer_keeps_normal_fill_path(tmp_path) -> None:
     stack = _reconciliation_probe_stack(tmp_path, with_probe=False)
     executor = stack.executor
@@ -1009,6 +1216,205 @@ def test_reprice_cancels_and_reconciles_before_reposting_remaining() -> None:
     assert executor.cancel_calls == 1
     assert controller.metrics.build_reprices == 1
     assert [order.side for order in executor.orders] == ["SELL", "SELL", "BUY"]
+
+
+def test_persistent_terminal_429_has_one_cancel_and_finite_reconciliation(
+    monkeypatch,
+) -> None:
+    class FakeRisk:
+        halted = False
+        halt_reason = None
+
+        def halt(self, reason: str) -> None:
+            self.halted = True
+            self.halt_reason = reason
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.risk = FakeRisk()
+            self.has_live_order = True
+            self._terminal_reconcile_pending = True
+            self.cancel_calls = 0
+            self.reconcile_calls = 0
+            self.orders: list[Any] = []
+            self.hedges: list[Any] = []
+            self.reconciliation_required_calls = 0
+
+        async def cancel_outstanding(self) -> None:
+            self.cancel_calls += 1
+            self.has_live_order = False
+            self._terminal_reconcile_pending = True
+
+        async def reconcile(self) -> ReconciliationResult:
+            self.reconcile_calls += 1
+            return ReconciliationResult(status="rate_limited", retry_after=1.0)
+
+        def mark_reconciliation_required(self, reason: str) -> None:
+            self.reconciliation_required_calls += 1
+            self.risk.halt(reason)
+
+    clock = [0.0]
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "entropy_arb.volume_probe_runtime.time.monotonic", lambda: clock[0]
+    )
+
+    async def advance_sleep(delay: float) -> None:
+        delays.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr("entropy_arb.volume_probe_runtime.asyncio.sleep", advance_sleep)
+    executor = FakeExecutor()
+    controller = VolumeProbeController(
+        executor=cast(Any, executor),
+        config=ProbeConfig(clip_usd=Decimal("10"), probe_side="sell"),
+        symbol="HYPE-USD",
+    )
+
+    result = asyncio.run(controller._cancel_terminal())
+
+    assert result is False
+    assert controller.status is ProbeStatus.RECONCILIATION_REQUIRED
+    assert controller.state is ProbeState.RECONCILIATION_REQUIRED
+    assert executor.cancel_calls == 1
+    assert executor.reconcile_calls <= 5
+    assert delays[:4] == [1.0, 2.0, 4.0, 5.0]
+    assert max(delays) <= 5.0
+    assert executor.reconciliation_required_calls == 1
+    assert executor.orders == []
+    assert executor.hedges == []
+
+
+def test_final_state_rate_limit_retries_then_allows_flat_completion(
+    monkeypatch,
+) -> None:
+    controller = _probe_controller()
+    clock = [0.0]
+    monkeypatch.setattr(
+        "entropy_arb.volume_probe_runtime.time.monotonic", lambda: clock[0]
+    )
+
+    async def advance_sleep(delay: float) -> None:
+        clock[0] += delay
+
+    monkeypatch.setattr("entropy_arb.volume_probe_runtime.asyncio.sleep", advance_sleep)
+    calls = 0
+
+    async def final_state_reader():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ArcusRateLimited(2.0)
+        return Decimal("0"), Decimal("0"), [], []
+
+    final = asyncio.run(controller._read_final_state(final_state_reader))
+
+    assert final is not None
+    assert calls == 2
+    assert (
+        controller.finalize_positions(
+            arcus_position=final[0],
+            rh_position=final[1],
+            arcus_open_orders=final[2],
+            rh_open_orders=final[3],
+        )
+        is ProbeStatus.COMPLETED
+    )
+
+
+def test_persistent_final_state_429_never_completes(monkeypatch) -> None:
+    controller = _probe_controller()
+    clock = [0.0]
+    monkeypatch.setattr(
+        "entropy_arb.volume_probe_runtime.time.monotonic", lambda: clock[0]
+    )
+
+    async def advance_sleep(delay: float) -> None:
+        clock[0] += delay
+
+    monkeypatch.setattr("entropy_arb.volume_probe_runtime.asyncio.sleep", advance_sleep)
+    calls = 0
+
+    async def final_state_reader():
+        nonlocal calls
+        calls += 1
+        raise ArcusRateLimited()
+
+    final = asyncio.run(controller._read_final_state(final_state_reader))
+
+    assert final is None
+    assert calls <= 5
+    assert controller.status is ProbeStatus.RECONCILIATION_REQUIRED
+    assert controller.state is ProbeState.RECONCILIATION_REQUIRED
+
+
+def test_shutdown_skips_second_reconciliation_after_probe_failure(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(tmp_path, with_probe=False)
+    executor = stack.executor
+    executor._terminal_reconcile_pending = True
+    executor._order_contexts = {"client:pending": object()}
+
+    class NoRetryRest:
+        calls = 0
+
+        async def open_orders(self, *args: Any, **kwargs: Any):
+            self.calls += 1
+            raise AssertionError("shutdown started a duplicate reconciliation")
+
+        async def fills(self, *args: Any, **kwargs: Any):
+            self.calls += 1
+            raise AssertionError("shutdown started a duplicate reconciliation")
+
+    rest = NoRetryRest()
+    executor.account_rest = cast(ArcusAccountRest, rest)
+    executor.mark_reconciliation_required("probe terminal reconciliation deadline")
+
+    try:
+        asyncio.run(executor.shutdown())
+        assert rest.calls == 0
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_shutdown_persistent_429_uses_bounded_backoff(tmp_path, monkeypatch) -> None:
+    stack = _reconciliation_probe_stack(tmp_path, with_probe=False)
+    executor = stack.executor
+    executor._terminal_reconcile_pending = True
+    executor._order_contexts = {"client:pending": object()}
+    clock = [0.0]
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "entropy_arb.calibration_runtime.time.monotonic", lambda: clock[0]
+    )
+
+    async def advance_sleep(delay: float) -> None:
+        delays.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr("entropy_arb.calibration_runtime.asyncio.sleep", advance_sleep)
+
+    class Persistent429Rest:
+        calls = 0
+
+        async def open_orders(self, *args: Any, **kwargs: Any):
+            self.calls += 1
+            raise ArcusRateLimited()
+
+        async def fills(self, *args: Any, **kwargs: Any):
+            self.calls += 1
+            raise ArcusRateLimited()
+
+    rest = Persistent429Rest()
+    executor.account_rest = cast(ArcusAccountRest, rest)
+
+    try:
+        asyncio.run(executor.shutdown())
+        assert rest.calls <= 5
+        assert delays[:4] == [1.0, 2.0, 4.0, 5.0]
+        assert max(delays) <= 5.0
+        assert executor.reconciliation_required is True
+    finally:
+        executor.telemetry.store.close()
 
 
 def test_terminal_reconcile_barrier_precedes_unwind() -> None:

@@ -13,10 +13,12 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import aiohttp
@@ -65,6 +67,14 @@ class ArcusAloWouldCross(ArcusOrderError):
     """Raised locally when an ALO quote would remove liquidity."""
 
 
+class ArcusRateLimited(RuntimeError):
+    """Raised when an Arcus REST request is temporarily rate limited."""
+
+    def __init__(self, retry_after: float | None = None) -> None:
+        self.retry_after = retry_after
+        super().__init__("Arcus REST request rate limited (HTTP 429)")
+
+
 def _decimal(value: Any, field: str, *, allow_none: bool = False) -> Decimal | None:
     if value is None and allow_none:
         return None
@@ -81,6 +91,21 @@ def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _retry_after_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        try:
+            delay = parsedate_to_datetime(str(value)).timestamp() - time.time()
+        except (IndexError, TypeError, ValueError, OverflowError):
+            return None
+    if not math.isfinite(delay) or delay < 0:
+        return None
+    return delay
 
 
 def _integer(
@@ -1061,6 +1086,10 @@ class ArcusAccountRest:
             params=dict(params),
             timeout=aiohttp.ClientTimeout(total=REST_TIMEOUT),
         ) as response:
+            if response.status == 429:
+                raise ArcusRateLimited(
+                    _retry_after_seconds(response.headers.get("Retry-After"))
+                )
             response.raise_for_status()
             payload = await response.json()
         if not isinstance(payload, Mapping):

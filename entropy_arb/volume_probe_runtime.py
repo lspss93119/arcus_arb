@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import math
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -17,8 +19,14 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from .arcus_execution import ArcusRateLimited
 from .calibration import QuoteCandidate
-from .calibration_runtime import CalibrationController, HedgeExecutionResult
+from .calibration_runtime import (
+    RECONCILIATION_BACKOFF_CAP_SEC,
+    RECONCILIATION_BACKOFF_INITIAL_SEC,
+    CalibrationController,
+    HedgeExecutionResult,
+)
 from .volume_probe import (
     ProbeCandidate,
     ProbeConfig,
@@ -34,6 +42,11 @@ from .volume_probe import (
 
 def _now_text() -> str:
     return datetime.now(UTC).isoformat()
+
+
+log = logging.getLogger("volume-probe")
+RECONCILIATION_DEADLINE_SEC = 15.0
+RECONCILIATION_POLL_SEC = 1.0
 
 
 def _decimal(value: Any, field: str) -> Decimal:
@@ -132,6 +145,7 @@ class VolumeProbeController:
         self.unwind_target_qty: Decimal | None = None
         self.unwind_base_qty = Decimal("0")
         self._order_placed_mono: float | None = None
+        self._terminal_cancel_requested = False
         self._round_started_mono = time.monotonic()
         self._phase_started_mono: dict[str, float] = {}
         self._phase_completed_mono: dict[str, float] = {}
@@ -442,6 +456,7 @@ class VolumeProbeController:
         if phase.first_quote_at is None:
             phase.first_quote_at = _now_text()
         await self.executor.place_quote(candidate)
+        self._terminal_cancel_requested = False
         self._order_placed_mono = time.monotonic()
 
     @staticmethod
@@ -598,18 +613,136 @@ class VolumeProbeController:
     async def on_connect(self) -> None:
         await self.executor.on_connect()
 
-    async def _cancel_terminal(self) -> bool:
-        await self.executor.cancel_outstanding()
-        deadline = time.monotonic() + min(self.config.reprice_sec, 15.0)
+    def _require_reconciliation(self, reason: str) -> None:
+        if self.status is ProbeStatus.RECONCILIATION_REQUIRED:
+            return
+        self._failure_reason = self._failure_reason or reason
+        marker = getattr(self.executor, "mark_reconciliation_required", None)
+        if callable(marker):
+            marker(reason)
+        self.machine.state = ProbeState.RECONCILIATION_REQUIRED
+        self._status = ProbeStatus.RECONCILIATION_REQUIRED
+        log.warning("[ARCUS] reconciliation required: %s", reason)
+
+    @staticmethod
+    def _bounded_retry_delay(retry_after: Any, backoff: float) -> float:
+        try:
+            requested = float(retry_after)
+        except (TypeError, ValueError):
+            requested = math.nan
+        if not math.isfinite(requested):
+            return min(
+                RECONCILIATION_BACKOFF_CAP_SEC,
+                max(RECONCILIATION_BACKOFF_INITIAL_SEC, backoff),
+            )
+        return max(RECONCILIATION_BACKOFF_INITIAL_SEC, backoff, requested)
+
+    async def _reconcile_terminal(self, deadline: float) -> bool:
+        backoff = RECONCILIATION_BACKOFF_INITIAL_SEC
         while not self.reprice_allowed:
-            await self.executor.reconcile()
+            if time.monotonic() >= deadline:
+                self._require_reconciliation(
+                    "Arcus order terminal reconciliation deadline expired"
+                )
+                return False
+            status: str | None = None
+            retry_after: Any = None
+            error: Exception | None = None
+            try:
+                result = await self.executor.reconcile()
+            except ArcusRateLimited as exc:
+                status = "rate_limited"
+                retry_after = exc.retry_after
+                error = exc
+            except Exception as exc:
+                self._require_reconciliation(
+                    f"Arcus terminal reconciliation failed ({type(exc).__name__})"
+                )
+                return False
+            else:
+                status = getattr(result, "status", None)
+                retry_after = getattr(result, "retry_after", None)
+                error = getattr(result, "error", None)
+
             if self.reprice_allowed:
                 return True
-            if time.monotonic() >= deadline:
-                self._halt("Arcus order terminal reconciliation unresolved")
+            if status == "failed":
+                reason = (
+                    f"Arcus terminal reconciliation failed ({type(error).__name__})"
+                    if error is not None
+                    else "Arcus terminal reconciliation failed"
+                )
+                self._require_reconciliation(reason)
                 return False
-            await asyncio.sleep(0.05)
+            now = time.monotonic()
+            if now >= deadline:
+                self._require_reconciliation(
+                    "Arcus order terminal reconciliation deadline expired"
+                )
+                return False
+            if status == "rate_limited":
+                delay = self._bounded_retry_delay(retry_after, backoff)
+                backoff = min(RECONCILIATION_BACKOFF_CAP_SEC, backoff * 2.0)
+            else:
+                delay = RECONCILIATION_POLL_SEC
+                backoff = RECONCILIATION_BACKOFF_INITIAL_SEC
+            remaining = deadline - now
+            await asyncio.sleep(min(delay, remaining))
         return True
+
+    async def _cancel_terminal(self) -> bool:
+        if self.reprice_allowed:
+            return True
+        if (
+            getattr(self.executor, "has_live_order", False)
+            and not self._terminal_cancel_requested
+        ):
+            try:
+                await self.executor.cancel_outstanding()
+            except Exception as exc:
+                self._require_reconciliation(
+                    f"Arcus cancel failed ({type(exc).__name__})"
+                )
+                return False
+            self._terminal_cancel_requested = True
+        deadline = time.monotonic() + RECONCILIATION_DEADLINE_SEC
+        return await self._reconcile_terminal(deadline)
+
+    async def _read_final_state(
+        self,
+        reader: Callable[
+            [], Awaitable[tuple[Decimal, Decimal, list[Any], list[Mapping[str, Any]]]]
+        ],
+    ) -> tuple[Decimal, Decimal, list[Any], list[Mapping[str, Any]]] | None:
+        deadline = time.monotonic() + RECONCILIATION_DEADLINE_SEC
+        backoff = RECONCILIATION_BACKOFF_INITIAL_SEC
+        while True:
+            if time.monotonic() >= deadline:
+                self._require_reconciliation(
+                    "final reconciliation deadline expired; state is unknown"
+                )
+                return None
+            try:
+                return await reader()
+            except ArcusRateLimited as exc:
+                delay = self._bounded_retry_delay(exc.retry_after, backoff)
+                backoff = min(RECONCILIATION_BACKOFF_CAP_SEC, backoff * 2.0)
+                log.warning(
+                    "[ARCUS] reconciliation rate limited; retry in %.1fs", delay
+                )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._require_reconciliation(
+                        "final reconciliation deadline expired; state is unknown"
+                    )
+                    return None
+                await asyncio.sleep(min(delay, remaining))
+            except Exception as exc:
+                log.exception("final reconciliation failed")
+                self._require_reconciliation(
+                    f"final reconciliation failed ({type(exc).__name__})"
+                )
+                return None
 
     def _sync_metrics(self) -> None:
         build = self._phase_metrics["build"]
@@ -670,27 +803,10 @@ class VolumeProbeController:
             await self.place_next_quote()
             while not stop.is_set():
                 if getattr(self.executor, "_terminal_reconcile_pending", False):
-                    try:
-                        await self.executor.reconcile()
-                    except Exception as exc:
-                        reason = f"Arcus terminal reconciliation failed: {exc}"
-                        halt = getattr(self.executor.risk, "halt", None)
-                        if callable(halt):
-                            halt(reason)
-                        self._failure_reason = reason
-                        self.machine.state = ProbeState.RECONCILIATION_REQUIRED
-                        self._status = ProbeStatus.RECONCILIATION_REQUIRED
+                    if not await self._reconcile_terminal(
+                        time.monotonic() + RECONCILIATION_DEADLINE_SEC
+                    ):
                         break
-                    if getattr(
-                        self.executor, "_terminal_reconcile_pending", False
-                    ) and not getattr(self.executor.risk, "halted", False):
-                        self.executor.risk.check_runtime()
-                        if not getattr(self.executor.risk, "halted", False):
-                            try:
-                                await asyncio.wait_for(stop.wait(), timeout=0.05)
-                            except TimeoutError:
-                                pass
-                            continue
                 self.executor.risk.check_runtime()
                 if getattr(self.executor.risk, "halted", False):
                     reason = str(
@@ -698,19 +814,15 @@ class VolumeProbeController:
                         or "executor halted"
                     )
                     self._halt(reason)
-                    await self._cancel_terminal()
-                    try:
-                        final = await final_state_reader()
-                        self.finalize_positions(
-                            arcus_position=final[0],
-                            rh_position=final[1],
-                            arcus_open_orders=final[2],
-                            rh_open_orders=final[3],
-                        )
-                    except Exception as exc:
-                        self._failure_reason = f"final reconciliation failed: {exc}"
-                        self.machine.state = ProbeState.RECONCILIATION_REQUIRED
-                        self._status = ProbeStatus.RECONCILIATION_REQUIRED
+                    if await self._cancel_terminal():
+                        final = await self._read_final_state(final_state_reader)
+                        if final is not None:
+                            self.finalize_positions(
+                                arcus_position=final[0],
+                                rh_position=final[1],
+                                arcus_open_orders=final[2],
+                                rh_open_orders=final[3],
+                            )
                     break
                 health = self.executor.market_health()
                 if not health.can_quote:
@@ -728,13 +840,14 @@ class VolumeProbeController:
                         self.phase_target_qty or 0
                     ):
                         self.finish_unwind()
-                        final = await final_state_reader()
-                        self.finalize_positions(
-                            arcus_position=final[0],
-                            rh_position=final[1],
-                            arcus_open_orders=final[2],
-                            rh_open_orders=final[3],
-                        )
+                        final = await self._read_final_state(final_state_reader)
+                        if final is not None:
+                            self.finalize_positions(
+                                arcus_position=final[0],
+                                rh_position=final[1],
+                                arcus_open_orders=final[2],
+                                rh_open_orders=final[3],
+                            )
                         break
                     if self.reprice_allowed:
                         await self.place_next_quote()
@@ -749,10 +862,9 @@ class VolumeProbeController:
                         and time.monotonic() - self._order_placed_mono
                         >= self.config.reprice_sec
                     ):
-                        if await self._cancel_terminal() and self.state in (
-                            ProbeState.BUILD,
-                            ProbeState.UNWIND,
-                        ):
+                        if not await self._cancel_terminal():
+                            break
+                        if self.state in (ProbeState.BUILD, ProbeState.UNWIND):
                             self.record_reprice()
                             await self.place_next_quote()
                 try:
