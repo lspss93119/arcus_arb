@@ -66,6 +66,7 @@ from .volume_probe import (
     ProbeStatus,
     VolumeProbeRoundWriter,
     compute_probe_quantity,
+    probe_tolerance,
 )
 from .volume_probe_runtime import VolumeProbeController
 
@@ -732,6 +733,7 @@ class Engine:
                 allow_first_order=True,
                 staleness_sec=cfg.staleness_sec,
                 rh_fee_bps=rh_fee_bps,
+                session_id=probe_session_id,
                 session_limits=limits,
                 client_prefix="vp-",
             )
@@ -747,7 +749,9 @@ class Engine:
                 symbol=metadata.symbol,
                 session_id=probe_session_id,
                 writer=writer,
-                tolerance=min(Decimal(metadata.step_size), rh_step),
+                tolerance=probe_tolerance(
+                    arcus_step=Decimal(metadata.step_size), rh_step=rh_step
+                ),
             )
             self.calibration = executor
             self.volume_probe_controller = controller

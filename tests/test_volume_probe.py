@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import pytest
 
+from entropy_arb.calibration import FillAccumulator
 from entropy_arb.calibration_runtime import HedgeExecutionResult
 from entropy_arb.volume_probe import (
     ProbeConfig,
@@ -18,6 +19,7 @@ from entropy_arb.volume_probe import (
     VolumeProbeRoundWriter,
     build_probe_candidate,
     compute_probe_quantity,
+    probe_tolerance,
     unwind_side,
 )
 from entropy_arb.volume_probe_runtime import VolumeProbeController
@@ -184,6 +186,52 @@ def _probe_controller(*, side: str = "sell") -> VolumeProbeController:
     )
 
 
+def _real_accumulator_controller(
+    *, side: str = "sell", tolerance: Decimal = Decimal("0")
+) -> VolumeProbeController:
+    class FakeRisk:
+        halted = False
+        halt_reason = None
+        fill_events = 0
+
+    executor = SimpleNamespace(
+        risk=FakeRisk(),
+        accumulator=FillAccumulator(
+            rh_min_qty=Decimal("0.01"), rh_step=Decimal("0.01")
+        ),
+        has_live_order=False,
+        _terminal_reconcile_pending=False,
+    )
+    return VolumeProbeController(
+        executor=cast(Any, executor),
+        config=ProbeConfig(clip_usd=Decimal("10"), probe_side=side),
+        symbol="HYPE-USD",
+        tolerance=tolerance,
+    )
+
+
+def test_volume_probe_session_id_matches_executor() -> None:
+    seed = _real_accumulator_controller()
+    executor = cast(Any, seed.executor)
+    executor.session_id = "vp-shared"
+
+    matched = VolumeProbeController(
+        executor=executor,
+        config=ProbeConfig(clip_usd=Decimal("10"), probe_side="sell"),
+        symbol="HYPE-USD",
+        session_id="vp-shared",
+    )
+    assert matched.session_id == executor.session_id == matched.metrics.session_id
+
+    with pytest.raises(ValueError, match="session IDs must match"):
+        VolumeProbeController(
+            executor=executor,
+            config=ProbeConfig(clip_usd=Decimal("10"), probe_side="sell"),
+            symbol="HYPE-USD",
+            session_id="vp-other",
+        )
+
+
 def _hedge(*, side: str, qty: str) -> HedgeExecutionResult:
     return HedgeExecutionResult(
         hedge_side=side,
@@ -223,6 +271,106 @@ def test_partial_build_fill_is_hedged_then_unwind_reverses_actual_qty() -> None:
     assert candidate.arcus_side == "BUY"
     assert candidate.hedge_side == "SELL"
     assert candidate.quantity == Decimal("0.1")
+
+
+def test_real_fill_accumulator_resets_before_opposite_unwind_fill() -> None:
+    controller = _real_accumulator_controller()
+    controller.begin_build(Decimal("0.1"))
+    build_instruction = controller.executor.accumulator.add_fill(
+        side="SELL", quantity=Decimal("0.1")
+    )
+    assert build_instruction is not None
+    controller.record_hedged_fill(
+        arcus_side="SELL",
+        arcus_price=Decimal("100"),
+        arcus_quantity=Decimal("0.1"),
+        arcus_fee=Decimal("0.01"),
+        hedge=_hedge(side="BUY", qty="0.1"),
+    )
+    assert controller.executor.accumulator.side == "SELL"
+    assert controller.executor.accumulator.residual_exposure == Decimal("0")
+
+    controller.begin_unwind()
+
+    assert controller.executor.accumulator.side is None
+    unwind_instruction = controller.executor.accumulator.add_fill(
+        side="BUY", quantity=Decimal("0.1")
+    )
+    assert unwind_instruction is not None
+    controller.record_hedged_fill(
+        arcus_side="BUY",
+        arcus_price=Decimal("100"),
+        arcus_quantity=Decimal("0.1"),
+        arcus_fee=Decimal("0.01"),
+        hedge=_hedge(side="SELL", qty="0.1"),
+    )
+    assert controller.unwind_base_qty == Decimal("0.1")
+
+
+def test_nonzero_accumulator_residual_blocks_unwind() -> None:
+    controller = _real_accumulator_controller()
+    controller.begin_build(Decimal("0.1"))
+    controller.record_hedged_fill(
+        arcus_side="SELL",
+        arcus_price=Decimal("100"),
+        arcus_quantity=Decimal("0.1"),
+        arcus_fee=Decimal("0.01"),
+        hedge=_hedge(side="BUY", qty="0.1"),
+    )
+    controller.executor.accumulator.unhedged_qty = Decimal("0.001")
+
+    with pytest.raises(RuntimeError, match="residual"):
+        controller.begin_unwind()
+
+    assert controller.state is ProbeState.HALTED
+
+
+def test_one_full_step_short_does_not_complete_build() -> None:
+    controller = _real_accumulator_controller(
+        tolerance=probe_tolerance(arcus_step=Decimal("0.01"), rh_step=Decimal("0.01"))
+    )
+    controller.begin_build(Decimal("0.1"))
+    controller.record_hedged_fill(
+        arcus_side="SELL",
+        arcus_price=Decimal("100"),
+        arcus_quantity=Decimal("0.09"),
+        arcus_fee=Decimal("0.01"),
+        hedge=_hedge(side="BUY", qty="0.09"),
+    )
+    assert controller.state is ProbeState.BUILD
+
+
+def test_one_full_step_final_residual_is_not_completed() -> None:
+    controller = _real_accumulator_controller(
+        tolerance=probe_tolerance(arcus_step=Decimal("0.01"), rh_step=Decimal("0.01"))
+    )
+    controller.begin_build(Decimal("0.1"))
+    controller.record_hedged_fill(
+        arcus_side="SELL",
+        arcus_price=Decimal("100"),
+        arcus_quantity=Decimal("0.1"),
+        arcus_fee=Decimal("0.01"),
+        hedge=_hedge(side="BUY", qty="0.1"),
+    )
+    controller.begin_unwind()
+    controller.record_hedged_fill(
+        arcus_side="BUY",
+        arcus_price=Decimal("100"),
+        arcus_quantity=Decimal("0.1"),
+        arcus_fee=Decimal("0.01"),
+        hedge=_hedge(side="SELL", qty="0.1"),
+    )
+    controller.finish_unwind()
+
+    assert (
+        controller.finalize_positions(
+            arcus_position=Decimal("0.01"),
+            rh_position=Decimal("-0.01"),
+            arcus_open_orders=(),
+            rh_open_orders=(),
+        )
+        is ProbeStatus.RECONCILIATION_REQUIRED
+    )
 
 
 def test_unresolved_hedge_halts_without_advancing_to_unwind() -> None:
@@ -516,6 +664,103 @@ def test_reprice_cancels_and_reconciles_before_reposting_remaining() -> None:
     assert executor.cancel_calls == 1
     assert controller.metrics.build_reprices == 1
     assert [order.side for order in executor.orders] == ["SELL", "SELL", "BUY"]
+
+
+def test_terminal_reconcile_barrier_precedes_unwind() -> None:
+    class FakeBook:
+        def best_bid(self) -> Decimal:
+            return Decimal("99.90")
+
+        def best_ask(self) -> Decimal:
+            return Decimal("100.10")
+
+    class FakeRisk:
+        def __init__(self) -> None:
+            self.halted = False
+            self.halt_reason: str | None = None
+            self.fill_events = 0
+            self.checks = 0
+
+        def check_runtime(self) -> None:
+            self.checks += 1
+            if self.checks >= 4:
+                self.halted = True
+                self.halt_reason = "test runtime timeout"
+
+        def halt(self, reason: str) -> None:
+            self.halted = True
+            self.halt_reason = reason
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.risk = FakeRisk()
+            self.accumulator = FillAccumulator(
+                rh_min_qty=Decimal("0.01"), rh_step=Decimal("0.01")
+            )
+            self.arcus = SimpleNamespace(book=FakeBook())
+            self.hedge = SimpleNamespace(book=FakeBook())
+            self.pnl = SimpleNamespace(actual_usd=Decimal("0"))
+            self.has_live_order = False
+            self._terminal_reconcile_pending = False
+            self.orders: list[Any] = []
+            self.reconcile_calls = 0
+            self.controller: VolumeProbeController | None = None
+
+        def market_health(self):
+            return SimpleNamespace(can_quote=True)
+
+        async def place_quote(self, candidate) -> None:
+            assert not self.has_live_order
+            self.has_live_order = True
+            self.orders.append(candidate)
+            assert self.controller is not None
+            instruction = self.accumulator.add_fill(
+                side=candidate.side, quantity=candidate.quantity
+            )
+            assert instruction is not None
+            self.controller.record_hedged_fill(
+                arcus_side=candidate.side,
+                arcus_price=candidate.price,
+                arcus_quantity=candidate.quantity,
+                arcus_fee=Decimal("0.01"),
+                hedge=_hedge(
+                    side=candidate.hedge_side,
+                    qty=str(candidate.quantity),
+                ),
+            )
+            self.has_live_order = False
+            self._terminal_reconcile_pending = True
+
+        async def cancel_outstanding(self) -> None:
+            self.has_live_order = False
+
+        async def reconcile(self) -> None:
+            self.reconcile_calls += 1
+            self._terminal_reconcile_pending = False
+
+    executor = FakeExecutor()
+    controller = VolumeProbeController(
+        executor=cast(Any, executor),
+        config=ProbeConfig(clip_usd=Decimal("10"), probe_side="sell"),
+        symbol="HYPE-USD",
+        tolerance=probe_tolerance(arcus_step=Decimal("0.01"), rh_step=Decimal("0.01")),
+    )
+    executor.controller = controller
+
+    async def final_state_reader():
+        return Decimal("0"), Decimal("0"), [], []
+
+    status = asyncio.run(
+        controller.run(
+            asyncio.Event(),
+            quantity=Decimal("0.1"),
+            final_state_reader=final_state_reader,
+        )
+    )
+
+    assert status is ProbeStatus.COMPLETED
+    assert executor.reconcile_calls >= 2
+    assert [order.side for order in executor.orders] == ["SELL", "BUY"]
 
 
 def test_volume_probe_runtime_gates_are_independent_from_b0() -> None:

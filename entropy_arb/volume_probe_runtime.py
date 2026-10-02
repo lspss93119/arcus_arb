@@ -110,6 +110,12 @@ class VolumeProbeController:
         self.executor = executor
         self.config = config
         self.symbol = symbol
+        executor_session_id = getattr(executor, "session_id", None)
+        if session_id is not None and executor_session_id is not None:
+            if session_id != executor_session_id:
+                raise ValueError("volume probe and calibration session IDs must match")
+        elif session_id is None and executor_session_id is not None:
+            session_id = str(executor_session_id)
         self.session_id = session_id or f"vp-{uuid.uuid4().hex[:12]}"
         self.writer = writer
         self._metrics_written = False
@@ -208,6 +214,22 @@ class VolumeProbeController:
             raise RuntimeError("cannot begin unwind before BUILD is fully hedged")
         if self.build_base_qty <= self.tolerance:
             raise RuntimeError("cannot unwind a zero build quantity")
+        accumulator = getattr(self.executor, "accumulator", None)
+        residual = _decimal(
+            getattr(accumulator, "residual_exposure", 0),
+            "FillAccumulator residual",
+        )
+        if residual != 0:
+            reason = "cannot begin unwind with nonzero FillAccumulator residual"
+            self._halt(reason)
+            raise RuntimeError(f"volume probe halted: {reason}")
+        reset_if_flat = getattr(accumulator, "reset_if_flat", None)
+        if callable(reset_if_flat):
+            reset_if_flat()
+        if hasattr(accumulator, "side") and getattr(accumulator, "side") is not None:
+            reason = "FillAccumulator side was not cleared before unwind"
+            self._halt(reason)
+            raise RuntimeError(f"volume probe halted: {reason}")
         self.machine.transition(ProbeState.UNWIND)
         self.phase = "unwind"
         self.phase_target_qty = self.build_base_qty
@@ -594,6 +616,28 @@ class VolumeProbeController:
                 raise RuntimeError("volume probe is not ready to start BUILD")
             await self.place_next_quote()
             while not stop.is_set():
+                if getattr(self.executor, "_terminal_reconcile_pending", False):
+                    try:
+                        await self.executor.reconcile()
+                    except Exception as exc:
+                        reason = f"Arcus terminal reconciliation failed: {exc}"
+                        halt = getattr(self.executor.risk, "halt", None)
+                        if callable(halt):
+                            halt(reason)
+                        self._failure_reason = reason
+                        self.machine.state = ProbeState.RECONCILIATION_REQUIRED
+                        self._status = ProbeStatus.RECONCILIATION_REQUIRED
+                        break
+                    if getattr(
+                        self.executor, "_terminal_reconcile_pending", False
+                    ) and not getattr(self.executor.risk, "halted", False):
+                        self.executor.risk.check_runtime()
+                        if not getattr(self.executor.risk, "halted", False):
+                            try:
+                                await asyncio.wait_for(stop.wait(), timeout=0.05)
+                            except TimeoutError:
+                                pass
+                            continue
                 self.executor.risk.check_runtime()
                 if getattr(self.executor.risk, "halted", False):
                     reason = str(

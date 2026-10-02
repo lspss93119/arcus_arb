@@ -202,6 +202,16 @@ def compute_probe_quantity(
     return quantity
 
 
+def probe_tolerance(*, arcus_step: Decimal, rh_step: Decimal) -> Decimal:
+    """Return a strict sub-step tolerance for completion and flatness gates."""
+
+    arcus = _decimal(arcus_step, "arcus_step")
+    rh = _decimal(rh_step, "rh_step")
+    if arcus <= 0 or rh <= 0:
+        raise ValueError("venue step sizes must be > 0")
+    return min(arcus, rh) / Decimal("2")
+
+
 def alo_would_cross(
     *, side: str, price: Decimal, best_bid: Decimal, best_ask: Decimal
 ) -> bool:
