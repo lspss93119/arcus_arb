@@ -65,6 +65,7 @@ from .volume_probe import (
     ProbeRoundMetrics,
     ProbeStatus,
     VolumeProbeRoundWriter,
+    common_executable_step,
     compute_probe_quantity,
     probe_tolerance,
 )
@@ -677,20 +678,35 @@ class Engine:
                 raise RuntimeError(
                     "fresh Arcus BBO is unavailable; aborting volume probe"
                 )
+            rh_bid_value = self.hedge.book.best_bid()
+            rh_ask_value = self.hedge.book.best_ask()
+            if (
+                rh_bid_value is None
+                or rh_ask_value is None
+                or not self.hedge.book.is_fresh(cfg.staleness_sec)
+            ):
+                raise RuntimeError("fresh RH BBO is unavailable; aborting volume probe")
             arcus_bid = Decimal(str(bid))
             arcus_ask = Decimal(str(ask))
+            rh_bid = Decimal(str(rh_bid_value))
+            rh_ask = Decimal(str(rh_ask_value))
             rh_step = Decimal(1).scaleb(-int(self.hedge.size_decimals))
             rh_min = max(
                 RH_HEDGE_MIN_QTY,
                 rh_step,
                 Decimal(str(self.hedge.min_base)),
             )
+            arcus_step = Decimal(metadata.step_size)
+            common_step = common_executable_step(
+                arcus_step=arcus_step,
+                rh_step=rh_step,
+            )
             quantity = compute_probe_quantity(
                 clip_usd=Decimal(str(self.probe_clip_usd)),
                 arcus_bid=arcus_bid,
                 arcus_ask=arcus_ask,
                 probe_side=self.probe_side,
-                arcus_step=Decimal(metadata.step_size),
+                arcus_step=arcus_step,
                 arcus_min_size=(
                     Decimal(metadata.min_order_size)
                     if metadata.min_order_size is not None
@@ -708,6 +724,23 @@ class Engine:
                 ),
                 rh_step=rh_step,
                 rh_min_size=rh_min,
+                rh_bid=rh_bid,
+                rh_ask=rh_ask,
+                rh_min_quote=Decimal(str(self.hedge.min_quote)),
+            )
+            probe_side = str(self.probe_side).upper()
+            arcus_order_price = arcus_bid if probe_side == "BUY" else arcus_ask
+            rh_reference_price = rh_bid if probe_side == "BUY" else rh_ask
+            log.info(
+                "[volume-probe sizing] requested_clip_usd=%s "
+                "common_qty_step=%s probe_qty=%s arcus_order_notional=%s "
+                "rh_hedge_reference_notional=%s rh_hedge_reference_price=%s",
+                Decimal(str(self.probe_clip_usd)),
+                common_step,
+                quantity,
+                quantity * arcus_order_price,
+                quantity * rh_reference_price,
+                rh_reference_price,
             )
             limits = SessionLimits(
                 max_filled_notional_usd=max(

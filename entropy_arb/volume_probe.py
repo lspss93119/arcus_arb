@@ -11,6 +11,7 @@ import csv
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal
 from enum import Enum, StrEnum
+from math import lcm
 from pathlib import Path
 from typing import Any
 
@@ -129,6 +130,39 @@ def _side(value: str) -> str:
     return normalized
 
 
+def common_executable_step(*, arcus_step: Decimal, rh_step: Decimal) -> Decimal:
+    """Return the smallest positive decimal step shared by both venues.
+
+    Finite Decimal steps are converted to integer multiples of their smallest
+    shared power-of-ten unit.  The least common multiple of those integers is
+    therefore the smallest quantity that is aligned to both venue grids.
+    """
+
+    arcus = _decimal(arcus_step, "arcus_step")
+    rh = _decimal(rh_step, "rh_step")
+    if arcus <= 0 or rh <= 0:
+        raise ValueError("venue step sizes must be > 0")
+
+    arcus_tuple = arcus.as_tuple()
+    rh_tuple = rh.as_tuple()
+    arcus_exponent = arcus_tuple.exponent
+    rh_exponent = rh_tuple.exponent
+    if not isinstance(arcus_exponent, int) or not isinstance(rh_exponent, int):
+        raise ValueError("venue step sizes must be finite decimals")
+    unit_exponent = min(0, arcus_exponent, rh_exponent)
+
+    def integer_units(value: Decimal) -> int:
+        value_tuple = value.as_tuple()
+        value_exponent = value_tuple.exponent
+        if not isinstance(value_exponent, int):
+            raise ValueError("venue step sizes must be finite decimals")
+        coefficient = int("".join(str(digit) for digit in value_tuple.digits) or "0")
+        return coefficient * 10 ** (value_exponent - unit_exponent)
+
+    common_units = lcm(integer_units(arcus), integer_units(rh))
+    return Decimal(common_units).scaleb(unit_exponent)
+
+
 def compute_probe_quantity(
     *,
     clip_usd: Decimal,
@@ -141,12 +175,15 @@ def compute_probe_quantity(
     arcus_min_notional: Decimal | None,
     rh_step: Decimal,
     rh_min_size: Decimal | None,
+    rh_bid: Decimal | None = None,
+    rh_ask: Decimal | None = None,
+    rh_min_quote: Decimal | None = None,
 ) -> Decimal:
     """Compute one executable quantity from a fresh two-sided BBO.
 
     The requested notional is converted using the Arcus mid and rounded down
-    on the Arcus grid.  RH's grid/minimum are validation gates rather than a
-    second rounding boundary, so an incompatible quantity fails closed.
+    on the smallest grid shared by Arcus and RH.  Venue size and notional
+    minimums remain fail-closed validation gates.
     """
 
     clip = _decimal(clip_usd, "probe_clip_usd")
@@ -164,7 +201,10 @@ def compute_probe_quantity(
 
     mid = (bid + ask) / Decimal("2")
     raw_qty = clip / mid
-    quantity = (raw_qty / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    common_step = common_executable_step(arcus_step=step, rh_step=rh_grid)
+    quantity = (raw_qty / common_step).to_integral_value(
+        rounding=ROUND_FLOOR
+    ) * common_step
     if quantity <= 0:
         raise ValueError("probe quantity rounds to zero")
     minimum = (
@@ -199,6 +239,23 @@ def compute_probe_quantity(
         raise ValueError("probe quantity is below RH minimum quantity")
     if quantity % rh_grid != 0:
         raise ValueError("probe quantity is not aligned to RH step")
+
+    if rh_min_quote is not None:
+        rh_quote_minimum = _decimal(rh_min_quote, "RH minimum quote notional")
+        if rh_quote_minimum < 0:
+            raise ValueError("RH minimum quote notional must be >= 0")
+        if rh_bid is None or rh_ask is None:
+            raise ValueError("RH BBO is required to validate RH minimum quote notional")
+        hedge_bid = _decimal(rh_bid, "rh_bid")
+        hedge_ask = _decimal(rh_ask, "rh_ask")
+        if hedge_bid <= 0 or hedge_ask <= 0 or hedge_ask < hedge_bid:
+            raise ValueError("RH BBO must be positive and ordered")
+        hedge_reference = hedge_ask if side == "SELL" else hedge_bid
+        if quantity * hedge_reference < rh_quote_minimum:
+            raise ValueError(
+                "probe clip rounds below RH minimum quote notional; "
+                "increase --probe-clip-usd"
+            )
     return quantity
 
 

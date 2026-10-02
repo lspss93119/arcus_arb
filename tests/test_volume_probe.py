@@ -30,6 +30,7 @@ from entropy_arb.volume_probe import (
     ProbeStatus,
     VolumeProbeRoundWriter,
     build_probe_candidate,
+    common_executable_step,
     compute_probe_quantity,
     probe_tolerance,
     unwind_side,
@@ -67,7 +68,7 @@ def test_clip_usd_rounds_down_from_arcus_mid_by_arcus_step() -> None:
         ({"arcus_max_size": Decimal("0.05")}, "max"),
         ({"arcus_min_notional": Decimal("20")}, "notional"),
         ({"rh_min_size": Decimal("0.2")}, "RH minimum"),
-        ({"rh_step": Decimal("0.01")}, "RH step"),
+        ({"rh_step": Decimal("0")}, "step sizes"),
     ],
 )
 def test_quantity_validation_rejects_unhedgeable_or_out_of_bounds_clip(
@@ -75,6 +76,74 @@ def test_quantity_validation_rejects_unhedgeable_or_out_of_bounds_clip(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _quantity(**overrides)
+
+
+@pytest.mark.parametrize(
+    "arcus_step, rh_step, expected",
+    [
+        (Decimal("0.000001"), Decimal("0.001"), Decimal("0.001")),
+        (Decimal("0.01"), Decimal("0.001"), Decimal("0.01")),
+        (Decimal("0.002"), Decimal("0.003"), Decimal("0.006")),
+    ],
+)
+def test_common_executable_step_is_the_smallest_shared_decimal_grid(
+    arcus_step: Decimal, rh_step: Decimal, expected: Decimal
+) -> None:
+    assert common_executable_step(arcus_step=arcus_step, rh_step=rh_step) == expected
+
+
+def test_quantity_rounds_down_to_common_grid_and_stays_below_raw_quantity() -> None:
+    quantity = _quantity(
+        clip_usd=Decimal("18.7643"),
+        arcus_bid=Decimal("99.90"),
+        arcus_ask=Decimal("100.10"),
+        arcus_step=Decimal("0.000001"),
+        arcus_min_size=Decimal("0.001"),
+        rh_step=Decimal("0.001"),
+        rh_min_size=Decimal("0.1"),
+    )
+    raw_quantity = Decimal("18.7643") / Decimal("100")
+    assert quantity == Decimal("0.187")
+    assert quantity <= raw_quantity
+    assert quantity % Decimal("0.000001") == 0
+    assert quantity % Decimal("0.001") == 0
+
+
+def test_rh_buy_min_quote_uses_conservative_best_ask() -> None:
+    with pytest.raises(
+        ValueError,
+        match="probe clip rounds below RH minimum quote notional; increase --probe-clip-usd",
+    ):
+        _quantity(
+            clip_usd=Decimal("9.99"),
+            rh_bid=Decimal("99"),
+            rh_ask=Decimal("100"),
+            rh_min_quote=Decimal("10"),
+        )
+
+
+def test_rh_sell_min_quote_uses_conservative_best_bid() -> None:
+    with pytest.raises(
+        ValueError,
+        match="probe clip rounds below RH minimum quote notional; increase --probe-clip-usd",
+    ):
+        _quantity(
+            clip_usd=Decimal("9.99"),
+            probe_side="buy",
+            rh_bid=Decimal("100"),
+            rh_ask=Decimal("1000"),
+            rh_min_quote=Decimal("10"),
+        )
+
+
+def test_rh_min_quote_passes_when_hedge_reference_notional_is_large_enough() -> None:
+    quantity = _quantity(
+        clip_usd=Decimal("10.10"),
+        rh_bid=Decimal("100"),
+        rh_ask=Decimal("100"),
+        rh_min_quote=Decimal("10"),
+    )
+    assert quantity == Decimal("0.101")
 
 
 def test_buy_build_candidate_is_arcus_best_bid_and_rh_sell() -> None:
