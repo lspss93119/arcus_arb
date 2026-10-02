@@ -201,6 +201,7 @@ class FillInstruction:
 class FillAccumulator:
     rh_min_qty: Decimal = RH_HEDGE_MIN_QTY
     rh_step: Decimal = RH_HEDGE_MIN_QTY
+    rh_min_quote: Decimal | None = None
     unhedged_qty: Decimal = Decimal("0")
     side: str | None = None
 
@@ -208,7 +209,7 @@ class FillAccumulator:
     def residual_exposure(self) -> Decimal:
         return self.unhedged_qty
 
-    def add_fill(self, *, side: str, quantity: Decimal) -> FillInstruction | None:
+    def retain_residual(self, *, side: str, quantity: Decimal) -> None:
         side = side.upper()
         quantity = _decimal(quantity, "quantity")
         if side not in ("BUY", "SELL") or quantity <= 0:
@@ -218,6 +219,15 @@ class FillAccumulator:
         elif self.side != side:
             raise RuntimeError("one calibration order cannot mix Arcus fill sides")
         self.unhedged_qty += quantity
+
+    def add_fill(
+        self,
+        *,
+        side: str,
+        quantity: Decimal,
+        hedge_reference_price: Decimal | None = None,
+    ) -> FillInstruction | None:
+        self.retain_residual(side=side, quantity=quantity)
         if self.unhedged_qty < self.rh_min_qty:
             return None
         units = (self.unhedged_qty / self.rh_step).to_integral_value(
@@ -226,6 +236,12 @@ class FillAccumulator:
         hedge_qty = units * self.rh_step
         if hedge_qty < self.rh_min_qty or hedge_qty > self.unhedged_qty:
             return None
+        if self.rh_min_quote is not None:
+            if hedge_reference_price is None:
+                return None
+            reference_price = _decimal(hedge_reference_price, "hedge reference price")
+            if reference_price <= 0 or hedge_qty * reference_price < self.rh_min_quote:
+                return None
         self.unhedged_qty -= hedge_qty
         return FillInstruction(
             quantity=hedge_qty,

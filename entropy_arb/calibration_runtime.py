@@ -364,6 +364,12 @@ class CalibrationController:
             rh_step,
             _decimal(getattr(hedge, "min_base", 0), "RH min base"),
         )
+        raw_rh_min_quote = getattr(hedge, "min_quote", None)
+        rh_min_quote = None
+        if raw_rh_min_quote is not None:
+            parsed_rh_min_quote = _decimal(raw_rh_min_quote, "RH min quote")
+            if parsed_rh_min_quote > 0:
+                rh_min_quote = parsed_rh_min_quote
         if rh_min > self.limits.max_order_qty:
             if client_prefix == "b0-":
                 raise RuntimeError(
@@ -374,7 +380,11 @@ class CalibrationController:
                 f"RH minimum executable quantity {rh_min} exceeds probe "
                 f"quantity {self.limits.max_order_qty}"
             )
-        self.accumulator = FillAccumulator(rh_min_qty=rh_min, rh_step=rh_step)
+        self.accumulator = FillAccumulator(
+            rh_min_qty=rh_min,
+            rh_step=rh_step,
+            rh_min_quote=rh_min_quote,
+        )
         self.lifecycle = CalibrationLifecycle()
         self.telemetry = CalibrationTelemetry(
             store,
@@ -497,6 +507,14 @@ class CalibrationController:
             _decimal(bid, "bid") if bid is not None else None,
             _decimal(ask, "ask") if ask is not None else None,
         )
+
+    def _fresh_hedge_reference(self, hedge_side: str) -> Decimal | None:
+        book = self.hedge.book
+        is_fresh = getattr(book, "is_fresh", None)
+        if callable(is_fresh) and not is_fresh(self.staleness_sec):
+            return None
+        bid, ask = self._book_bbo(self.hedge)
+        return ask if hedge_side.upper() == "BUY" else bid
 
     def center_bps(self) -> Decimal:
         state = self.strategy.state()
@@ -877,7 +895,16 @@ class CalibrationController:
             return
 
         expected_at_fill = self._expected_edge_at_fill(fill)
-        instruction = self.accumulator.add_fill(side=fill.side, quantity=fill.quantity)
+        hedge_reference_price = None
+        if self.accumulator.rh_min_quote is not None:
+            hedge_reference_price = self._fresh_hedge_reference(
+                "BUY" if fill.side.upper() == "SELL" else "SELL"
+            )
+        instruction = self.accumulator.add_fill(
+            side=fill.side,
+            quantity=fill.quantity,
+            hedge_reference_price=hedge_reference_price,
+        )
         self.telemetry.record(
             "fill",
             execution_id=context.execution_id,
@@ -1006,6 +1033,18 @@ class CalibrationController:
         if bid is None or ask is None:
             await self._hedge_failure("RH BBO unavailable")
             return
+        if self.accumulator.rh_min_quote is not None:
+            hedge_reference_price = ask if instruction.hedge_side == "BUY" else bid
+            if (
+                hedge_reference_price is None
+                or instruction.quantity * hedge_reference_price
+                < self.accumulator.rh_min_quote
+            ):
+                self.accumulator.retain_residual(
+                    side=fill.side,
+                    quantity=instruction.quantity,
+                )
+                return
         signal_mono = time.monotonic_ns()
         # Existing Lighter send_taker provides IOC/avg-price protection.  The
         # limit is deliberately bounded at 20 bps from the observed BBO.
@@ -1103,7 +1142,10 @@ class CalibrationController:
             fill_to_rh_fill_ms=fill_to_fill_ms,
         )
         if filled_qty < instruction.quantity:
-            self.accumulator.unhedged_qty += instruction.quantity - filled_qty
+            self.accumulator.retain_residual(
+                side=fill.side,
+                quantity=instruction.quantity - filled_qty,
+            )
             self.risk.halt("RH hedge partially filled")
         fee_record = self._arcus_fee_records.get(fill.trade_id)
         accounted_arcus_fee = (

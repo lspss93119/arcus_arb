@@ -888,6 +888,88 @@ def test_partial_fill_below_rh_minimum_remains_explicit_residual() -> None:
     assert acc.residual_exposure == Decimal("0.004")
 
 
+def test_partial_fill_below_rh_min_quote_remains_residual() -> None:
+    acc = FillAccumulator(
+        rh_min_qty=Decimal("0.100"),
+        rh_step=Decimal("0.001"),
+        rh_min_quote=Decimal("10"),
+    )
+
+    assert (
+        acc.add_fill(
+            side="SELL",
+            quantity=Decimal("0.100"),
+            hedge_reference_price=Decimal("89"),
+        )
+        is None
+    )
+    assert acc.residual_exposure == Decimal("0.100")
+
+
+def test_partial_fills_aggregate_until_rh_min_quote_without_overhedging() -> None:
+    acc = FillAccumulator(
+        rh_min_qty=Decimal("0.100"),
+        rh_step=Decimal("0.001"),
+        rh_min_quote=Decimal("10"),
+    )
+
+    assert (
+        acc.add_fill(
+            side="SELL",
+            quantity=Decimal("0.100"),
+            hedge_reference_price=Decimal("50"),
+        )
+        is None
+    )
+    assert (
+        acc.add_fill(
+            side="SELL",
+            quantity=Decimal("0.050"),
+            hedge_reference_price=Decimal("50"),
+        )
+        is None
+    )
+    instruction = acc.add_fill(
+        side="SELL",
+        quantity=Decimal("0.050"),
+        hedge_reference_price=Decimal("50"),
+    )
+
+    assert instruction is not None
+    assert instruction.quantity == Decimal("0.200")
+    assert instruction.hedge_side == "BUY"
+    assert acc.residual_exposure == Decimal("0")
+
+
+@pytest.mark.parametrize(
+    "arcus_side, hedge_reference_price, expected_hedge_side",
+    [
+        ("SELL", Decimal("50"), "BUY"),
+        ("BUY", Decimal("50"), "SELL"),
+    ],
+)
+def test_fill_accumulator_uses_the_hedge_side_reference_price(
+    arcus_side: str,
+    hedge_reference_price: Decimal,
+    expected_hedge_side: str,
+) -> None:
+    acc = FillAccumulator(
+        rh_min_qty=Decimal("0.100"),
+        rh_step=Decimal("0.001"),
+        rh_min_quote=Decimal("10"),
+    )
+
+    instruction = acc.add_fill(
+        side=arcus_side,
+        quantity=Decimal("0.200"),
+        hedge_reference_price=hedge_reference_price,
+    )
+
+    assert instruction is not None
+    assert instruction.quantity == Decimal("0.200")
+    assert instruction.hedge_side == expected_hedge_side
+
+
 def test_hedge_never_rounds_above_arcus_filled_quantity() -> None:
     acc = FillAccumulator(rh_min_qty=RH_HEDGE_MIN_QTY)
     acc.add_fill(side="SELL", quantity=Decimal("0.006"))

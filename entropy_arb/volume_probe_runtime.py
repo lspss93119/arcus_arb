@@ -216,6 +216,20 @@ class VolumeProbeController:
             else ProbeStatus.HALTED
         )
 
+    def _require_residual_reconciliation(self) -> bool:
+        residual = _decimal(
+            getattr(self.executor.accumulator, "residual_exposure", 0),
+            "FillAccumulator residual",
+        )
+        if residual <= self.tolerance:
+            return False
+        self._failure_reason = self._failure_reason or (
+            f"unresolved FillAccumulator residual exposure: {residual}"
+        )
+        self.machine.state = ProbeState.RECONCILIATION_REQUIRED
+        self._status = ProbeStatus.RECONCILIATION_REQUIRED
+        return True
+
     def begin_build(self, quantity: Decimal) -> None:
         quantity = _decimal(quantity, "build quantity")
         if quantity <= 0:
@@ -854,6 +868,8 @@ class VolumeProbeController:
                 elif (
                     self.state is ProbeState.BUILD and not self.executor.has_live_order
                 ):
+                    if self._require_residual_reconciliation():
+                        break
                     if self.reprice_allowed:
                         await self.place_next_quote()
                 elif self.executor.has_live_order:
@@ -879,7 +895,9 @@ class VolumeProbeController:
             if not self.reprice_allowed:
                 await self._cancel_terminal()
         finally:
-            if self._status is None:
+            if self._require_residual_reconciliation():
+                pass
+            elif self._status is None:
                 if self.state is ProbeState.HALTED:
                     self._status = (
                         ProbeStatus.TIMEOUT
@@ -890,7 +908,11 @@ class VolumeProbeController:
                     self._status = ProbeStatus.COMPLETED
                 else:
                     self._status = ProbeStatus.RECONCILIATION_REQUIRED
-            self.metrics.status = self._status
+            status = self._status
+            if status is None:
+                status = ProbeStatus.RECONCILIATION_REQUIRED
+                self._status = status
+            self.metrics.status = status
             self.metrics.failure_reason = self._failure_reason
             if self.metrics.finished_at is None:
                 self.metrics.finished_at = _now_text()
@@ -907,4 +929,7 @@ class VolumeProbeController:
                 self._status = ProbeStatus.RECONCILIATION_REQUIRED
             finally:
                 stop.set()
-        return self._status
+        final_status = self._status
+        if final_status is None:
+            final_status = ProbeStatus.RECONCILIATION_REQUIRED
+        return final_status
