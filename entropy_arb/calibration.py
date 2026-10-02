@@ -203,11 +203,14 @@ class FillAccumulator:
     rh_step: Decimal = RH_HEDGE_MIN_QTY
     rh_min_quote: Decimal | None = None
     unhedged_qty: Decimal = Decimal("0")
+    pending_hedge_qty: Decimal = Decimal("0")
     side: str | None = None
 
     @property
     def residual_exposure(self) -> Decimal:
-        return self.unhedged_qty
+        """Return all exposure not covered by an authoritative RH fill."""
+
+        return self.unhedged_qty + self.pending_hedge_qty
 
     def retain_residual(self, *, side: str, quantity: Decimal) -> None:
         side = side.upper()
@@ -220,6 +223,44 @@ class FillAccumulator:
             raise RuntimeError("one calibration order cannot mix Arcus fill sides")
         self.unhedged_qty += quantity
 
+    def _consume_pending(self, quantity: Decimal) -> None:
+        quantity = _decimal(quantity, "instruction quantity")
+        if quantity <= 0:
+            raise ValueError("instruction quantity must be > 0")
+        if quantity > self.pending_hedge_qty:
+            raise RuntimeError("hedge reservation exceeds pending quantity")
+        self.pending_hedge_qty -= quantity
+
+    def settle_hedge(
+        self,
+        *,
+        instruction_quantity: Decimal,
+        filled_quantity: Decimal,
+    ) -> None:
+        instruction_quantity = _decimal(instruction_quantity, "instruction quantity")
+        filled_quantity = _decimal(filled_quantity, "filled quantity")
+        if instruction_quantity <= 0:
+            raise ValueError("instruction quantity must be > 0")
+        if filled_quantity < 0 or filled_quantity > instruction_quantity:
+            raise ValueError("filled quantity must be within instruction quantity")
+        self._consume_pending(instruction_quantity)
+        remainder = instruction_quantity - filled_quantity
+        if remainder:
+            if self.side is None:
+                raise RuntimeError("hedge reservation has no Arcus side")
+            self.retain_residual(side=self.side, quantity=remainder)
+
+    def rollback_hedge(self, instruction_quantity: Decimal) -> None:
+        """Return a reserved instruction that was never sent to RH."""
+
+        instruction_quantity = _decimal(instruction_quantity, "instruction quantity")
+        if instruction_quantity <= 0:
+            raise ValueError("instruction quantity must be > 0")
+        self._consume_pending(instruction_quantity)
+        if self.side is None:
+            raise RuntimeError("hedge reservation has no Arcus side")
+        self.retain_residual(side=self.side, quantity=instruction_quantity)
+
     def add_fill(
         self,
         *,
@@ -228,6 +269,8 @@ class FillAccumulator:
         hedge_reference_price: Decimal | None = None,
     ) -> FillInstruction | None:
         self.retain_residual(side=side, quantity=quantity)
+        if self.pending_hedge_qty != 0:
+            return None
         if self.unhedged_qty < self.rh_min_qty:
             return None
         units = (self.unhedged_qty / self.rh_step).to_integral_value(
@@ -243,19 +286,21 @@ class FillAccumulator:
             if reference_price <= 0 or hedge_qty * reference_price < self.rh_min_quote:
                 return None
         self.unhedged_qty -= hedge_qty
+        self.pending_hedge_qty += hedge_qty
         return FillInstruction(
             quantity=hedge_qty,
             hedge_side="BUY" if side == "SELL" else "SELL",
         )
 
     def reset_if_flat(self) -> None:
-        """Allow a later one-sided order to use the opposite side.
+        """Allow a later one-sided order to use the opposite side only flat.
 
-        ``side`` describes the direction of the currently unhedged residual,
-        not a session-wide inventory restriction.  Once the residual is flat,
-        a subsequent calibration order may validly quote the other side.
+        ``side`` describes the direction of the currently unresolved exposure,
+        not a session-wide inventory restriction. Once both the unhedged and
+        pending quantities are flat, a subsequent calibration order may
+        validly quote the other side.
         """
-        if self.unhedged_qty == 0:
+        if self.unhedged_qty == 0 and self.pending_hedge_qty == 0:
             self.side = None
 
 

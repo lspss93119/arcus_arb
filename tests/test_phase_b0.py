@@ -251,6 +251,32 @@ def test_lighter_unknown_account_tier_fails_closed() -> None:
         )
 
 
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_lighter_transport_exception_is_unresolved_for_pending_hedge() -> None:
+    class FailingSigner:
+        async def create_order(self, **_kwargs: Any):
+            raise TimeoutError("connection lost after send")
+
+    venue = cast(Any, object.__new__(LighterVenue))
+    venue.signer = FailingSigner()
+    venue.orders_feed = None
+    venue.market_id = 2
+    venue.size_decimals = 3
+    venue.price_decimals = 2
+    venue._coi = 0
+
+    result = asyncio.run(
+        venue.send_taker(
+            is_buy=True,
+            qty=0.2,
+            limit_px=50.0,
+        )
+    )
+
+    assert result["status"] == "send-failed"
+    assert result["unresolved"] is True
+
+
 def test_lighter_fee_tick_conversion_uses_official_fee_tick_scale() -> None:
     assert LIGHTER_FEE_TICK_SCALE == 1_000_000
     assert lighter_fee_tick_to_bps(100) == Decimal("1")
@@ -938,7 +964,78 @@ def test_partial_fills_aggregate_until_rh_min_quote_without_overhedging() -> Non
     assert instruction is not None
     assert instruction.quantity == Decimal("0.200")
     assert instruction.hedge_side == "BUY"
+    assert acc.unhedged_qty == Decimal("0")
+    assert acc.pending_hedge_qty == Decimal("0.200")
+    assert acc.residual_exposure == Decimal("0.200")
+
+
+def test_fill_accumulator_reserves_until_authoritative_full_hedge() -> None:
+    acc = FillAccumulator(rh_min_qty=Decimal("0.100"), rh_step=Decimal("0.001"))
+
+    instruction = acc.add_fill(side="SELL", quantity=Decimal("0.200"))
+
+    assert instruction is not None
+    assert acc.unhedged_qty == Decimal("0")
+    assert acc.pending_hedge_qty == Decimal("0.200")
+    assert acc.residual_exposure == Decimal("0.200")
+
+    acc.settle_hedge(
+        instruction_quantity=instruction.quantity,
+        filled_quantity=instruction.quantity,
+    )
+
+    assert acc.unhedged_qty == Decimal("0")
+    assert acc.pending_hedge_qty == Decimal("0")
     assert acc.residual_exposure == Decimal("0")
+
+
+def test_fill_accumulator_restores_authoritative_partial_hedge_remainder() -> None:
+    acc = FillAccumulator(rh_min_qty=Decimal("0.100"), rh_step=Decimal("0.001"))
+    instruction = acc.add_fill(side="SELL", quantity=Decimal("0.200"))
+    assert instruction is not None
+
+    acc.settle_hedge(
+        instruction_quantity=instruction.quantity,
+        filled_quantity=Decimal("0.120"),
+    )
+
+    assert acc.unhedged_qty == Decimal("0.080")
+    assert acc.pending_hedge_qty == Decimal("0")
+    assert acc.residual_exposure == Decimal("0.080")
+
+
+def test_fill_accumulator_restores_definitive_zero_fill_without_pending() -> None:
+    acc = FillAccumulator(rh_min_qty=Decimal("0.100"), rh_step=Decimal("0.001"))
+    instruction = acc.add_fill(side="SELL", quantity=Decimal("0.200"))
+    assert instruction is not None
+
+    acc.settle_hedge(
+        instruction_quantity=instruction.quantity,
+        filled_quantity=Decimal("0"),
+    )
+
+    assert acc.unhedged_qty == Decimal("0.200")
+    assert acc.pending_hedge_qty == Decimal("0")
+    assert acc.residual_exposure == Decimal("0.200")
+
+
+def test_fill_accumulator_keeps_ambiguous_hedge_pending_and_side_locked() -> None:
+    acc = FillAccumulator(rh_min_qty=Decimal("0.100"), rh_step=Decimal("0.001"))
+    instruction = acc.add_fill(side="SELL", quantity=Decimal("0.200"))
+    assert instruction is not None
+
+    acc.reset_if_flat()
+
+    assert acc.unhedged_qty == Decimal("0")
+    assert acc.pending_hedge_qty == Decimal("0.200")
+    assert acc.residual_exposure == Decimal("0.200")
+    assert acc.side == "SELL"
+    assert acc.add_fill(side="SELL", quantity=Decimal("0.200")) is None
+    assert acc.unhedged_qty == Decimal("0.200")
+    assert acc.pending_hedge_qty == Decimal("0.200")
+    assert acc.residual_exposure == Decimal("0.400")
+    with pytest.raises(RuntimeError, match="cannot mix"):
+        acc.retain_residual(side="BUY", quantity=Decimal("0.001"))
 
 
 @pytest.mark.parametrize(

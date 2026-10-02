@@ -496,7 +496,7 @@ class LighterVenue:
                 "filled_base": 0.0,
                 "avg_px": None,
                 "err": msg,
-                "unresolved": False,
+                "unresolved": True,
                 "order_send_ts_ms": order_send_ts_ms,
             }
         ack_ts_ms = time.time_ns() // 1_000_000

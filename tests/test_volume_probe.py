@@ -485,6 +485,8 @@ def _reconciliation_probe_stack(
     *,
     with_probe: bool = True,
     place_exception: Exception | None = None,
+    hedge_result: dict[str, Any] | None = None,
+    hedge_exception: Exception | None = None,
     rh_bid: Decimal = Decimal("99.90"),
     rh_ask: Decimal = Decimal("100.10"),
     rh_size_decimals: int = 2,
@@ -566,6 +568,10 @@ def _reconciliation_probe_stack(
 
         async def send_taker(self, **kwargs: Any):
             self.hedges.append(kwargs)
+            if hedge_exception is not None:
+                raise hedge_exception
+            if hedge_result is not None:
+                return dict(hedge_result)
             avg_px = self.book.best_ask() if kwargs["is_buy"] else self.book.best_bid()
             return {
                 "status": "filled",
@@ -625,6 +631,41 @@ def _reconciliation_probe_stack(
         maker=maker,
         hedge=hedge,
         probe=probe,
+    )
+
+
+def _stack_candidate(quantity: Decimal = Decimal("0.200")) -> QuoteCandidate:
+    return QuoteCandidate(
+        side="SELL",
+        price=Decimal("100.10"),
+        quantity=quantity,
+        hedge_side="BUY",
+        hedge_price=Decimal("100.10"),
+        fair_price=Decimal("100.10"),
+        expected_edge_bps=Decimal("4.2"),
+        expected_usd=Decimal("0.01"),
+    )
+
+
+def _stack_fill(
+    executor: CalibrationController,
+    *,
+    trade_id: str = "hedge-fill",
+    quantity: Decimal = Decimal("0.200"),
+) -> ArcusUserFill:
+    return ArcusUserFill(
+        trade_id=trade_id,
+        order_id=executor.lifecycle.order_id or "",
+        client_id=executor.lifecycle.client_id,
+        market_id=33,
+        market_display_name="HYPE-USD",
+        side="SELL",
+        price=Decimal("100.10"),
+        quantity=quantity,
+        fee=Decimal("0.01"),
+        created_at_us=1_001,
+        sequence_number=1,
+        is_snapshot=False,
     )
 
 
@@ -1097,6 +1138,8 @@ def test_min_quote_is_rechecked_before_send_and_retained_on_price_move(
     try:
         asyncio.run(exercise())
         assert stack.hedge.hedges == []
+        assert executor.accumulator.unhedged_qty == Decimal("0.200")
+        assert executor.accumulator.pending_hedge_qty == Decimal("0")
         assert executor.accumulator.residual_exposure == Decimal("0.200")
         assert executor.risk.halted is False
         rows = executor.telemetry.store._conn.execute(
@@ -1105,6 +1148,202 @@ def test_min_quote_is_rechecked_before_send_and_retained_on_price_move(
         assert not any(row[0] == "hedge_failure" for row in rows)
     finally:
         executor.telemetry.store.close()
+
+
+def test_calibration_full_authoritative_hedge_clears_reservation(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        with_probe=False,
+        max_order_qty=Decimal("0.200"),
+        hedge_result={
+            "status": "filled",
+            "filled_base": 0.200,
+            "avg_px": 100.10,
+            "fee": 0.01,
+            "unresolved": False,
+        },
+    )
+    executor = stack.executor
+
+    async def exercise() -> None:
+        await executor._place_quote(_stack_candidate())
+        await executor.on_fill(_stack_fill(executor))
+
+    try:
+        asyncio.run(exercise())
+        assert len(stack.hedge.hedges) == 1
+        assert executor.accumulator.unhedged_qty == Decimal("0")
+        assert executor.accumulator.pending_hedge_qty == Decimal("0")
+        assert executor.accumulator.residual_exposure == Decimal("0")
+        assert executor.risk.halted is False
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_calibration_definitive_zero_fill_restores_reservation_without_retry(
+    tmp_path,
+) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        with_probe=False,
+        max_order_qty=Decimal("0.200"),
+        hedge_result={
+            "status": "rejected",
+            "filled_base": 0.0,
+            "avg_px": None,
+            "err": "minimum quote rejection",
+            "unresolved": False,
+        },
+    )
+    executor = stack.executor
+
+    async def exercise() -> None:
+        await executor._place_quote(_stack_candidate())
+        fill = _stack_fill(executor)
+        await executor.on_fill(fill)
+        await executor.on_fill(fill)
+
+    try:
+        asyncio.run(exercise())
+        assert len(stack.hedge.hedges) == 1
+        assert executor.accumulator.unhedged_qty == Decimal("0.200")
+        assert executor.accumulator.pending_hedge_qty == Decimal("0")
+        assert executor.accumulator.residual_exposure == Decimal("0.200")
+        assert executor.risk.halted is True
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_calibration_partial_authoritative_hedge_restores_only_remainder(
+    tmp_path,
+) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        with_probe=False,
+        max_order_qty=Decimal("0.200"),
+        hedge_result={
+            "status": "filled",
+            "filled_base": 0.120,
+            "avg_px": 100.10,
+            "fee": 0.01,
+            "unresolved": False,
+        },
+    )
+    executor = stack.executor
+
+    async def exercise() -> None:
+        await executor._place_quote(_stack_candidate())
+        await executor.on_fill(_stack_fill(executor))
+
+    try:
+        asyncio.run(exercise())
+        assert len(stack.hedge.hedges) == 1
+        assert executor.accumulator.unhedged_qty == Decimal("0.080")
+        assert executor.accumulator.pending_hedge_qty == Decimal("0")
+        assert executor.accumulator.residual_exposure == Decimal("0.080")
+        assert executor.risk.halted is True
+    finally:
+        executor.telemetry.store.close()
+
+
+@pytest.mark.parametrize(
+    "hedge_result, hedge_exception",
+    [
+        (
+            {
+                "status": "timeout",
+                "filled_base": 0.0,
+                "avg_px": None,
+                "unresolved": True,
+            },
+            None,
+        ),
+        (None, TimeoutError("transport outcome unknown")),
+    ],
+    ids=["timeout-result", "transport-exception"],
+)
+def test_calibration_ambiguous_hedge_keeps_pending_without_retry(
+    tmp_path,
+    hedge_result: dict[str, Any] | None,
+    hedge_exception: Exception | None,
+) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        with_probe=False,
+        max_order_qty=Decimal("0.200"),
+        hedge_result=hedge_result,
+        hedge_exception=hedge_exception,
+    )
+    executor = stack.executor
+
+    async def exercise() -> None:
+        await executor._place_quote(_stack_candidate())
+        fill = _stack_fill(executor)
+        await executor.on_fill(fill)
+        await executor.on_fill(fill)
+
+    try:
+        asyncio.run(exercise())
+        assert len(stack.hedge.hedges) == 1
+        assert executor.accumulator.unhedged_qty == Decimal("0")
+        assert executor.accumulator.pending_hedge_qty == Decimal("0.200")
+        assert executor.accumulator.residual_exposure == Decimal("0.200")
+        assert executor.risk.halted is True
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_reconcile_recovered_ambiguous_hedge_is_not_retried(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        with_probe=False,
+        max_order_qty=Decimal("0.200"),
+        hedge_result={
+            "status": "sent-unconfirmed",
+            "filled_base": 0.0,
+            "avg_px": None,
+            "unresolved": True,
+        },
+    )
+    executor = stack.executor
+
+    async def exercise() -> None:
+        await executor._place_quote(_stack_candidate())
+        fill = _stack_fill(executor, trade_id="recovered-ambiguous")
+        stack.rest.fills_data = [fill]
+        await executor.reconcile()
+        await executor.reconcile()
+
+    try:
+        asyncio.run(exercise())
+        assert len(stack.hedge.hedges) == 1
+        assert executor.accumulator.pending_hedge_qty == Decimal("0.200")
+        assert executor.accumulator.unhedged_qty == Decimal("0")
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_volume_probe_pending_reservation_cannot_finalize_completed() -> None:
+    controller = _real_accumulator_controller()
+    controller.begin_build(Decimal("0.2"))
+    instruction = controller.executor.accumulator.add_fill(
+        side="SELL", quantity=Decimal("0.2")
+    )
+    assert instruction is not None
+    controller.machine.state = ProbeState.FLAT
+    controller.phase = None
+    controller.phase_target_qty = None
+
+    status = controller.finalize_positions(
+        arcus_position=Decimal("0"),
+        rh_position=Decimal("0"),
+        arcus_open_orders=(),
+        rh_open_orders=(),
+    )
+
+    assert status is ProbeStatus.RECONCILIATION_REQUIRED
+    assert controller.state is ProbeState.RECONCILIATION_REQUIRED
+    assert controller.executor.accumulator.pending_hedge_qty == Decimal("0.2")
 
 
 def test_probe_timeout_with_min_quote_residual_requires_reconciliation() -> None:
@@ -1294,6 +1533,10 @@ def test_real_fill_accumulator_resets_before_opposite_unwind_fill() -> None:
         side="SELL", quantity=Decimal("0.1")
     )
     assert build_instruction is not None
+    controller.executor.accumulator.settle_hedge(
+        instruction_quantity=build_instruction.quantity,
+        filled_quantity=build_instruction.quantity,
+    )
     controller.record_hedged_fill(
         arcus_side="SELL",
         arcus_price=Decimal("100"),
@@ -1311,6 +1554,10 @@ def test_real_fill_accumulator_resets_before_opposite_unwind_fill() -> None:
         side="BUY", quantity=Decimal("0.1")
     )
     assert unwind_instruction is not None
+    controller.executor.accumulator.settle_hedge(
+        instruction_quantity=unwind_instruction.quantity,
+        filled_quantity=unwind_instruction.quantity,
+    )
     controller.record_hedged_fill(
         arcus_side="BUY",
         arcus_price=Decimal("100"),
@@ -1931,6 +2178,10 @@ def test_terminal_reconcile_barrier_precedes_unwind() -> None:
                 side=candidate.side, quantity=candidate.quantity
             )
             assert instruction is not None
+            self.accumulator.settle_hedge(
+                instruction_quantity=instruction.quantity,
+                filled_quantity=instruction.quantity,
+            )
             self.controller.record_hedged_fill(
                 arcus_side=candidate.side,
                 arcus_price=candidate.price,

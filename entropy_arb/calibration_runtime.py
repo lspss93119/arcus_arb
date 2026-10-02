@@ -1040,10 +1040,7 @@ class CalibrationController:
                 or instruction.quantity * hedge_reference_price
                 < self.accumulator.rh_min_quote
             ):
-                self.accumulator.retain_residual(
-                    side=fill.side,
-                    quantity=instruction.quantity,
-                )
+                self.accumulator.rollback_hedge(instruction.quantity)
                 return
         signal_mono = time.monotonic_ns()
         # Existing Lighter send_taker provides IOC/avg-price protection.  The
@@ -1082,15 +1079,38 @@ class CalibrationController:
             "sent-unconfirmed",
             "unknown",
         }:
+            if (
+                status == "send-failed"
+                and not result.get("unresolved")
+                and filled_qty == 0
+                and avg_px is None
+            ):
+                self.accumulator.settle_hedge(
+                    instruction_quantity=instruction.quantity,
+                    filled_quantity=Decimal("0"),
+                )
             await self._hedge_failure(f"RH hedge {status or 'unresolved'}")
             return
         if filled_qty <= 0 or avg_px is None:
+            if (
+                filled_qty == 0
+                and avg_px is None
+                and status in {"rejected", "canceled", "cancelled", "expired"}
+            ):
+                self.accumulator.settle_hedge(
+                    instruction_quantity=instruction.quantity,
+                    filled_quantity=Decimal("0"),
+                )
             await self._hedge_failure("RH hedge returned no authoritative fill")
             return
         avg_px_decimal = _decimal(avg_px, "RH avg_px")
         if filled_qty > instruction.quantity:
             await self._hedge_failure("RH hedge filled more than Arcus fill")
             return
+        self.accumulator.settle_hedge(
+            instruction_quantity=instruction.quantity,
+            filled_quantity=filled_qty,
+        )
         rh_fee = result.get("fee")
         if rh_fee is None:
             rh_fee_decimal = (
@@ -1142,10 +1162,6 @@ class CalibrationController:
             fill_to_rh_fill_ms=fill_to_fill_ms,
         )
         if filled_qty < instruction.quantity:
-            self.accumulator.retain_residual(
-                side=fill.side,
-                quantity=instruction.quantity - filled_qty,
-            )
             self.risk.halt("RH hedge partially filled")
         fee_record = self._arcus_fee_records.get(fill.trade_id)
         accounted_arcus_fee = (
