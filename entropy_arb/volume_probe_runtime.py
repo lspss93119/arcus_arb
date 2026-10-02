@@ -119,6 +119,9 @@ class VolumeProbeController:
         self.session_id = session_id or f"vp-{uuid.uuid4().hex[:12]}"
         self.writer = writer
         self._metrics_written = False
+        self._processed_fill_keys: set[str] = set()
+        if hasattr(executor, "on_processed_fill"):
+            executor.on_processed_fill = self._on_processed_fill
         self.tolerance = _decimal(tolerance, "quantity tolerance")
         if self.tolerance < 0:
             raise ValueError("quantity tolerance must be >= 0")
@@ -441,42 +444,39 @@ class VolumeProbeController:
         await self.executor.place_quote(candidate)
         self._order_placed_mono = time.monotonic()
 
-    async def on_fill(self, fill: Any) -> None:
-        context_lookup = getattr(self.executor, "_context_for_fill", None)
-        if callable(context_lookup) and context_lookup(fill) is None:
-            # The account stream is account-scoped.  A new fill that cannot be
-            # tied to this probe is an identity ambiguity, not a harmless
-            # unrelated event; stop before the inherited controller can
-            # ignore it.
-            if not bool(getattr(fill, "is_snapshot", False)):
-                reason = "unknown Arcus fill identity during volume probe"
-                halt = getattr(self.executor.risk, "halt", None)
-                if callable(halt):
-                    halt(reason)
-                self._halt(reason)
-                cancel = getattr(self.executor, "cancel_outstanding", None)
-                if callable(cancel):
-                    with contextlib.suppress(Exception):
-                        await cancel()
-                return
-        before = int(getattr(self.executor.risk, "fill_events", 0))
-        await self.executor.on_fill(fill)
-        after = int(getattr(self.executor.risk, "fill_events", 0))
-        if after == before:
-            if getattr(self.executor.risk, "halted", False):
-                self._halt(
-                    str(
-                        getattr(self.executor.risk, "halt_reason", None)
-                        or "executor halted"
-                    )
-                )
+    @staticmethod
+    def _fill_key(fill: Any) -> str:
+        trade_id = getattr(fill, "trade_id", None)
+        if trade_id:
+            return f"trade:{trade_id}"
+        return f"object:{id(fill)}"
+
+    async def _on_processed_fill(
+        self,
+        fill: Any,
+        hedge: HedgeExecutionResult | None,
+        fee_used: Decimal,
+        was_actionable: bool,
+    ) -> None:
+        if not was_actionable:
             return
-        fee_record = getattr(self.executor, "_arcus_fee_records", {}).get(
-            getattr(fill, "trade_id", None)
+        key = self._fill_key(fill)
+        if key in self._processed_fill_keys:
+            return
+        self._processed_fill_keys.add(key)
+        await self._account_processed_fill(
+            fill=fill,
+            hedge=hedge,
+            arcus_fee=fee_used,
         )
-        fee = getattr(fee_record, "fee_used", None)
-        hedge = getattr(self.executor, "last_hedge_result", None)
-        arcus_fee = fee if fee is not None else getattr(fill, "fee", None)
+
+    async def _account_processed_fill(
+        self,
+        *,
+        fill: Any,
+        hedge: HedgeExecutionResult | None,
+        arcus_fee: Decimal | None,
+    ) -> None:
         if hedge is None:
             residual = _decimal(
                 getattr(self.executor.accumulator, "residual_exposure", 0),
@@ -532,6 +532,59 @@ class VolumeProbeController:
                     or "executor halted"
                 )
             )
+
+    async def on_fill(self, fill: Any) -> None:
+        context_lookup = getattr(self.executor, "_context_for_fill", None)
+        if callable(context_lookup) and context_lookup(fill) is None:
+            # The account stream is account-scoped.  A new fill that cannot be
+            # tied to this probe is an identity ambiguity, not a harmless
+            # unrelated event; stop before the inherited controller can
+            # ignore it.
+            if not bool(getattr(fill, "is_snapshot", False)):
+                reason = "unknown Arcus fill identity during volume probe"
+                halt = getattr(self.executor.risk, "halt", None)
+                if callable(halt):
+                    halt(reason)
+                self._halt(reason)
+                cancel = getattr(self.executor, "cancel_outstanding", None)
+                if callable(cancel):
+                    with contextlib.suppress(Exception):
+                        await cancel()
+                return
+        key = self._fill_key(fill)
+        before = int(getattr(self.executor.risk, "fill_events", 0))
+        await self.executor.on_fill(fill)
+        if key in self._processed_fill_keys:
+            self._processed_fill_keys.discard(key)
+            if getattr(self.executor.risk, "halted", False):
+                self._halt(
+                    str(
+                        getattr(self.executor.risk, "halt_reason", None)
+                        or "executor halted"
+                    )
+                )
+            return
+        after = int(getattr(self.executor.risk, "fill_events", 0))
+        if after == before:
+            if getattr(self.executor.risk, "halted", False):
+                self._halt(
+                    str(
+                        getattr(self.executor.risk, "halt_reason", None)
+                        or "executor halted"
+                    )
+                )
+            return
+        fee_record = getattr(self.executor, "_arcus_fee_records", {}).get(
+            getattr(fill, "trade_id", None)
+        )
+        fee = getattr(fee_record, "fee_used", None)
+        hedge = getattr(self.executor, "last_hedge_result", None)
+        arcus_fee = fee if fee is not None else getattr(fill, "fee", None)
+        await self._account_processed_fill(
+            fill=fill,
+            hedge=hedge,
+            arcus_fee=arcus_fee,
+        )
 
     async def on_order(self, update: Any) -> None:
         await self.executor.on_order(update)

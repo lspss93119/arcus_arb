@@ -8,8 +8,20 @@ from typing import Any, cast
 
 import pytest
 
-from entropy_arb.calibration import FillAccumulator
-from entropy_arb.calibration_runtime import HedgeExecutionResult
+from entropy_arb.arcus_execution import (
+    ArcusAccountRest,
+    ArcusAccountState,
+    ArcusFeeTier,
+    ArcusMakerClient,
+    ArcusOrderUpdate,
+    ArcusUserFill,
+)
+from entropy_arb.calibration import FillAccumulator, QuoteCandidate, SessionLimits
+from entropy_arb.calibration_runtime import (
+    CalibrationController,
+    HedgeExecutionResult,
+)
+from entropy_arb.storage import MarketHistoryStore
 from entropy_arb.volume_probe import (
     ProbeConfig,
     ProbeRoundMetrics,
@@ -242,6 +254,270 @@ def _hedge(*, side: str, qty: str) -> HedgeExecutionResult:
         fill_to_hedge_send_ms=2,
         fill_to_rh_fill_ms=8,
     )
+
+
+def _reconciliation_probe_stack(tmp_path, *, with_probe: bool = True):
+    class FakeBook:
+        ready = True
+        sequence_health = "OK"
+
+        def best_bid(self) -> Decimal:
+            return Decimal("99.90")
+
+        def best_ask(self) -> Decimal:
+            return Decimal("100.10")
+
+        def is_fresh(self, max_age_sec: float) -> bool:
+            return True
+
+    class FakeFeed:
+        healthy = True
+        required_channels_healthy = True
+
+        def __init__(self) -> None:
+            self.latest_orders: dict[str, Any] = {}
+
+    class FakeRest:
+        def __init__(self) -> None:
+            self.fills_data: list[ArcusUserFill] = []
+
+        async def open_orders(self, *args: Any, **kwargs: Any):
+            return []
+
+        async def fills(self, *args: Any, **kwargs: Any):
+            return list(self.fills_data)
+
+    class FakeMaker:
+        def __init__(self) -> None:
+            self.credentials = SimpleNamespace(
+                account_address="0x" + "11" * 20,
+                account_index=0,
+            )
+            self.quantities: list[Decimal] = []
+
+        async def place_alo(self, **kwargs: Any):
+            self.quantities.append(Decimal(str(kwargs["quantity"])))
+            return SimpleNamespace(
+                order_id=f"order-{len(self.quantities)}",
+                client_id=kwargs["client_id"],
+            )
+
+        async def cancel_calibration_order(self, **kwargs: Any):
+            return {"status": 202}
+
+    class FakeHedge:
+        def __init__(self) -> None:
+            self.book = FakeBook()
+            self.size_decimals = 2
+            self.min_base = 0.01
+            self.fee_bps = 1.0
+            self.hedges: list[dict[str, Any]] = []
+
+        async def send_taker(self, **kwargs: Any):
+            self.hedges.append(kwargs)
+            return {
+                "status": "filled",
+                "filled_base": kwargs["qty"],
+                "avg_px": 100.00,
+                "fee": 0.01,
+                "order_send_ts_ms": 2,
+                "ack_ts_ms": 3,
+                "fill_receive_ts_ms": 4,
+            }
+
+    feed = FakeFeed()
+    rest = FakeRest()
+    maker = FakeMaker()
+    hedge = FakeHedge()
+    executor = CalibrationController(
+        arcus=SimpleNamespace(
+            book=FakeBook(),
+            latest_attributes=SimpleNamespace(is_outside_rth=False),
+        ),
+        hedge=hedge,
+        maker=cast(ArcusMakerClient, maker),
+        account_feed=feed,
+        account_rest=cast(ArcusAccountRest, rest),
+        account_state=ArcusAccountState(startup_watermark_us=0),
+        metadata=SimpleNamespace(
+            market_id=33,
+            symbol="HYPE-USD",
+            tick_size="0.01",
+            step_size="0.01",
+            status="ONLINE",
+        ),
+        fee_tier=ArcusFeeTier(1, "base", 20, 100),
+        strategy=SimpleNamespace(
+            fixed_center_bps=0.0,
+            state=lambda: SimpleNamespace(center_bps=0.0),
+        ),
+        store=MarketHistoryStore(tmp_path / "reconciliation.sqlite"),
+        allow_first_order=True,
+        staleness_sec=10.0,
+        rh_fee_bps=Decimal("1.0"),
+        session_id="vp-reconciliation-test",
+        session_limits=SessionLimits(max_order_qty=Decimal("0.10")),
+    )
+    probe = None
+    if with_probe:
+        probe = VolumeProbeController(
+            executor=executor,
+            config=ProbeConfig(clip_usd=Decimal("10"), probe_side="sell"),
+            symbol="HYPE-USD",
+            session_id="vp-reconciliation-test",
+        )
+    return SimpleNamespace(
+        executor=executor,
+        feed=feed,
+        rest=rest,
+        maker=maker,
+        hedge=hedge,
+        probe=probe,
+    )
+
+
+def test_reconcile_routes_recovered_build_and_unwind_fills_once(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(tmp_path)
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    def current_fill(*, trade_id: str, side: str, quantity: str) -> ArcusUserFill:
+        return ArcusUserFill(
+            trade_id=trade_id,
+            order_id=executor.lifecycle.order_id or "",
+            client_id=executor.lifecycle.client_id,
+            market_id=33,
+            market_display_name="HYPE-USD",
+            side=side,
+            price=Decimal("100.10") if side == "SELL" else Decimal("99.90"),
+            quantity=Decimal(quantity),
+            fee=Decimal("0.01"),
+            created_at_us=1_000 + len(stack.hedge.hedges) + 1,
+            sequence_number=len(stack.hedge.hedges) + 1,
+            is_snapshot=False,
+            local_receive_ts_ms=10,
+            local_receive_monotonic_ns=10,
+        )
+
+    async def mark_terminal() -> None:
+        candidate = executor.current_candidate
+        assert candidate is not None
+        await executor.on_order(
+            ArcusOrderUpdate(
+                order_id=executor.lifecycle.order_id or "",
+                client_id=executor.lifecycle.client_id,
+                market_id=33,
+                market_display_name="HYPE-USD",
+                side=candidate.side,
+                status="CANCELED",
+                state="CANCELED",
+                price=candidate.price,
+                original_size=candidate.quantity,
+                remaining_size=candidate.quantity,
+                avg_fill_price=None,
+                created_at_us=1_000,
+                updated_at_us=1_001,
+                sequence_number=len(stack.hedge.hedges) + 1,
+                is_snapshot=False,
+            )
+        )
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.10"))
+        await probe.place_next_quote()
+        assert stack.maker.quantities == [Decimal("0.10")]
+
+        first = current_fill(trade_id="build-1", side="SELL", quantity="0.04")
+        await mark_terminal()
+        stack.rest.fills_data = [first]
+        await executor.reconcile()
+        assert len(stack.hedge.hedges) == 1
+        assert Decimal(str(stack.hedge.hedges[0]["qty"])) == Decimal("0.04")
+        assert probe.build_base_qty == Decimal("0.04")
+        assert probe.state is ProbeState.BUILD
+
+        await probe.on_fill(first)
+        assert len(stack.hedge.hedges) == 1
+        assert probe.build_base_qty == Decimal("0.04")
+
+        await probe.place_next_quote()
+        assert stack.maker.quantities == [Decimal("0.10"), Decimal("0.06")]
+
+        second = current_fill(trade_id="build-2", side="SELL", quantity="0.06")
+        await mark_terminal()
+        stack.rest.fills_data = [first, second]
+        await executor.reconcile()
+        assert len(stack.hedge.hedges) == 2
+        assert probe.build_base_qty == Decimal("0.10")
+        assert probe.state is ProbeState.HEDGED
+
+        probe.begin_unwind()
+        await probe.place_next_quote()
+        assert stack.maker.quantities == [
+            Decimal("0.10"),
+            Decimal("0.06"),
+            Decimal("0.10"),
+        ]
+
+        unwind = current_fill(trade_id="unwind-1", side="BUY", quantity="0.10")
+        await mark_terminal()
+        stack.rest.fills_data = [first, second, unwind]
+        await executor.reconcile()
+        assert len(stack.hedge.hedges) == 3
+        assert probe.unwind_base_qty == Decimal("0.10")
+        assert probe.state is ProbeState.UNWIND
+
+        await probe.on_fill(unwind)
+        assert len(stack.hedge.hedges) == 3
+        assert probe.unwind_base_qty == Decimal("0.10")
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_b0_reconcile_without_probe_observer_keeps_normal_fill_path(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(tmp_path, with_probe=False)
+    executor = stack.executor
+    candidate = QuoteCandidate(
+        side="SELL",
+        price=Decimal("100.10"),
+        quantity=Decimal("0.01"),
+        hedge_side="BUY",
+        hedge_price=Decimal("100.10"),
+        fair_price=Decimal("100.10"),
+        expected_edge_bps=Decimal("4.2"),
+        expected_usd=Decimal("0.0042"),
+    )
+
+    async def exercise() -> None:
+        await executor.place_quote(candidate)
+        fill = ArcusUserFill(
+            trade_id="b0-reconcile-1",
+            order_id=executor.lifecycle.order_id or "",
+            client_id=executor.lifecycle.client_id,
+            market_id=33,
+            market_display_name="HYPE-USD",
+            side="SELL",
+            price=Decimal("100.10"),
+            quantity=Decimal("0.01"),
+            fee=Decimal("0.01"),
+            created_at_us=1_001,
+            sequence_number=1,
+            is_snapshot=False,
+        )
+        stack.rest.fills_data = [fill]
+        await executor.reconcile()
+        assert executor.risk.fill_events == 1
+        assert len(stack.hedge.hedges) == 1
+        assert executor.accumulator.residual_exposure == Decimal("0")
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
 
 
 def test_partial_build_fill_is_hedged_then_unwind_reverses_actual_qty() -> None:

@@ -13,7 +13,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from types import SimpleNamespace
@@ -165,6 +165,11 @@ class HedgeExecutionResult:
     fill_to_rh_fill_ms: int
 
 
+ProcessedFillObserver = Callable[
+    [ArcusUserFill, HedgeExecutionResult | None, Decimal, bool], Awaitable[None]
+]
+
+
 class CalibrationTelemetry:
     """Append-only B0 lifecycle writer backed by the existing WAL store."""
 
@@ -311,6 +316,7 @@ class CalibrationController:
         session_id: str | None = None,
         session_limits: SessionLimits | None = None,
         client_prefix: str = "b0-",
+        on_processed_fill: ProcessedFillObserver | None = None,
     ) -> None:
         if not client_prefix:
             raise ValueError("Arcus client prefix must not be empty")
@@ -333,6 +339,7 @@ class CalibrationController:
         self.rh_account_limits = getattr(hedge, "account_limits", None)
         self.order_prefix = client_prefix
         self.session_id = session_id or f"{client_prefix}{uuid.uuid4().hex[:12]}"
+        self.on_processed_fill = on_processed_fill
         self.limits = session_limits or SessionLimits()
         self.risk = SessionRisk(self.limits)
         self.pnl = CalibrationPnL()
@@ -912,7 +919,41 @@ class CalibrationController:
             self.accumulator.residual_exposure,
             quantization_unit=self.accumulator.rh_step,
         )
+        if self.on_processed_fill is not None and not (
+            self.risk.halted and self.last_hedge_result is None
+        ):
+            fee_record = self._arcus_fee_records.get(fill.trade_id)
+            fee_used = (
+                fee_record.fee_used if fee_record is not None else fee_for_accounting
+            )
+            await self._notify_processed_fill(
+                fill,
+                fee_used=fee_used,
+                was_actionable=True,
+            )
         if self.risk.halted:
+            await self.cancel_outstanding()
+            self._record_halt()
+
+    async def _notify_processed_fill(
+        self,
+        fill: ArcusUserFill,
+        *,
+        fee_used: Decimal,
+        was_actionable: bool,
+    ) -> None:
+        observer = self.on_processed_fill
+        if observer is None:
+            return
+        try:
+            await observer(
+                fill,
+                self.last_hedge_result,
+                fee_used,
+                was_actionable,
+            )
+        except Exception as exc:
+            self.risk.on_telemetry_failure(f"processed fill observer failed: {exc}")
             await self.cancel_outstanding()
             self._record_halt()
 
