@@ -178,7 +178,7 @@ def build_ordersign_payload(
     return {
         "ad": credentials.account_address.lower(),
         "ai": credentials.account_index,
-        "c": client_id,
+        "c": client_id.lower(),
         "ct": timestamp_ns,
         "g": good_til_time_us * 1000,
         "m": market_id,
@@ -214,7 +214,8 @@ def build_cancel_ordersign_payload(
     if order_id is not None:
         payload["id"] = order_id
     else:
-        payload["c"] = client_id
+        assert client_id is not None
+        payload["c"] = client_id.lower()
     return payload
 
 

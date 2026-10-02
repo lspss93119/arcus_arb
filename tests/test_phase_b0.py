@@ -7,6 +7,7 @@ behavior is exercised only through small in-memory transports.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from decimal import Decimal
@@ -21,9 +22,11 @@ try:
         ArcusCredentialError,
         ArcusCredentials,
         ArcusSigner,
+        build_cancel_ordersign_payload,
         build_ordersign_payload,
     )
     from entropy_arb.arcus_execution import (
+        GOOD_TIL_TIME_DAYS,
         ArcusAccountFeed,
         ArcusAccountRest,
         ArcusAccountState,
@@ -509,6 +512,30 @@ def test_ordersign_payload_uses_exact_alo_integer_semantics() -> None:
         "t": 3,
         "v": 1,
     }
+
+
+def test_ordersign_client_id_is_lowercase_canonical() -> None:
+    place_payload = build_ordersign_payload(
+        _credentials(),
+        market_id=33,
+        side="SELL",
+        price=Decimal("1540.67"),
+        quantity=Decimal("0.01"),
+        tick_size=Decimal("0.01"),
+        step_size=Decimal("0.01"),
+        timestamp_ns=1_700_000_000_000_000_000,
+        good_til_time_us=1_800_000_000_000_000,
+        client_id="B0-Mixed-Case",
+    )
+    cancel_payload = build_cancel_ordersign_payload(
+        _credentials(),
+        market_id=33,
+        timestamp_ns=1_700_000_000_000_000_000,
+        client_id="B0-Mixed-Case",
+    )
+
+    assert place_payload["c"] == "b0-mixed-case"
+    assert cancel_payload["c"] == "b0-mixed-case"
 
 
 def test_alo_is_the_only_calibration_tif() -> None:
@@ -1495,20 +1522,43 @@ def test_calibration_event_has_partial_fill_granularity(tmp_path) -> None:
     store.close()
 
 
-def test_arcus_maker_client_sends_only_publicly_documented_alo_payload() -> None:
-    class FakeRpc:
-        def __init__(self):
-            self.requests = []
+def test_arcus_maker_client_sends_only_publicly_documented_alo_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamp_ns = 1_700_000_000_123_456_789
+    monkeypatch.setattr(
+        "entropy_arb.arcus_execution.time.time_ns", lambda: timestamp_ns
+    )
 
-        async def post(self, method, payload, signature, timestamp):
-            self.requests.append((method, payload, signature, timestamp))
-            return {"status": 202, "result": {"orderId": "o1"}}
+    class FakeSigner:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, Any]] = []
 
-    rpc = FakeRpc()
+        def sign_typed(self, payload: dict[str, Any]) -> str:
+            self.payloads.append(dict(payload))
+            return "signature"
+
+    class FakeWebSocket:
+        def __init__(self, feed: ArcusAccountFeed) -> None:
+            self.feed = feed
+            self.sent: list[dict[str, Any]] = []
+
+        async def send(self, message: str) -> None:
+            envelope = json.loads(message)
+            self.sent.append(envelope)
+            self.feed._pending[envelope["id"]].set_result(
+                {"status": 202, "result": {"orderId": "o1"}}
+            )
+
+    feed = ArcusAccountFeed(ADDRESS, "SNDK-USD", api_key="api")
+    websocket = FakeWebSocket(feed)
+    feed.websocket = websocket
+    feed.healthy = True
+    signer = FakeSigner()
     client = ArcusMakerClient(
         credentials=_credentials(),
-        signer=ArcusSigner(_credentials()),
-        rpc=rpc,
+        signer=cast(Any, signer),
+        rpc=feed,
     )
 
     async def run():
@@ -1526,9 +1576,86 @@ def test_arcus_maker_client_sends_only_publicly_documented_alo_payload() -> None
 
     result = asyncio.run(run())
     assert result.order_id == "o1"
-    assert rpc.requests[0][0] == "placeOrder"
-    assert rpc.requests[0][1]["orderType"] == "LIMIT"
-    assert rpc.requests[0][1]["timeInForce"] == "ALO"
+    assert len(websocket.sent) == 1
+    envelope = websocket.sent[0]
+    assert envelope["request"]["type"] == "placeOrder"
+    assert envelope["request"]["timestamp"] == str(timestamp_ns)
+    good_til_time_us = timestamp_ns // 1000 + GOOD_TIL_TIME_DAYS * 86_400_000_000
+    assert envelope["request"]["payload"] == {
+        "address": ADDRESS,
+        "accountIndex": 0,
+        "marketId": 33,
+        "orderSide": "SELL",
+        "orderType": "LIMIT",
+        "quantity": "0.01",
+        "price": "100.00",
+        "timeInForce": "ALO",
+        "goodTilTime": str(good_til_time_us),
+        "timestamp": timestamp_ns,
+        "reduceOnly": False,
+        "clientId": "b0-test-1",
+    }
+    assert "clientTime" not in envelope["request"]["payload"]
+    assert signer.payloads[0]["ct"] == timestamp_ns
+    assert signer.payloads[0]["g"] == good_til_time_us * 1000
+
+
+def test_arcus_maker_client_cancel_wire_format_uses_shared_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timestamp_ns = 1_700_000_000_987_654_321
+    monkeypatch.setattr(
+        "entropy_arb.arcus_execution.time.time_ns", lambda: timestamp_ns
+    )
+
+    class FakeSigner:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, Any]] = []
+
+        def sign_typed(self, payload: dict[str, Any]) -> str:
+            self.payloads.append(dict(payload))
+            return "signature"
+
+    class FakeWebSocket:
+        def __init__(self, feed: ArcusAccountFeed) -> None:
+            self.feed = feed
+            self.sent: list[dict[str, Any]] = []
+
+        async def send(self, message: str) -> None:
+            envelope = json.loads(message)
+            self.sent.append(envelope)
+            self.feed._pending[envelope["id"]].set_result({"status": 202})
+
+    feed = ArcusAccountFeed(ADDRESS, "SNDK-USD", api_key="api")
+    websocket = FakeWebSocket(feed)
+    feed.websocket = websocket
+    feed.healthy = True
+    signer = FakeSigner()
+    client = ArcusMakerClient(
+        credentials=_credentials(),
+        signer=cast(Any, signer),
+        rpc=feed,
+    )
+    client._known_order_ids.add("o1")
+
+    async def run() -> None:
+        await client.cancel_calibration_order(market_id=33, order_id="o1")
+
+    asyncio.run(run())
+    assert len(websocket.sent) == 1
+    envelope = websocket.sent[0]
+    assert envelope["request"]["type"] == "cancelOrder"
+    assert envelope["request"]["timestamp"] == str(timestamp_ns)
+    assert envelope["request"]["payload"] == {
+        "address": ADDRESS,
+        "accountIndex": 0,
+        "marketId": 33,
+        "kind": "orderId",
+        "timestamp": timestamp_ns,
+        "orderId": "o1",
+    }
+    assert signer.payloads[0]["ct"] == timestamp_ns
+    assert signer.payloads[0]["op"] == 2
 
 
 def test_arcus_maker_volume_mode_accepts_vp_prefix_and_nonfixed_quantity() -> None:

@@ -738,12 +738,13 @@ class ArcusMakerClient:
             "marketId": market_id,
             "orderSide": side,
             "orderType": "LIMIT",
-            "timeInForce": "ALO",
-            "goodTilTime": str(good_til_time_us),
             "quantity": str(quantity),
             "price": str(price),
+            "timeInForce": "ALO",
+            "goodTilTime": str(good_til_time_us),
+            "timestamp": timestamp_ns,
+            "reduceOnly": False,
             "clientId": client_id,
-            "clientTime": str(timestamp_ns),
         }
         response = await self._require_rpc().post(
             "placeOrder", body, self.signer.sign_typed(signed), timestamp_ns
@@ -795,6 +796,7 @@ class ArcusMakerClient:
             "accountIndex": self.credentials.account_index,
             "marketId": market_id,
             "kind": "orderId" if order_id is not None else "clientId",
+            "timestamp": timestamp_ns,
         }
         if order_id is not None:
             body["orderId"] = order_id
