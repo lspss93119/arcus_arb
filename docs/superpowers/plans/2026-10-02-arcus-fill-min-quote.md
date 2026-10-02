@@ -126,7 +126,7 @@
 
   Confirm no strategy or live-gate changes, no hard-coded min quote, no RH call when below min quote, aggregate hedge never exceeds residual Arcus exposure, websocket/REST duplicate idempotency remains intact, and `main` is not merged.
 
-- [ ] **Step 3: Commit and push**
+- [x] **Step 3: Commit and push**
 
   ```bash
   git add entropy_arb/calibration.py entropy_arb/calibration_runtime.py entropy_arb/volume_probe_runtime.py tests/test_phase_b0.py tests/test_volume_probe.py docs/superpowers/plans/2026-10-02-arcus-fill-min-quote.md
