@@ -18,6 +18,7 @@ ARCUS_PUBLIC_SUBSCRIPTIONS = (
     "l2OrderbookUpdates",
     "trades",
     "marketAttributes",
+    "bbo",
 )
 ARCUS_BOOK_LEVELS = 20
 
@@ -212,6 +213,15 @@ class ArcusBookUpdate:
 
 
 @dataclass(frozen=True)
+class ArcusBBO:
+    best_bid: tuple[str, str] | None
+    best_ask: tuple[str, str] | None
+    last_sequence_id: int
+    global_sequence_id: int
+    exchange_timestamp_us: int | None
+
+
+@dataclass(frozen=True)
 class ArcusL2Event:
     """One raw price-level event from an Arcus L2 frame.
 
@@ -300,6 +310,53 @@ def parse_arcus_book_update(message: Mapping[str, Any]) -> ArcusBookUpdate:
     return ArcusBookUpdate(
         bids=_levels(_required(contents, "bids", "message.contents"), "bids"),
         asks=_levels(_required(contents, "asks", "message.contents"), "asks"),
+        last_sequence_id=sequence,
+        global_sequence_id=global_sequence,
+        exchange_timestamp_us=timestamp,
+    )
+
+
+def _bbo_level(value: Any, path: str) -> tuple[str, str] | None:
+    if value is None:
+        return None
+    level = _mapping(value, path)
+    return (
+        _decimal_text(_required(level, "price", path), f"{path}.price", positive=True),
+        _decimal_text(_required(level, "size", path), f"{path}.size", positive=True),
+    )
+
+
+def parse_arcus_bbo(message: Mapping[str, Any]) -> ArcusBBO:
+    """Parse a public Arcus BBO snapshot or update."""
+    message_type = message.get("type")
+    if message_type not in ("subscribed", "channel_data"):
+        raise ArcusMarketDataError(
+            "bbo message type must be 'subscribed' or 'channel_data'"
+        )
+    if message.get("channel") != "bbo":
+        raise ArcusMarketDataError("message is not bbo")
+    contents = _mapping(_required(message, "contents", "message"), "message.contents")
+    sequence = _integer(
+        _required(contents, "lastSequenceId", "message.contents"),
+        "message.contents.lastSequenceId",
+    )
+    global_sequence = _integer(
+        _required(contents, "globalSequenceId", "message.contents"),
+        "message.contents.globalSequenceId",
+    )
+    assert sequence is not None and global_sequence is not None
+    timestamp = _integer(
+        contents.get("timestamp"), "message.contents.timestamp", optional=True
+    )
+    return ArcusBBO(
+        best_bid=_bbo_level(
+            _required(contents, "bestBid", "message.contents"),
+            "message.contents.bestBid",
+        ),
+        best_ask=_bbo_level(
+            _required(contents, "bestAsk", "message.contents"),
+            "message.contents.bestAsk",
+        ),
         last_sequence_id=sequence,
         global_sequence_id=global_sequence,
         exchange_timestamp_us=timestamp,

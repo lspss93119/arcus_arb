@@ -15,10 +15,12 @@ import pytest
 
 from entropy_arb.arcus import (
     ARCUS_PUBLIC_SUBSCRIPTIONS,
+    ArcusBBO,
     ArcusL2Event,
     ArcusMarketAttributes,
     ArcusMarketMetadata,
     ArcusTrade,
+    parse_arcus_bbo,
     parse_arcus_book_snapshot,
     parse_arcus_book_update,
     parse_arcus_market,
@@ -89,6 +91,19 @@ UPDATE: dict[str, Any] = {
         "asks": [["1540.67", "0.4412"]],
         "lastSequenceId": 91051779,
         "globalSequenceId": 1789133353,
+    },
+}
+
+BBO_MESSAGE: dict[str, Any] = {
+    "type": "channel_data",
+    "channel": "bbo",
+    "id": "SNDK-USD",
+    "contents": {
+        "bestBid": {"price": "1540.16", "size": "0.5000"},
+        "bestAsk": {"price": "1540.67", "size": "0.4000"},
+        "lastSequenceId": 91051779,
+        "globalSequenceId": 1789133353,
+        "timestamp": 1788425525850029,
     },
 }
 
@@ -174,6 +189,157 @@ def test_arcus_incremental_book_update_parsing_and_quantities() -> None:
     assert update.asks == (("1540.67", "0.4412"),)
 
 
+def test_arcus_bbo_parsing_preserves_nullable_top_levels() -> None:
+    bbo = parse_arcus_bbo(BBO_MESSAGE)
+
+    assert isinstance(bbo, ArcusBBO)
+    assert bbo.best_bid == ("1540.16", "0.5000")
+    assert bbo.best_ask == ("1540.67", "0.4000")
+    assert bbo.last_sequence_id == 91051779
+    assert bbo.global_sequence_id == 1789133353
+    assert bbo.exchange_timestamp_us == 1788425525850029
+
+    no_bid = {
+        **BBO_MESSAGE,
+        "contents": {**BBO_MESSAGE["contents"], "bestBid": None},
+    }
+    assert parse_arcus_bbo(no_bid).best_bid is None
+
+
+def test_arcus_first_delta_boundary_is_not_a_true_gap() -> None:
+    snapshot = {
+        **SNAPSHOT,
+        "contents": {**SNAPSHOT["contents"], "lastSequenceId": 100},
+    }
+    book = ArcusOrderBook()
+    book.apply_snapshot(parse_arcus_book_snapshot(snapshot))
+    assert book.first_delta_after_snapshot
+
+    for stale_sequence in (99, 100):
+        assert book.apply_update(
+            parse_arcus_book_update(_l2_delta(sequence=stale_sequence))
+        )
+        assert book.sequence_id == 100
+        assert book.first_delta_after_snapshot
+        assert book.boundary_gap_count == 0
+        assert book.sequence_gap_count == 0
+
+    assert book.apply_update(parse_arcus_book_update(_l2_delta(sequence=105)))
+    assert book.sequence_id == 105
+    assert not book.first_delta_after_snapshot
+    assert book.boundary_gap_count == 1
+    assert book.sequence_gap_count == 0
+    assert book.health == "BOUNDARY"
+    assert not book.ready
+
+    assert book.apply_update(parse_arcus_book_update(_l2_delta(sequence=106)))
+    assert book.sequence_id == 106
+    assert book.boundary_gap_count == 1
+    assert book.sequence_gap_count == 0
+    assert book.health == "BOUNDARY"
+
+
+def test_arcus_later_gap_after_boundary_is_true_resync() -> None:
+    snapshot = {
+        **SNAPSHOT,
+        "contents": {**SNAPSHOT["contents"], "lastSequenceId": 100},
+    }
+    book = ArcusOrderBook()
+    book.apply_snapshot(parse_arcus_book_snapshot(snapshot))
+
+    assert book.apply_update(parse_arcus_book_update(_l2_delta(sequence=105)))
+    assert not book.apply_update(parse_arcus_book_update(_l2_delta(sequence=108)))
+    assert book.health == "RESYNC"
+    assert book.sequence_id is None
+    assert book.boundary_gap_count == 1
+    assert book.sequence_gap_count == 1
+
+
+def test_arcus_boundary_requires_matching_bbo_and_repairs_phantom_top_levels() -> None:
+    snapshot = {
+        **SNAPSHOT,
+        "contents": {
+            **SNAPSHOT["contents"],
+            "lastSequenceId": 100,
+            "bids": [["100", "1"], ["99", "2"]],
+            "asks": [["101", "1"], ["102", "2"]],
+        },
+    }
+    boundary = _l2_delta(
+        sequence=105,
+        bids=[["98", "3"]],
+        asks=[["103", "4"]],
+    )
+    bbo = {
+        **BBO_MESSAGE,
+        "contents": {
+            **BBO_MESSAGE["contents"],
+            "bestBid": {"price": "99", "size": "5"},
+            "bestAsk": {"price": "102", "size": "6"},
+            "lastSequenceId": 105,
+        },
+    }
+    book = ArcusOrderBook()
+    book.apply_snapshot(parse_arcus_book_snapshot(snapshot))
+    assert book.apply_update(parse_arcus_book_update(boundary))
+    book.alive_ts = time.time()
+    assert not book.is_fresh(60)
+    assert book.best_bid() == 100.0
+    assert book.best_ask() == 101.0
+
+    stale_bbo = {
+        **bbo,
+        "contents": {**bbo["contents"], "lastSequenceId": 104},
+    }
+    assert book.apply_bbo(parse_arcus_bbo(stale_bbo)) is False
+    assert book.health == "BOUNDARY"
+
+    assert book.apply_bbo(parse_arcus_bbo(bbo)) is True
+    assert book.health == "OK"
+    assert book.ready
+    assert book.is_fresh(60)
+    assert book.best_bid() == 99.0
+    assert book.best_bid_size == 5.0
+    assert book.best_ask() == 102.0
+    assert book.best_ask_size == 6.0
+    assert 100.0 not in book.bids
+    assert 101.0 not in book.asks
+
+
+def test_arcus_bbo_received_before_snapshot_is_reconciled_at_boundary() -> None:
+    snapshot = {
+        **SNAPSHOT,
+        "contents": {
+            **SNAPSHOT["contents"],
+            "lastSequenceId": 100,
+            "bids": [["100", "1"]],
+            "asks": [["101", "1"]],
+        },
+    }
+    bbo = {
+        **BBO_MESSAGE,
+        "contents": {
+            **BBO_MESSAGE["contents"],
+            "bestBid": {"price": "99", "size": "5"},
+            "bestAsk": {"price": "102", "size": "6"},
+            "lastSequenceId": 105,
+        },
+    }
+    book = ArcusOrderBook()
+
+    assert book.apply_bbo(parse_arcus_bbo(bbo)) is False
+    book.apply_snapshot(parse_arcus_book_snapshot(snapshot))
+    assert book.health == "OK"
+    assert book.bbo_sequence_id is None
+
+    assert book.apply_update(parse_arcus_book_update(_l2_delta(sequence=105)))
+    assert book.health == "OK"
+    assert book.ready
+    assert book.best_bid() == 99.0
+    assert book.best_ask() == 102.0
+    assert book.bbo_sequence_id == 105
+
+
 def test_arcus_sequence_gap_invalidates_book_until_fresh_snapshot() -> None:
     book = ArcusOrderBook()
     book.apply_snapshot(parse_arcus_book_snapshot(SNAPSHOT), 1000, 10)
@@ -232,13 +398,13 @@ def test_market_attributes_parsing_preserves_nullable_fields() -> None:
     assert attributes.market_sequence_num == 44
 
 
-def test_only_three_arcus_public_subscriptions_are_used() -> None:
+def test_arcus_public_subscriptions_include_bbo() -> None:
     assert ARCUS_PUBLIC_SUBSCRIPTIONS == (
         "l2OrderbookUpdates",
         "trades",
         "marketAttributes",
+        "bbo",
     )
-    assert "bbo" not in ARCUS_PUBLIC_SUBSCRIPTIONS
 
 
 def test_midpoint_premium_uses_arcus_over_rh_midpoint() -> None:
@@ -417,20 +583,21 @@ class _FakeWebSocket:
         self.sent.append(message)
 
 
-def test_arcus_feed_subscribes_to_exactly_three_public_channels() -> None:
+def test_arcus_feed_subscribes_to_four_public_channels_in_order() -> None:
     feed = ArcusBookFeed("SNDK-USD", ArcusOrderBook())
     websocket = _FakeWebSocket()
 
     asyncio.run(feed.subscribe_public(websocket))
     subscriptions = [json.loads(message) for message in websocket.sent]
 
-    assert len(subscriptions) == 3
+    assert len(subscriptions) == 4
     assert [item["channel"] for item in subscriptions] == list(
         ARCUS_PUBLIC_SUBSCRIPTIONS
     )
     assert subscriptions[0]["id"] == "SNDK-USD"
     assert subscriptions[1]["id"] == "SNDK-USD"
     assert "id" not in subscriptions[2]
+    assert subscriptions[3]["id"] == "SNDK-USD"
 
 
 def test_arcus_feed_gap_requests_book_resync_without_extra_channels() -> None:
@@ -439,6 +606,7 @@ def test_arcus_feed_gap_requests_book_resync_without_extra_channels() -> None:
 
     async def exercise() -> None:
         await feed.handle_message(websocket, SNAPSHOT, 1000, 10)
+        await feed.handle_message(websocket, UPDATE, 1001, 11)
         await feed.handle_message(
             websocket,
             {
@@ -448,8 +616,8 @@ def test_arcus_feed_gap_requests_book_resync_without_extra_channels() -> None:
                     "lastSequenceId": 91051781,
                 },
             },
-            1001,
-            11,
+            1002,
+            12,
         )
 
     asyncio.run(exercise())
@@ -460,6 +628,31 @@ def test_arcus_feed_gap_requests_book_resync_without_extra_channels() -> None:
         "l2OrderbookUpdates",
     ]
     assert feed.book.health == "RESYNC"
+
+
+def test_arcus_feed_dispatches_bbo_and_unlocks_matching_boundary() -> None:
+    feed = ArcusBookFeed("SNDK-USD", ArcusOrderBook())
+    websocket = _FakeWebSocket()
+    snapshot = {
+        **SNAPSHOT,
+        "contents": {**SNAPSHOT["contents"], "lastSequenceId": 100},
+    }
+    boundary = _l2_delta(sequence=105)
+    bbo = {
+        **BBO_MESSAGE,
+        "contents": {**BBO_MESSAGE["contents"], "lastSequenceId": 105},
+    }
+
+    async def exercise() -> None:
+        await feed.handle_message(websocket, snapshot)
+        await feed.handle_message(websocket, boundary)
+        assert feed.book.health == "BOUNDARY"
+        await feed.handle_message(websocket, bbo)
+
+    asyncio.run(exercise())
+    assert feed.book.health == "OK"
+    assert feed.book.ready
+    assert feed.book.sequence_id == 105
 
 
 def _l2_recorder(store: MarketHistoryStore) -> ArcusMarketRecorder:
@@ -647,6 +840,31 @@ def test_arcus_l2_gap_rows_and_new_snapshot_epoch_are_distinguishable(
     assert 91051780 not in {row[7] for row in rows}
     assert feed.book.health == "OK"
     assert feed.book.book_epoch == 2
+    store.close()
+
+
+def test_arcus_boundary_delta_rows_remain_raw_without_fabricated_sequences(
+    tmp_path: Path,
+) -> None:
+    store = MarketHistoryStore(tmp_path / "boundary.sqlite")
+    recorder = _l2_recorder(store)
+    feed = _l2_feed(recorder)
+    boundary = _l2_delta(sequence=91051781)
+
+    async def deliver() -> None:
+        websocket = _FakeWebSocket()
+        await feed.handle_message(websocket, SNAPSHOT, 1000, 10)
+        await feed.handle_message(websocket, boundary, 1001, 11)
+
+    asyncio.run(deliver())
+    assert store.flush().ok
+    rows = _stored_l2_rows(store)
+    assert [(row[3], row[7]) for row in rows] == [
+        *([("snapshot", 91051778)] * 4),
+        *([("delta", 91051781)] * 2),
+    ]
+    assert 91051780 not in {row[7] for row in rows}
+    assert feed.book.health == "BOUNDARY"
     store.close()
 
 

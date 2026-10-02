@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 
-from .arcus import ArcusBookSnapshot, ArcusBookUpdate
+from .arcus import ArcusBBO, ArcusBookSnapshot, ArcusBookUpdate
 from .book import OrderBook
 
 
@@ -28,6 +28,15 @@ class ArcusOrderBook(OrderBook):
         self.local_receive_ts_ms: int | None = None
         self.local_receive_monotonic_ns: int | None = None
         self.sequence_gap_count = 0
+        self.boundary_gap_count = 0
+        self.first_delta_after_snapshot = False
+        self.boundary_bbo_pending = False
+        self.bbo_sequence_id: int | None = None
+        self.bbo_global_sequence_id: int | None = None
+        self.bbo_exchange_timestamp_us: int | None = None
+        self._latest_bbo: ArcusBBO | None = None
+        self._latest_bbo_receive_ts_ms: int | None = None
+        self._latest_bbo_receive_monotonic_ns: int | None = None
 
     @property
     def sequence_health(self) -> str:
@@ -50,6 +59,14 @@ class ArcusOrderBook(OrderBook):
         self.exchange_timestamp_us = None
         self.local_receive_ts_ms = None
         self.local_receive_monotonic_ns = None
+        self.first_delta_after_snapshot = False
+        self.boundary_bbo_pending = False
+        self.bbo_sequence_id = None
+        self.bbo_global_sequence_id = None
+        self.bbo_exchange_timestamp_us = None
+        self._latest_bbo = None
+        self._latest_bbo_receive_ts_ms = None
+        self._latest_bbo_receive_monotonic_ns = None
 
     def mark_stale(self) -> None:
         self.clear()
@@ -98,11 +115,25 @@ class ArcusOrderBook(OrderBook):
         self.global_sequence_id = snapshot.global_sequence_id
         self.exchange_timestamp_us = snapshot.exchange_timestamp_us
         self._receive(local_receive_ts_ms, local_receive_monotonic_ns)
+        self.first_delta_after_snapshot = True
+        self.boundary_bbo_pending = False
+        self.bbo_sequence_id = None
+        self.bbo_global_sequence_id = None
+        self.bbo_exchange_timestamp_us = None
+        if (
+            self._latest_bbo is not None
+            and self._latest_bbo.last_sequence_id < snapshot.last_sequence_id
+        ):
+            self._latest_bbo = None
+            self._latest_bbo_receive_ts_ms = None
+            self._latest_bbo_receive_monotonic_ns = None
         # Synchronization readiness is independent from whether either side
         # currently has a level; ``is_fresh`` separately requires both BBO
         # sides before a premium sample is accepted.
         self.ready = True
         self.health = "OK"
+        if self._latest_bbo is not None:
+            self._reconcile_matching_bbo()
 
     def apply_update(
         self,
@@ -110,13 +141,20 @@ class ArcusOrderBook(OrderBook):
         local_receive_ts_ms: int | None = None,
         local_receive_monotonic_ns: int | None = None,
     ) -> bool:
-        if not self.ready or self.health != "OK" or self.sequence_id is None:
+        if self.sequence_id is None or self.health in ("STALE", "RESYNC"):
             return False
         expected = self.sequence_id + 1
         if update.last_sequence_id < expected:
             # A replayed frame is harmless and must not make a valid book stale.
             return True
-        if update.last_sequence_id != expected:
+        if self.first_delta_after_snapshot:
+            if update.last_sequence_id > expected:
+                self.boundary_gap_count += 1
+                self.boundary_bbo_pending = True
+                self.ready = False
+                self.health = "BOUNDARY"
+            self.first_delta_after_snapshot = False
+        elif update.last_sequence_id != expected:
             self.sequence_gap_count += 1
             self.mark_resync()
             return False
@@ -126,6 +164,77 @@ class ArcusOrderBook(OrderBook):
         self.global_sequence_id = update.global_sequence_id
         self.exchange_timestamp_us = update.exchange_timestamp_us
         self._receive(local_receive_ts_ms, local_receive_monotonic_ns)
-        self.ready = True
-        self.health = "OK"
-        return self.ready
+        if self.boundary_bbo_pending:
+            self._reconcile_matching_bbo()
+        elif self.health != "BOUNDARY":
+            self.ready = True
+            self.health = "OK"
+        return True
+
+    @staticmethod
+    def _apply_authoritative_top(
+        target: dict[float, float],
+        level: tuple[str, str] | None,
+        *,
+        is_bid: bool,
+    ) -> None:
+        if level is None:
+            target.clear()
+            return
+        price = float(level[0])
+        size = float(level[1])
+        if not math.isfinite(price) or not math.isfinite(size) or size <= 0:
+            raise ValueError("Arcus BBO level must be finite and positive")
+        for existing_price in tuple(target):
+            if (is_bid and existing_price > price) or (
+                not is_bid and existing_price < price
+            ):
+                target.pop(existing_price, None)
+        target[price] = size
+
+    def _reconcile_matching_bbo(self) -> bool:
+        bbo = self._latest_bbo
+        if bbo is None or self.sequence_id != bbo.last_sequence_id:
+            return False
+        self._apply_authoritative_top(self.bids, bbo.best_bid, is_bid=True)
+        self._apply_authoritative_top(self.asks, bbo.best_ask, is_bid=False)
+        self.bbo_sequence_id = bbo.last_sequence_id
+        self.bbo_global_sequence_id = bbo.global_sequence_id
+        self.bbo_exchange_timestamp_us = bbo.exchange_timestamp_us
+        self._receive(
+            self._latest_bbo_receive_ts_ms,
+            self._latest_bbo_receive_monotonic_ns,
+        )
+        if self.boundary_bbo_pending:
+            self.boundary_bbo_pending = False
+            self.ready = True
+            self.health = "OK"
+        return True
+
+    def apply_bbo(
+        self,
+        bbo: ArcusBBO,
+        local_receive_ts_ms: int | None = None,
+        local_receive_monotonic_ns: int | None = None,
+    ) -> bool:
+        """Apply a matching-sequence BBO without fabricating L2 events."""
+        if self.sequence_id is None:
+            self._latest_bbo = bbo
+            self._latest_bbo_receive_ts_ms = local_receive_ts_ms
+            self._latest_bbo_receive_monotonic_ns = local_receive_monotonic_ns
+            return False
+        if bbo.last_sequence_id == self.sequence_id:
+            self._latest_bbo = bbo
+            self._latest_bbo_receive_ts_ms = local_receive_ts_ms
+            self._latest_bbo_receive_monotonic_ns = local_receive_monotonic_ns
+            return self._reconcile_matching_bbo()
+        if bbo.last_sequence_id < self.sequence_id:
+            return False
+        if self._latest_bbo is not None and (
+            bbo.last_sequence_id < self._latest_bbo.last_sequence_id
+        ):
+            return False
+        self._latest_bbo = bbo
+        self._latest_bbo_receive_ts_ms = local_receive_ts_ms
+        self._latest_bbo_receive_monotonic_ns = local_receive_monotonic_ns
+        return self._reconcile_matching_bbo()

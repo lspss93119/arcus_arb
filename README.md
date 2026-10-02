@@ -116,10 +116,11 @@ The implementation follows the official documentation at
 
 - REST market discovery: `GET https://api.arcus.xyz/v1/markets`.
 - One public multiplexed WebSocket: `wss://api.arcus.xyz/v1/ws`.
-- Exactly three subscriptions: `l2OrderbookUpdates` for `SNDK-USD`, `trades`
-  for `SNDK-USD`, and global `marketAttributes`.
-- The `bbo` channel is intentionally not subscribed. The L2 update snapshot
-  already supplies the BBO and the deltas maintain the local book.
+- Exactly four subscriptions: `l2OrderbookUpdates` for `SNDK-USD`, `trades`
+  and `bbo` for `SNDK-USD`, and global `marketAttributes`.
+- The first L2 delta after a snapshot may jump forward. That boundary is
+  accepted as a separate synchronization state, while a matching-sequence
+  `bbo` update must confirm the top of book before the book becomes quoteable.
 
 B0's account websocket uses four additional account-state subscriptions on its
 separate connection: `userFills`, `orders`, `positions`, and
@@ -132,9 +133,12 @@ channel operation.
 The CLI symbol is resolved from live metadata (`baseAsset` or
 `marketDisplayName`); tick and quantity precision are never hard-coded. L2
 `lastSequenceId` is the per-market continuity anchor. `globalSequenceId` is
-stored as cross-market telemetry and is not used as the gap anchor. A gap
-clears the book, marks it `RESYNC`, requests a fresh L2 snapshot, and resumes
-only after that snapshot is accepted. Disconnects mark the book `STALE`.
+stored as cross-market telemetry and is not used as the gap anchor. A first
+forward jump after a snapshot is tracked as a boundary and remains blocked
+until a matching-sequence BBO reconciles the top levels. A later mid-stream
+gap clears the book, marks it `RESYNC`, requests a fresh L2 snapshot, and
+resumes only after that snapshot is accepted. Disconnects mark the book
+`STALE`.
 
 Arcus public trades are stored separately with exchange timestamp, local wall
 receive timestamp, local monotonic receive timestamp, price, size, trade ID,

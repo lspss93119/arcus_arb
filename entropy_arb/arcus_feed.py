@@ -1,7 +1,7 @@
 """Public Arcus websocket feed for one market.
 
-One multiplexed public socket carries exactly three Phase A subscriptions:
-the incremental L2 book, public trades, and global market attributes.
+One multiplexed public socket carries the incremental L2 book, public trades,
+the BBO, and global market attributes.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from .arcus import (
     ArcusL2Event,
     ArcusMarketAttributes,
     ArcusTrade,
+    parse_arcus_bbo,
     parse_arcus_book_snapshot,
     parse_arcus_book_update,
     parse_arcus_market_attributes,
@@ -77,7 +78,7 @@ class ArcusBookFeed:
             await result
 
     async def subscribe_public(self, websocket) -> None:
-        """Subscribe to the three required public channels, once each."""
+        """Subscribe to the four required public channels, once each."""
         messages: list[dict[str, Any]] = [
             {
                 "type": "subscribe",
@@ -91,6 +92,11 @@ class ArcusBookFeed:
                 "id": self.market_display_name,
             },
             {"type": "subscribe", "channel": "marketAttributes"},
+            {
+                "type": "subscribe",
+                "channel": "bbo",
+                "id": self.market_display_name,
+            },
         ]
         assert tuple(item["channel"] for item in messages) == ARCUS_PUBLIC_SUBSCRIPTIONS
         for message in messages:
@@ -170,7 +176,9 @@ class ArcusBookFeed:
         local_receive_monotonic_ns: int | None = None,
     ) -> None:
         channel = message.get("channel")
-        if channel in ("l2OrderbookUpdates", "trades") and not self._is_target(message):
+        if channel in ("l2OrderbookUpdates", "trades", "bbo") and not self._is_target(
+            message
+        ):
             return
         wall_ms = (
             int(time.time() * 1000)
@@ -235,6 +243,14 @@ class ArcusBookFeed:
                     await self._resubscribe_book(websocket)
                 self.notify()
                 return
+            self.notify()
+            return
+
+        if channel == "bbo":
+            if message.get("type") not in ("subscribed", "channel_data"):
+                return
+            bbo = parse_arcus_bbo(message)
+            self.book.apply_bbo(bbo, wall_ms, mono_ns)
             self.notify()
             return
 
