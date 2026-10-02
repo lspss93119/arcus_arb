@@ -1653,7 +1653,9 @@ def test_arcus_order_rejected_sanitizes_place_order_rejection_details() -> None:
                         "invalid signature; apiKey=API_KEY_SECRET "
                         "signature=SIGNATURE_SECRET "
                         "privateKey=PRIVATE_KEY_SECRET "
-                        '{"apiKey":"JSON_API_KEY_SECRET"}'
+                        '{"apiKey":"JSON_API_KEY_SECRET"} '
+                        'signedRequestPayload={"apiKey":"NESTED_API_KEY_SECRET",'
+                        '"signature":"NESTED_SIGNATURE_SECRET"}'
                     ),
                 },
                 "signedRequestPayload": "SIGNED_REQUEST_PAYLOAD_SECRET",
@@ -1692,6 +1694,8 @@ def test_arcus_order_rejected_sanitizes_place_order_rejection_details() -> None:
             "SIGNATURE_SECRET",
             "PRIVATE_KEY_SECRET",
             "JSON_API_KEY_SECRET",
+            "NESTED_API_KEY_SECRET",
+            "NESTED_SIGNATURE_SECRET",
             "SIGNED_REQUEST_PAYLOAD_SECRET",
         ):
             assert secret not in rendered

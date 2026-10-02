@@ -123,7 +123,7 @@
 
   Inspect the diff and test output for strategy, market-selection, funding, clip, hold, repeated-round, or live-network changes. Confirm rejection exceptions and telemetry contain only status/code/message and do not expose credentials, signatures, or signed payloads. Confirm the starting branch and target remain `feature/volume-probe-v1` and `main` is not merged.
 
-- [ ] **Step 3: Commit and push**
+- [x] **Step 3: Commit and push**
 
   ```bash
   git add entropy_arb/arcus_execution.py entropy_arb/calibration_runtime.py tests/test_phase_b0.py tests/test_volume_probe.py docs/superpowers/plans/2026-10-02-arcus-order-rejection.md

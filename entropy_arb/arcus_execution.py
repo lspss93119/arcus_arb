@@ -70,6 +70,11 @@ _SENSITIVE_REJECTION_DETAIL = re.compile(
     r"signed[\s_-]*(?:request|payload))[\"']?\s*(?:=|:|\s)\s*[\"']?"
     r"[^,\s;\}\]\"']+[\"']?"
 )
+_UNSANITIZED_SENSITIVE_REJECTION_DETAIL = re.compile(
+    r"(?i)(api[\s_-]*key|private[\s_-]*key|signature|secret|passphrase|"
+    r"signed[\s_-]*(?:request|payload))[\"']?\s*(?:=|:|\s)\s*[\"']?"
+    r"(?!<redacted>)[^,\s;\}\]\"']+"
+)
 
 
 def _sanitize_rejection_detail(value: Any) -> str | None:
@@ -81,6 +86,8 @@ def _sanitize_rejection_detail(value: Any) -> str | None:
     detail = _SENSITIVE_REJECTION_DETAIL.sub(
         lambda match: f"{match.group(1)}=<redacted>", detail
     )
+    if _UNSANITIZED_SENSITIVE_REJECTION_DETAIL.search(detail):
+        detail = "<redacted sensitive server detail>"
     return detail[:_REJECTION_DETAIL_LIMIT]
 
 
