@@ -101,7 +101,7 @@
 
   Inspect the diff for strategy/lifecycle/risk changes, verify websocket envelope code is unchanged, confirm the exact final place/cancel body schemas and timestamp relationships, and confirm no live API calls were made.
 
-- [ ] **Step 3: Commit and push**
+- [x] **Step 3: Commit and push**
 
   ```bash
   git add entropy_arb/arcus_auth.py entropy_arb/arcus_execution.py tests/test_phase_b0.py docs/superpowers/plans/2026-10-02-arcus-wire-format.md
