@@ -14,6 +14,7 @@ import inspect
 import json
 import logging
 import math
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -61,6 +62,81 @@ GOOD_TIL_TIME_DAYS = 32
 
 class ArcusOrderError(RuntimeError):
     """Raised when a maker-only Arcus operation cannot be submitted safely."""
+
+
+_REJECTION_DETAIL_LIMIT = 256
+_SENSITIVE_REJECTION_DETAIL = re.compile(
+    r"(?i)(api[\s_-]*key|private[\s_-]*key|signature|secret|passphrase|"
+    r"signed[\s_-]*(?:request|payload))[\"']?\s*(?:=|:|\s)\s*[\"']?"
+    r"[^,\s;\}\]\"']+[\"']?"
+)
+
+
+def _sanitize_rejection_detail(value: Any) -> str | None:
+    if value is None or not isinstance(value, (str, int, float, bool, Decimal)):
+        return None
+    detail = str(value).strip()
+    if not detail:
+        return None
+    detail = _SENSITIVE_REJECTION_DETAIL.sub(
+        lambda match: f"{match.group(1)}=<redacted>", detail
+    )
+    return detail[:_REJECTION_DETAIL_LIMIT]
+
+
+def _order_rejection_details(
+    response: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    sources: list[Mapping[str, Any]] = [response]
+    scalar_error = response.get("error")
+    for nested_key in ("error", "result", "data"):
+        nested = response.get(nested_key)
+        if isinstance(nested, Mapping):
+            sources.append(nested)
+
+    code = None
+    message = _sanitize_rejection_detail(scalar_error)
+    for source in sources:
+        if code is None:
+            for key in ("code", "errorCode", "error_code", "errorCodeString"):
+                code = _sanitize_rejection_detail(source.get(key))
+                if code is not None:
+                    break
+        if message is None:
+            for key in (
+                "message",
+                "errorMessage",
+                "error_message",
+                "reason",
+                "detail",
+            ):
+                message = _sanitize_rejection_detail(source.get(key))
+                if message is not None:
+                    break
+        if code is not None and message is not None:
+            break
+    return code, message
+
+
+class ArcusOrderRejected(ArcusOrderError):
+    """Raised when Arcus explicitly rejects a placeOrder request."""
+
+    def __init__(
+        self,
+        *,
+        status: int,
+        code: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.status = status
+        self.code = _sanitize_rejection_detail(code)
+        self.message = _sanitize_rejection_detail(message)
+        details = [f"status={status}"]
+        if self.code is not None:
+            details.append(f"code={self.code}")
+        if self.message is not None:
+            details.append(f"message={self.message}")
+        super().__init__(f"Arcus placeOrder rejected: {' '.join(details)}")
 
 
 class ArcusAloWouldCross(ArcusOrderError):
@@ -666,6 +742,9 @@ class ArcusMakerClient:
             "placeOrder", body, self.signer.sign_typed(signed), timestamp_ns
         )
         status = int(response.get("status", 0))
+        if 400 <= status < 500:
+            code, message = _order_rejection_details(response)
+            raise ArcusOrderRejected(status=status, code=code, message=message)
         if status not in (200, 202):
             raise ArcusOrderError(f"Arcus placeOrder rejected with status={status}")
         self.orders_sent += 1

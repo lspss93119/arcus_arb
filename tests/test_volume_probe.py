@@ -13,6 +13,7 @@ from entropy_arb.arcus_execution import (
     ArcusAccountState,
     ArcusFeeTier,
     ArcusMakerClient,
+    ArcusOrderRejected,
     ArcusOrderUpdate,
     ArcusRateLimited,
     ArcusUserFill,
@@ -479,7 +480,12 @@ def _hedge(*, side: str, qty: str) -> HedgeExecutionResult:
     )
 
 
-def _reconciliation_probe_stack(tmp_path, *, with_probe: bool = True):
+def _reconciliation_probe_stack(
+    tmp_path,
+    *,
+    with_probe: bool = True,
+    place_exception: Exception | None = None,
+):
     class FakeBook:
         ready = True
         sequence_health = "OK"
@@ -503,11 +509,15 @@ def _reconciliation_probe_stack(tmp_path, *, with_probe: bool = True):
     class FakeRest:
         def __init__(self) -> None:
             self.fills_data: list[ArcusUserFill] = []
+            self.open_orders_calls = 0
+            self.fills_calls = 0
 
         async def open_orders(self, *args: Any, **kwargs: Any):
+            self.open_orders_calls += 1
             return []
 
         async def fills(self, *args: Any, **kwargs: Any):
+            self.fills_calls += 1
             return list(self.fills_data)
 
     class FakeMaker:
@@ -517,15 +527,21 @@ def _reconciliation_probe_stack(tmp_path, *, with_probe: bool = True):
                 account_index=0,
             )
             self.quantities: list[Decimal] = []
+            self.place_calls = 0
+            self.cancel_calls = 0
 
         async def place_alo(self, **kwargs: Any):
+            self.place_calls += 1
             self.quantities.append(Decimal(str(kwargs["quantity"])))
+            if place_exception is not None:
+                raise place_exception
             return SimpleNamespace(
                 order_id=f"order-{len(self.quantities)}",
                 client_id=kwargs["client_id"],
             )
 
         async def cancel_calibration_order(self, **kwargs: Any):
+            self.cancel_calls += 1
             return {"status": 202}
 
     class FakeHedge:
@@ -597,6 +613,121 @@ def _reconciliation_probe_stack(tmp_path, *, with_probe: bool = True):
         hedge=hedge,
         probe=probe,
     )
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_explicit_place_order_rejected_halts_volume_probe_without_cancel_or_reconcile(
+    tmp_path, status: int
+) -> None:
+    rejection = ArcusOrderRejected(
+        status=status,
+        code="AUTH_FAILED",
+        message="permission denied",
+    )
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        place_exception=rejection,
+    )
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    async def final_state_reader():
+        return Decimal("0"), Decimal("0"), [], []
+
+    async def exercise() -> None:
+        status_result = await probe.run(
+            asyncio.Event(),
+            quantity=Decimal("0.10"),
+            final_state_reader=final_state_reader,
+        )
+        assert status_result is ProbeStatus.HALTED
+        assert probe.state is ProbeState.HALTED
+        assert probe.status is ProbeStatus.HALTED
+        assert executor.lifecycle.state == "REJECTED"
+        assert executor.current_candidate is None
+        assert executor.current_execution_id is None
+        assert executor._current_context is None
+        assert executor.has_live_order is False
+        assert executor._terminal_reconcile_pending is False
+        assert executor.reconciliation_required is False
+        assert stack.maker.place_calls == 1
+        assert stack.maker.cancel_calls == 0
+        assert stack.rest.open_orders_calls == 0
+        assert stack.rest.fills_calls == 0
+        assert stack.hedge.hedges == []
+        assert executor.account_state.calibration_client_ids == set()
+        assert executor.telemetry.store.flush().ok
+        rows = executor.telemetry.store._conn.execute(
+            "SELECT event_type, lifecycle_state, halt_reason "
+            "FROM arcus_calibration_events ORDER BY id"
+        ).fetchall()
+        assert any(
+            event_type == "place_rejected"
+            and lifecycle_state == "REJECTED"
+            and f"status={status}" in (halt_reason or "")
+            for event_type, lifecycle_state, halt_reason in rows
+        )
+        assert not any(event_type == "place_failure" for event_type, *_ in rows)
+        assert executor.lifecycle.client_id is not None
+        await executor.on_fill(
+            ArcusUserFill(
+                trade_id="late-rejected-fill",
+                order_id="rejected-order",
+                client_id=executor.lifecycle.client_id,
+                market_id=33,
+                market_display_name="HYPE-USD",
+                side="SELL",
+                price=Decimal("100.10"),
+                quantity=Decimal("0.01"),
+                fee=Decimal("0.01"),
+                created_at_us=1_001,
+                sequence_number=1,
+                is_snapshot=False,
+            )
+        )
+        assert stack.hedge.hedges == []
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+@pytest.mark.parametrize(
+    "place_exception",
+    [
+        TimeoutError("placement websocket timeout"),
+        ConnectionError("connection lost after send"),
+    ],
+)
+def test_placement_timeout_or_connection_loss_keeps_cancel_reconciliation_safety_path(
+    tmp_path, place_exception: Exception
+) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        place_exception=place_exception,
+    )
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.10"))
+        await probe.place_next_quote()
+        assert stack.maker.place_calls == 1
+        assert executor.risk.halted is True
+        assert executor.lifecycle.state == "CANCEL_SENT"
+        assert stack.maker.cancel_calls == 1
+        assert executor.reconciliation_required is False
+        with pytest.raises(RuntimeError, match="cannot place a second"):
+            await probe.place_next_quote()
+        assert stack.maker.place_calls == 1
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
 
 
 def test_reconcile_routes_recovered_build_and_unwind_fills_once(tmp_path) -> None:

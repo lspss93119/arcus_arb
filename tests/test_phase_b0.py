@@ -29,6 +29,8 @@ try:
         ArcusAccountState,
         ArcusFeeTier,
         ArcusMakerClient,
+        ArcusOrderError,
+        ArcusOrderRejected,
         ArcusOrderUpdate,
         ArcusUserFill,
         parse_arcus_account_fee_tier,
@@ -1560,6 +1562,199 @@ def test_arcus_maker_volume_mode_accepts_vp_prefix_and_nonfixed_quantity() -> No
             client_id="vp-session-1",
         )
         assert ack.order_id == "vp-order"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "response, expected_status, expected_code, expected_message",
+    [
+        (
+            {
+                "status": 401,
+                "error": {
+                    "code": "INVALID_API_KEY",
+                    "message": "invalid apiKey API_KEY_SECRET_401",
+                },
+            },
+            401,
+            "INVALID_API_KEY",
+            "invalid apiKey",
+        ),
+        (
+            {
+                "status": 403,
+                "errorCode": "ACCOUNT_INDEX_MISMATCH",
+                "errorMessage": "accountIndex mismatch",
+            },
+            403,
+            "ACCOUNT_INDEX_MISMATCH",
+            "accountIndex mismatch",
+        ),
+    ],
+)
+def test_arcus_order_rejected_for_explicit_place_order_rejection(
+    response: dict[str, Any],
+    expected_status: int,
+    expected_code: str,
+    expected_message: str,
+) -> None:
+    class FakeRpc:
+        async def post(self, method, payload, signature, timestamp):
+            assert method == "placeOrder"
+            return response
+
+    class FakeSigner:
+        @staticmethod
+        def sign_typed(payload):
+            return "SIGNATURE_SECRET"
+
+    client = ArcusMakerClient(
+        credentials=_credentials(),
+        signer=cast(Any, FakeSigner()),
+        rpc=FakeRpc(),
+    )
+
+    async def run() -> None:
+        with pytest.raises(ArcusOrderRejected) as caught:
+            await client.place_alo(
+                market_id=33,
+                side="SELL",
+                price=Decimal("100.00"),
+                quantity=Decimal("0.01"),
+                tick_size=Decimal("0.01"),
+                step_size=Decimal("0.01"),
+                best_bid=Decimal("99.90"),
+                best_ask=Decimal("100.00"),
+                client_id="b0-rejected-1",
+            )
+
+        rejection = caught.value
+        assert rejection.status == expected_status
+        assert rejection.code == expected_code
+        assert rejection.message is not None
+        assert expected_message in rejection.message
+        assert f"status={expected_status}" in str(rejection)
+        assert expected_code in str(rejection)
+        assert expected_message in str(rejection)
+        assert "API_KEY_SECRET_401" not in str(rejection)
+
+    asyncio.run(run())
+
+
+def test_arcus_order_rejected_sanitizes_place_order_rejection_details() -> None:
+    class FakeRpc:
+        async def post(self, method, payload, signature, timestamp):
+            return {
+                "status": 401,
+                "error": {
+                    "code": "AUTH_FAILED",
+                    "message": (
+                        "invalid signature; apiKey=API_KEY_SECRET "
+                        "signature=SIGNATURE_SECRET "
+                        "privateKey=PRIVATE_KEY_SECRET "
+                        '{"apiKey":"JSON_API_KEY_SECRET"}'
+                    ),
+                },
+                "signedRequestPayload": "SIGNED_REQUEST_PAYLOAD_SECRET",
+            }
+
+    class FakeSigner:
+        @staticmethod
+        def sign_typed(payload):
+            return "SIGNATURE_SECRET"
+
+    client = ArcusMakerClient(
+        credentials=_credentials(),
+        signer=cast(Any, FakeSigner()),
+        rpc=FakeRpc(),
+    )
+
+    async def run() -> None:
+        with pytest.raises(ArcusOrderRejected) as caught:
+            await client.place_alo(
+                market_id=33,
+                side="SELL",
+                price=Decimal("100.00"),
+                quantity=Decimal("0.01"),
+                tick_size=Decimal("0.01"),
+                step_size=Decimal("0.01"),
+                best_bid=Decimal("99.90"),
+                best_ask=Decimal("100.00"),
+                client_id="b0-rejected-2",
+            )
+
+        rendered = str(caught.value)
+        assert "AUTH_FAILED" in rendered
+        assert "invalid signature" in rendered
+        for secret in (
+            "API_KEY_SECRET",
+            "SIGNATURE_SECRET",
+            "PRIVATE_KEY_SECRET",
+            "JSON_API_KEY_SECRET",
+            "SIGNED_REQUEST_PAYLOAD_SECRET",
+        ):
+            assert secret not in rendered
+
+    asyncio.run(run())
+
+
+def test_place_order_rejection_non_4xx_remains_generic() -> None:
+    class FakeRpc:
+        async def post(self, method, payload, signature, timestamp):
+            return {
+                "status": 503,
+                "error": {"code": "UPSTREAM_FAILURE", "message": "try later"},
+            }
+
+    client = ArcusMakerClient(
+        credentials=_credentials(),
+        signer=ArcusSigner(_credentials()),
+        rpc=FakeRpc(),
+    )
+
+    async def run() -> None:
+        with pytest.raises(ArcusOrderError) as caught:
+            await client.place_alo(
+                market_id=33,
+                side="SELL",
+                price=Decimal("100.00"),
+                quantity=Decimal("0.01"),
+                tick_size=Decimal("0.01"),
+                step_size=Decimal("0.01"),
+                best_bid=Decimal("99.90"),
+                best_ask=Decimal("100.00"),
+                client_id="b0-rejected-3",
+            )
+        assert type(caught.value) is ArcusOrderError
+
+    asyncio.run(run())
+
+
+def test_place_order_rejection_transport_failure_remains_ambiguous() -> None:
+    class FakeRpc:
+        async def post(self, method, payload, signature, timestamp):
+            raise TimeoutError("connection lost after send")
+
+    client = ArcusMakerClient(
+        credentials=_credentials(),
+        signer=ArcusSigner(_credentials()),
+        rpc=FakeRpc(),
+    )
+
+    async def run() -> None:
+        with pytest.raises(TimeoutError, match="connection lost after send"):
+            await client.place_alo(
+                market_id=33,
+                side="SELL",
+                price=Decimal("100.00"),
+                quantity=Decimal("0.01"),
+                tick_size=Decimal("0.01"),
+                step_size=Decimal("0.01"),
+                best_bid=Decimal("99.90"),
+                best_ask=Decimal("100.00"),
+                client_id="b0-rejected-4",
+            )
 
     asyncio.run(run())
 

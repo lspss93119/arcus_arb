@@ -26,6 +26,7 @@ from .arcus_execution import (
     ArcusAloWouldCross,
     ArcusFeeTier,
     ArcusMakerClient,
+    ArcusOrderRejected,
     ArcusOrderUpdate,
     ArcusRateLimited,
     ArcusUserFill,
@@ -1240,6 +1241,28 @@ class CalibrationController:
             self.current_candidate = None
             self.current_execution_id = None
             self._current_context = None
+            return
+        except ArcusOrderRejected as exc:
+            execution_id = self.current_execution_id
+            self._forget_order_context(context)
+            self.account_state.calibration_client_ids.discard(client_id)
+            self.lifecycle.record_order_status("REJECTED", Decimal("0"))
+            self.current_candidate = None
+            self.current_execution_id = None
+            self._current_context = None
+            self._cancel_sent = False
+            self._cancel_pending = False
+            self._terminal_reconcile_pending = False
+            self.risk.halt(str(exc))
+            self.telemetry.record(
+                "place_rejected",
+                execution_id=execution_id,
+                client_id=client_id,
+                order_id=None,
+                lifecycle_state="REJECTED",
+                halt_reason=self.risk.halt_reason,
+                account_sequence_id=self.account_state.account_sequence_id,
+            )
             return
         except Exception as exc:
             # A timeout is not proof of rejection; fail closed and reconcile
