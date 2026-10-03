@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -671,8 +672,9 @@ def _stack_fill(
 
 @pytest.mark.parametrize("status", [401, 403])
 def test_explicit_place_order_rejected_halts_volume_probe_without_cancel_or_reconcile(
-    tmp_path, status: int
+    tmp_path, caplog, status: int
 ) -> None:
+    caplog.set_level(logging.INFO, logger="volume-probe")
     rejection = ArcusOrderRejected(
         status=status,
         code="AUTH_FAILED",
@@ -723,6 +725,10 @@ def test_explicit_place_order_rejected_halts_volume_probe_without_cancel_or_reco
             for event_type, lifecycle_state, halt_reason in rows
         )
         assert not any(event_type == "place_failure" for event_type, *_ in rows)
+        assert (
+            f"[volume-probe] place_rejected reason=Arcus placeOrder rejected: "
+            f"status={status} code=AUTH_FAILED message=permission denied"
+        ) in caplog.text
         assert executor.lifecycle.client_id is not None
         await executor.on_fill(
             ArcusUserFill(
@@ -746,6 +752,138 @@ def test_explicit_place_order_rejected_halts_volume_probe_without_cancel_or_reco
         asyncio.run(exercise())
     finally:
         executor.telemetry.store.close()
+
+
+def test_volume_probe_logs_build_unwind_and_flat_completion(caplog) -> None:
+    class FakeBook:
+        def __init__(self, bid: str, ask: str) -> None:
+            self.bid = Decimal(bid)
+            self.ask = Decimal(ask)
+
+        def best_bid(self) -> Decimal:
+            return self.bid
+
+        def best_ask(self) -> Decimal:
+            return self.ask
+
+    class FakeAccumulator:
+        residual_exposure = Decimal("0")
+
+        def reset_if_flat(self) -> None:
+            return None
+
+    class FakeRisk:
+        halted = False
+        halt_reason = None
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.risk = FakeRisk()
+            self.accumulator = FakeAccumulator()
+            self.arcus = SimpleNamespace(book=FakeBook("100", "100.1"))
+            self.hedge = SimpleNamespace(book=FakeBook("99.9", "100.1"))
+            self.pnl = SimpleNamespace(actual_usd=Decimal("0.12"))
+            self.has_live_order = False
+            self._terminal_reconcile_pending = False
+            self.orders: list[QuoteCandidate] = []
+
+        async def place_quote(self, candidate: QuoteCandidate) -> None:
+            self.orders.append(candidate)
+
+    executor = FakeExecutor()
+    controller = VolumeProbeController(
+        executor=cast(Any, executor),
+        config=ProbeConfig(clip_usd=Decimal("10"), probe_side="sell"),
+        symbol="HYPE-USD",
+        session_id="vp-log-test",
+    )
+
+    caplog.set_level(logging.INFO, logger="volume-probe")
+    controller.begin_build(Decimal("0.10"))
+    asyncio.run(controller.place_next_quote())
+    controller.record_hedged_fill(
+        arcus_side="SELL",
+        arcus_price=Decimal("100"),
+        arcus_quantity=Decimal("0.10"),
+        arcus_fee=Decimal("0.01"),
+        hedge=_hedge(side="BUY", qty="0.10"),
+    )
+    controller.begin_unwind()
+    asyncio.run(controller.place_next_quote())
+    controller.record_hedged_fill(
+        arcus_side="BUY",
+        arcus_price=Decimal("100.1"),
+        arcus_quantity=Decimal("0.10"),
+        arcus_fee=Decimal("0.01"),
+        hedge=_hedge(side="SELL", qty="0.10"),
+    )
+    controller.finish_unwind()
+    assert (
+        controller.finalize_positions(
+            arcus_position=Decimal("0"),
+            rh_position=Decimal("0"),
+            arcus_open_orders=[],
+            rh_open_orders=[],
+        )
+        is ProbeStatus.COMPLETED
+    )
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[volume-probe] BUILD quote placed side=SELL" in messages
+    assert "[volume-probe] BUILD fill qty=0.10 avg_px=100" in messages
+    assert "[volume-probe] BUILD hedge side=BUY qty=0.10" in messages
+    assert "[volume-probe] BUILD complete" in messages
+    assert "[volume-probe] UNWIND quote placed side=BUY" in messages
+    assert "[volume-probe] UNWIND fill qty=0.10 avg_px=100.1" in messages
+    assert "[volume-probe] UNWIND hedge side=SELL qty=0.10" in messages
+    assert "[volume-probe] UNWIND complete" in messages
+    assert (
+        "[volume-probe] FINAL arcus_position=0 rh_position=0 "
+        "status=COMPLETED pnl_usd=0.12"
+    ) in messages
+
+
+@pytest.mark.parametrize(
+    ("reason", "event"),
+    [
+        ("Arcus placeOrder rejected: status=401 permission denied", "place_rejected"),
+        ("RH hedge unresolved", "hedge failure/unresolved"),
+        ("volume-probe runtime timeout", "TIMEOUT"),
+        ("market health gate failed", "HALTED"),
+    ],
+)
+def test_volume_probe_logs_terminal_reasons(caplog, reason: str, event: str) -> None:
+    caplog.set_level(logging.INFO, logger="volume-probe")
+
+    controller = _probe_controller()
+    controller._halt(reason)
+
+    assert f"[volume-probe] {event} reason={reason}" in caplog.text
+
+
+def test_volume_probe_logs_reconciliation_required_reason(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="volume-probe")
+
+    controller = _probe_controller()
+    controller._require_reconciliation("Arcus terminal reconciliation deadline expired")
+
+    assert (
+        "[volume-probe] RECONCILIATION_REQUIRED reason="
+        "Arcus terminal reconciliation deadline expired"
+    ) in caplog.text
+
+
+def test_completed_volume_probe_ignores_expected_shutdown_disconnect(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="volume-probe")
+    controller = _probe_controller()
+    controller.machine.state = ProbeState.DONE
+    controller._status = ProbeStatus.COMPLETED
+
+    asyncio.run(controller.on_disconnect())
+
+    assert controller.state is ProbeState.DONE
+    assert controller.status is ProbeStatus.COMPLETED
+    assert "disconnect" not in caplog.text.lower()
 
 
 @pytest.mark.parametrize(

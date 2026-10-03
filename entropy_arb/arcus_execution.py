@@ -31,10 +31,12 @@ except ImportError:  # pragma: no cover - compatibility with websockets < 14
 
 from .arcus import ArcusMarketAttributes
 from .arcus_auth import (
+    ArcusApiKeyRegistration,
     ArcusCredentials,
     ArcusSigner,
     build_cancel_ordersign_payload,
     build_ordersign_payload,
+    validate_registered_api_key,
 )
 from .calibration import ARCUS_CALIBRATION_QTY
 
@@ -1183,6 +1185,21 @@ class ArcusAccountRest:
         if not isinstance(payload, Mapping):
             raise RuntimeError(f"Arcus {path} returned a non-object response")
         return payload
+
+    async def validate_api_key_registration(
+        self, credentials: ArcusCredentials, signer: ArcusSigner
+    ) -> ArcusApiKeyRegistration:
+        """Verify the existing signer is active for this wallet/subaccount."""
+
+        payload = await self.get(
+            "/v1/apiKeys",
+            {"address": credentials.account_address},
+        )
+        return validate_registered_api_key(
+            payload,
+            derived_public_key=signer.public_key_hex,
+            runtime_account_index=credentials.account_index,
+        )
 
     async def fee_tiers(self) -> tuple[ArcusFeeTier, ...]:
         return parse_arcus_fee_tiers(await self.get("/v1/feetiers", {}))

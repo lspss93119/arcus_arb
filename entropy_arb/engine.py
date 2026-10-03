@@ -31,7 +31,7 @@ from typing import Any, cast
 
 import aiohttp
 
-from .arcus_auth import ArcusCredentials, ArcusSigner
+from .arcus_auth import ArcusApiKeyRegistration, ArcusCredentials, ArcusSigner
 from .arcus_execution import (
     ArcusAccountFeed,
     ArcusAccountRest,
@@ -120,6 +120,24 @@ EXECUTION_TELEMETRY_HEADER = [
 ]
 BALANCE_POLL_SEC = 30.0
 REFERENCE_HEDGE_KEYS = frozenset(("lighter", "lighter-rh"))
+
+
+async def _arcus_credential_preflight(
+    account_rest: ArcusAccountRest,
+    credentials: ArcusCredentials,
+    signer: ArcusSigner,
+) -> ArcusApiKeyRegistration:
+    """Run the read-only key-registration gate before Arcus mutations."""
+
+    registration = await account_rest.validate_api_key_registration(credentials, signer)
+    log.info(
+        "[ARCUS] credential preflight key=%s account_index=%s status=%s valid_until=%s",
+        registration.fingerprint,
+        registration.account_index,
+        registration.status,
+        registration.valid_until or "none",
+    )
+    return registration
 
 
 @dataclass
@@ -609,6 +627,7 @@ class Engine:
             rh_account_limits = await lighter_hedge.fetch_account_limits()
             rh_fee_bps = resolve_verified_rh_fee_bps(lighter_hedge, rh_account_limits)
             account_rest = ArcusAccountRest(self.session, rest_url=cfg.arcus_rest_url)
+            await _arcus_credential_preflight(account_rest, credentials, signer)
             fee_table = await account_rest.fee_tiers()
             startup_state = ArcusAccountState(
                 startup_watermark_us=time.time_ns() // 1000
@@ -1094,6 +1113,7 @@ class Engine:
             rh_account_limits = await lighter_hedge.fetch_account_limits()
             rh_fee_bps = resolve_verified_rh_fee_bps(lighter_hedge, rh_account_limits)
             account_rest = ArcusAccountRest(self.session, rest_url=cfg.arcus_rest_url)
+            await _arcus_credential_preflight(account_rest, credentials, signer)
             fee_table = await account_rest.fee_tiers()
             startup_state = ArcusAccountState(
                 startup_watermark_us=time.time_ns() // 1000

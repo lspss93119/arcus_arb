@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,184 @@ from typing import Any
 
 class ArcusCredentialError(RuntimeError):
     """Raised when a complete, internally consistent Arcus identity is absent."""
+
+
+@dataclass(frozen=True)
+class ArcusApiKeyRegistration:
+    """Safe summary of the runtime key's read-only Arcus registration."""
+
+    fingerprint: str
+    account_index: int
+    status: str
+    valid_until: str | None
+
+
+def _normalized_public_key(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().lower().removeprefix("0x")
+    if not re.fullmatch(r"[0-9a-f]{64}", candidate):
+        return None
+    return candidate
+
+
+def _public_key_fingerprint(public_key_hex: str) -> str:
+    return f"{public_key_hex[:8]}…{public_key_hex[-8:]}"
+
+
+def _api_key_rows(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    rows: Any = payload.get("apiKeys")
+    if rows is None:
+        rows = payload.get("keys")
+    if rows is None:
+        data = payload.get("data")
+        if isinstance(data, Mapping):
+            rows = data.get("apiKeys", data.get("keys"))
+        elif isinstance(data, list):
+            rows = data
+    if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
+        raise ArcusCredentialError(
+            "Arcus credential preflight failed: "
+            "API key registration response has no valid key list"
+        )
+    return list(rows)
+
+
+def _registration_key(row: Mapping[str, Any]) -> str | None:
+    for field_name in ("apiKey", "publicKey", "key"):
+        key = _normalized_public_key(row.get(field_name))
+        if key is not None:
+            return key
+    return None
+
+
+_SAFE_STATUS_VALUES = frozenset(
+    {
+        "ACTIVE",
+        "DELETED",
+        "DISABLED",
+        "EXPIRED",
+        "INACTIVE",
+        "PENDING",
+        "REVOKED",
+        "SUSPENDED",
+    }
+)
+
+
+def _status_text(value: Any) -> tuple[str, str]:
+    raw = str(value or "UNKNOWN").strip().upper()
+    return raw, raw if raw in _SAFE_STATUS_VALUES else "UNKNOWN"
+
+
+def _account_index(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return (
+        result if str(result) == str(value).strip() or isinstance(value, int) else None
+    )
+
+
+def _valid_until_epoch(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            timestamp = float(value)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(timestamp):
+            return None
+        if timestamp > 10**14:
+            timestamp /= 1_000_000
+        elif timestamp > 10**11:
+            timestamp /= 1_000
+        return timestamp
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        timestamp = float(Decimal(text))
+    except (InvalidOperation, ValueError):
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.timestamp()
+    if not math.isfinite(timestamp):
+        return None
+    if timestamp > 10**14:
+        timestamp /= 1_000_000
+    elif timestamp > 10**11:
+        timestamp /= 1_000
+    return timestamp
+
+
+def validate_registered_api_key(
+    payload: Mapping[str, Any],
+    *,
+    derived_public_key: str,
+    runtime_account_index: int,
+) -> ArcusApiKeyRegistration:
+    """Validate the exact runtime key without returning any secret material."""
+
+    derived = _normalized_public_key(derived_public_key)
+    if derived is None:
+        raise ArcusCredentialError(
+            "Arcus credential preflight failed: derived API key is invalid"
+        )
+    rows = _api_key_rows(payload)
+    matches = [row for row in rows if _registration_key(row) == derived]
+    if not matches:
+        raise ArcusCredentialError(
+            "Arcus credential preflight failed: "
+            "API key is not registered for this wallet"
+        )
+    if len(matches) != 1:
+        raise ArcusCredentialError(
+            "Arcus credential preflight failed: API key registration is ambiguous"
+        )
+    row = matches[0]
+    raw_status, status = _status_text(row.get("status"))
+    if raw_status != "ACTIVE":
+        raise ArcusCredentialError(
+            f"Arcus credential preflight failed: API key status={status}"
+        )
+    registered_account_index = _account_index(row.get("accountIndex"))
+    if registered_account_index is None:
+        raise ArcusCredentialError(
+            "Arcus credential preflight failed: API key accountIndex is invalid"
+        )
+    if registered_account_index != runtime_account_index:
+        raise ArcusCredentialError(
+            "Arcus credential preflight failed: "
+            f"API key belongs to accountIndex={registered_account_index}, "
+            f"runtime={runtime_account_index}"
+        )
+    valid_until_value = row.get("validUntil")
+    valid_until = None if valid_until_value is None else str(valid_until_value)
+    if valid_until_value is not None:
+        expiry = _valid_until_epoch(valid_until_value)
+        if expiry is None:
+            raise ArcusCredentialError(
+                "Arcus credential preflight failed: API key validUntil is invalid"
+            )
+        if expiry <= time.time():
+            raise ArcusCredentialError(
+                "Arcus credential preflight failed: API key expired"
+            )
+    return ArcusApiKeyRegistration(
+        fingerprint=_public_key_fingerprint(derived),
+        account_index=registered_account_index,
+        status=status,
+        valid_until=valid_until,
+    )
 
 
 def format_credential_status(
@@ -66,7 +247,7 @@ class ArcusCredentials:
     """
 
     account_address: str
-    api_key: str
+    api_key: str = field(repr=False)
     private_key_text: str = field(repr=False, compare=False)
     account_index: int = 0
 
@@ -226,6 +407,7 @@ class ArcusSigner:
         self.credentials = credentials
         self._private_key = self._load_private_key(credentials.private_key_text)
         public_key = self._private_key.public_key().public_bytes_raw().hex()
+        self._public_key_hex = public_key
         expected = credentials.api_key.lower().removeprefix("0x")
         if not re.fullmatch(r"[0-9a-f]{64}", expected) or public_key != expected:
             raise ArcusCredentialError(
@@ -235,6 +417,12 @@ class ArcusSigner:
             raise ArcusCredentialError(
                 "ARCUS_ACCOUNT_ADDRESS must be a 20-byte 0x address"
             )
+
+    @property
+    def public_key_hex(self) -> str:
+        """Return the derived public key for internal registration checks."""
+
+        return self._public_key_hex
 
     @staticmethod
     def _load_private_key(value: str):
@@ -276,4 +464,8 @@ class ArcusSigner:
         return self._private_key.sign(canonical_json(payload)).hex()
 
     def __repr__(self) -> str:
-        return f"ArcusSigner(api_key={self.credentials.api_key!r}, account_index={self.credentials.account_index})"
+        return (
+            "ArcusSigner("
+            f"api_key={_public_key_fingerprint(self.public_key_hex)!r}, "
+            f"account_index={self.credentials.account_index})"
+        )

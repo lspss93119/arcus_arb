@@ -151,6 +151,7 @@ class VolumeProbeController:
         self._phase_completed_mono: dict[str, float] = {}
         self._failure_reason: str | None = None
         self._status: ProbeStatus | None = None
+        self._terminal_log_keys: set[str] = set()
         self._phase_metrics = {
             "build": _PhaseMetrics(),
             "unwind": _PhaseMetrics(),
@@ -199,8 +200,27 @@ class VolumeProbeController:
             raise RuntimeError("volume-probe phase is not active")
         return self._phase_metrics[self.phase]
 
+    def _log_terminal(self, reason: str) -> None:
+        lower = reason.lower()
+        if "placeorder rejected" in lower:
+            event = "place_rejected"
+        elif "reconciliation" in lower or "deadline" in lower:
+            event = "RECONCILIATION_REQUIRED"
+        elif "hedge" in lower or "unresolved" in lower:
+            event = "hedge failure/unresolved"
+        elif "timeout" in lower or "runtime" in lower:
+            event = "TIMEOUT"
+        else:
+            event = "HALTED"
+        key = f"{event}:{reason}"
+        if key in self._terminal_log_keys:
+            return
+        self._terminal_log_keys.add(key)
+        log.info("[volume-probe] %s reason=%s", event, reason)
+
     def _halt(self, reason: str) -> None:
         self._failure_reason = reason
+        self._log_terminal(reason)
         if self.state in (ProbeState.DONE, ProbeState.RECONCILIATION_REQUIRED):
             self.machine.state = ProbeState.RECONCILIATION_REQUIRED
             self._status = ProbeStatus.RECONCILIATION_REQUIRED
@@ -280,6 +300,7 @@ class VolumeProbeController:
             self.metrics.unwind_seconds = time.monotonic() - started
         self._phase_completed_mono["unwind"] = time.monotonic()
         self.machine.transition(ProbeState.FLAT)
+        log.info("[volume-probe] UNWIND complete")
         self.phase = None
         self.phase_target_qty = None
 
@@ -301,6 +322,7 @@ class VolumeProbeController:
         hedge: HedgeExecutionResult | None,
     ) -> None:
         phase = self._phase()
+        phase_name = (self.phase or "unknown").upper()
         quantity = _decimal(arcus_quantity, "Arcus fill quantity")
         price = _decimal(arcus_price, "Arcus fill price")
         phase.base_qty += quantity
@@ -327,6 +349,21 @@ class VolumeProbeController:
             phase.max_slippage_bps = max(
                 phase.max_slippage_bps, hedge.realized_slippage_bps
             )
+        log.info(
+            "[volume-probe] %s fill qty=%s avg_px=%s",
+            phase_name,
+            quantity,
+            price,
+        )
+        if hedge is not None:
+            log.info(
+                "[volume-probe] %s hedge side=%s qty=%s avg_px=%s latency_ms=%s",
+                phase_name,
+                hedge.hedge_side,
+                hedge.filled_qty,
+                hedge.avg_px,
+                hedge.fill_to_rh_fill_ms,
+            )
         if self.phase == "build":
             self.build_base_qty = phase.base_qty
             target = self.phase_target_qty
@@ -339,6 +376,7 @@ class VolumeProbeController:
                 self.metrics.build_complete_at = now
                 self._phase_completed_mono["build"] = time.monotonic()
                 self.machine.transition(ProbeState.HEDGED)
+                log.info("[volume-probe] BUILD complete")
         elif self.phase == "unwind":
             self.unwind_base_qty = phase.base_qty
 
@@ -440,6 +478,15 @@ class VolumeProbeController:
         self.machine.transition(ProbeState.DONE)
         self.metrics.finished_at = _now_text()
         self._status = ProbeStatus.COMPLETED
+        pnl = getattr(getattr(self.executor, "pnl", None), "actual_usd", None)
+        log.info(
+            "[volume-probe] FINAL arcus_position=%s rh_position=%s status=%s "
+            "pnl_usd=%s",
+            arcus,
+            rh,
+            self._status.value,
+            pnl,
+        )
         return self._status
 
     def _runtime_candidate(self) -> QuoteCandidate:
@@ -472,6 +519,13 @@ class VolumeProbeController:
         await self.executor.place_quote(candidate)
         self._terminal_cancel_requested = False
         self._order_placed_mono = time.monotonic()
+        log.info(
+            "[volume-probe] %s quote placed side=%s price=%s qty=%s",
+            (self.phase or "unknown").upper(),
+            candidate.side,
+            candidate.price,
+            candidate.quantity,
+        )
 
     @staticmethod
     def _fill_key(fill: Any) -> str:
@@ -619,6 +673,8 @@ class VolumeProbeController:
         await self.executor.on_order(update)
 
     async def on_disconnect(self) -> None:
+        if self.state is ProbeState.DONE or self.status is ProbeStatus.COMPLETED:
+            return
         await self.executor.on_disconnect()
         self._halt(
             str(getattr(self.executor.risk, "halt_reason", None) or "Arcus disconnect")
@@ -636,6 +692,7 @@ class VolumeProbeController:
             marker(reason)
         self.machine.state = ProbeState.RECONCILIATION_REQUIRED
         self._status = ProbeStatus.RECONCILIATION_REQUIRED
+        self._log_terminal(reason)
         log.warning("[ARCUS] reconciliation required: %s", reason)
 
     @staticmethod
