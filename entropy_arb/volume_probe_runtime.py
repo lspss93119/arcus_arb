@@ -19,7 +19,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from .arcus_execution import ArcusRateLimited
+from .arcus_execution import (
+    ArcusOrderUpdate,
+    ArcusRateLimited,
+    is_retryable_post_only_reject,
+)
 from .calibration import QuoteCandidate
 from .calibration_runtime import (
     RECONCILIATION_BACKOFF_CAP_SEC,
@@ -47,6 +51,8 @@ def _now_text() -> str:
 log = logging.getLogger("volume-probe")
 RECONCILIATION_DEADLINE_SEC = 15.0
 RECONCILIATION_POLL_SEC = 1.0
+POST_ONLY_RETRY_DELAY_SEC = 1.0
+MAX_CONSECUTIVE_POST_ONLY_REJECTS = 5
 
 
 def _decimal(value: Any, field: str) -> Decimal:
@@ -146,6 +152,9 @@ class VolumeProbeController:
         self.unwind_base_qty = Decimal("0")
         self._order_placed_mono: float | None = None
         self._terminal_cancel_requested = False
+        self._post_only_retry_not_before_mono: float | None = None
+        self._consecutive_post_only_rejects = 0
+        self._seen_post_only_reject_keys: set[str] = set()
         self._round_started_mono = time.monotonic()
         self._phase_started_mono: dict[str, float] = {}
         self._phase_completed_mono: dict[str, float] = {}
@@ -199,6 +208,52 @@ class VolumeProbeController:
         if self.phase not in self._phase_metrics:
             raise RuntimeError("volume-probe phase is not active")
         return self._phase_metrics[self.phase]
+
+    def _reset_post_only_retry_state(self) -> None:
+        self._post_only_retry_not_before_mono = None
+        self._consecutive_post_only_rejects = 0
+        self._seen_post_only_reject_keys.clear()
+
+    def _current_order_context(self, update: Any) -> Any | None:
+        context_lookup = getattr(self.executor, "_context_for_order", None)
+        if callable(context_lookup):
+            context = context_lookup(update)
+        else:
+            context = getattr(self.executor, "_current_context", None)
+        if context is None or context is not getattr(
+            self.executor, "_current_context", None
+        ):
+            return None
+        return context
+
+    def _post_only_reject_keys(self, update: ArcusOrderUpdate) -> set[str]:
+        keys = {
+            f"client:{update.client_id}" if update.client_id else "",
+            f"order:{update.order_id}" if update.order_id else "",
+        }
+        keys.discard("")
+        if not keys:
+            execution_id = getattr(self.executor, "current_execution_id", None)
+            if execution_id:
+                keys.add(f"execution:{execution_id}")
+        return keys
+
+    def _schedule_post_only_retry(self) -> None:
+        self._consecutive_post_only_rejects += 1
+        if self._consecutive_post_only_rejects >= MAX_CONSECUTIVE_POST_ONLY_REJECTS:
+            reason = (
+                "volume probe halted after "
+                f"{MAX_CONSECUTIVE_POST_ONLY_REJECTS} consecutive "
+                "post-only rejects"
+            )
+            halt = getattr(self.executor.risk, "halt", None)
+            if callable(halt):
+                halt(reason)
+            self._halt(reason)
+            return
+        self._post_only_retry_not_before_mono = (
+            time.monotonic() + POST_ONLY_RETRY_DELAY_SEC
+        )
 
     def _log_terminal(self, reason: str) -> None:
         lower = reason.lower()
@@ -257,6 +312,7 @@ class VolumeProbeController:
         self.machine.transition(ProbeState.BUILD)
         self.phase = "build"
         self.phase_target_qty = quantity
+        self._reset_post_only_retry_state()
         self._phase_started_mono["build"] = time.monotonic()
         self.metrics.build_first_quote_at = None
 
@@ -306,6 +362,7 @@ class VolumeProbeController:
         self.phase = "unwind"
         self.phase_target_qty = self.build_base_qty
         self.unwind_target_qty = self.build_base_qty
+        self._reset_post_only_retry_state()
         self._phase_started_mono["unwind"] = time.monotonic()
         self.metrics.unwind_started_at = _now_text()
 
@@ -530,14 +587,28 @@ class VolumeProbeController:
             expected_usd=Decimal("0"),
         )
 
-    async def place_next_quote(self) -> None:
+    async def place_next_quote(self) -> bool:
         if not self.reprice_allowed:
             raise RuntimeError("cannot place a second volume-probe order")
+        if (
+            self._post_only_retry_not_before_mono is not None
+            and time.monotonic() < self._post_only_retry_not_before_mono
+        ):
+            return False
         candidate = self._runtime_candidate()
         phase = self._phase()
+        submitted = await self.executor.place_quote(candidate)
+        if submitted is False:
+            self._order_placed_mono = None
+            if getattr(getattr(self.executor, "risk", None), "halted", False):
+                return False
+            if not self.reprice_allowed:
+                return False
+            self._schedule_post_only_retry()
+            return False
         if phase.first_quote_at is None:
             phase.first_quote_at = _now_text()
-        await self.executor.place_quote(candidate)
+        self._post_only_retry_not_before_mono = None
         self._terminal_cancel_requested = False
         self._order_placed_mono = time.monotonic()
         log.info(
@@ -547,6 +618,7 @@ class VolumeProbeController:
             candidate.price,
             candidate.quantity,
         )
+        return True
 
     @staticmethod
     def _fill_key(fill: Any) -> str:
@@ -696,6 +768,21 @@ class VolumeProbeController:
 
     async def on_order(self, update: Any) -> None:
         await self.executor.on_order(update)
+        context = self._current_order_context(update)
+        if context is None:
+            return
+        if update.status in ("OPEN", "PARTIALLY_FILLED"):
+            self._reset_post_only_retry_state()
+            return
+        if not isinstance(update, ArcusOrderUpdate):
+            return
+        if not is_retryable_post_only_reject(update):
+            return
+        keys = self._post_only_reject_keys(update)
+        if keys and self._seen_post_only_reject_keys.intersection(keys):
+            return
+        self._seen_post_only_reject_keys.update(keys)
+        self._schedule_post_only_retry()
 
     async def on_disconnect(self) -> None:
         if self.state is ProbeState.DONE or self.status in (

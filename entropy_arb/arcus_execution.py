@@ -387,6 +387,8 @@ class ArcusOrderUpdate:
     sequence_number: int | None
     is_snapshot: bool
     last_sequence_id: int | None = None
+    filled_size: Decimal | None = None
+    rejection_reason: str | None = None
 
 
 def parse_arcus_order_update(
@@ -431,6 +433,24 @@ def parse_arcus_order_update(
             raw.get("lastSequenceId", message.get("lastSequenceId")),
             "order.lastSequenceId",
         ),
+        filled_size=_decimal(
+            raw.get("filledSize"), "order.filledSize", allow_none=True
+        ),
+        rejection_reason=_optional_text(raw.get("rejectionReason")),
+    )
+
+
+def is_retryable_post_only_reject(update: ArcusOrderUpdate) -> bool:
+    """Return whether an order rejection is proven to have filled nothing."""
+
+    return (
+        update.status == "REJECTED"
+        and update.rejection_reason == "POST_ONLY_WOULD_CROSS"
+        and update.filled_size is not None
+        and update.filled_size == Decimal("0")
+        and update.original_size is not None
+        and update.remaining_size is not None
+        and update.remaining_size == update.original_size
     )
 
 

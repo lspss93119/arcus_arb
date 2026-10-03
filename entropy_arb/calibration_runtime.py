@@ -30,6 +30,7 @@ from .arcus_execution import (
     ArcusOrderUpdate,
     ArcusRateLimited,
     ArcusUserFill,
+    is_retryable_post_only_reject,
 )
 from .calibration import (
     ARCUS_CALIBRATION_QTY,
@@ -799,8 +800,24 @@ class CalibrationController:
             account_sequence_id=self.account_state.account_sequence_id,
         )
         if update.status in ("REJECTED",):
-            self.risk.halt("Arcus calibration order rejected")
-            self._record_halt()
+            if is_retryable_post_only_reject(update):
+                if context is self._current_context:
+                    # The rejection is terminal, but the account REST view
+                    # still has to prove that no fill/residual survived the
+                    # post-only race before Volume Probe may replace it.
+                    self._terminal_reconcile_pending = True
+                self.telemetry.record(
+                    "post_only_reject",
+                    client_id=update.client_id,
+                    order_id=update.order_id,
+                    execution_id=context.execution_id,
+                    lifecycle_state=context.lifecycle.state,
+                    halt_reason=update.rejection_reason,
+                    account_sequence_id=self.account_state.account_sequence_id,
+                )
+            else:
+                self.risk.halt("Arcus calibration order rejected")
+                self._record_halt()
         if update.status in ("FILLED", "CANCELED", "MARGIN_CANCELED"):
             if context is self._current_context:
                 # A terminal order update is not enough by itself to permit a
@@ -1256,7 +1273,7 @@ class CalibrationController:
             self.risk.halt(f"Arcus cancel unresolved: {exc}")
             self.telemetry.record("cancel_failure", halt_reason=self.risk.halt_reason)
 
-    async def _place_quote(self, candidate: QuoteCandidate) -> None:
+    async def _place_quote(self, candidate: QuoteCandidate) -> bool:
         self._execution_number += 1
         self.current_execution_id = f"{self.session_id}-e{self._execution_number}"
         client_id = f"{self.calibration_prefix}{self._execution_number}"
@@ -1301,7 +1318,7 @@ class CalibrationController:
             self.current_candidate = None
             self.current_execution_id = None
             self._current_context = None
-            return
+            return False
         except ArcusOrderRejected as exc:
             execution_id = self.current_execution_id
             self._forget_order_context(context)
@@ -1323,7 +1340,7 @@ class CalibrationController:
                 halt_reason=self.risk.halt_reason,
                 account_sequence_id=self.account_state.account_sequence_id,
             )
-            return
+            return False
         except Exception as exc:
             # A timeout is not proof of rejection; fail closed and reconcile
             # the clientId through the account stream rather than retrying.
@@ -1332,7 +1349,7 @@ class CalibrationController:
                 "place_failure", client_id=client_id, halt_reason=self.risk.halt_reason
             )
             await self.cancel_outstanding()
-            return
+            return False
         self.lifecycle.order_id = ack.order_id
         if ack.client_id and ack.client_id != client_id:
             self.account_state.calibration_client_ids.add(ack.client_id)
@@ -1353,8 +1370,9 @@ class CalibrationController:
             expected_usd=_text(candidate.expected_usd),
             account_sequence_id=self.account_state.account_sequence_id,
         )
+        return True
 
-    async def place_quote(self, candidate: QuoteCandidate) -> None:
+    async def place_quote(self, candidate: QuoteCandidate) -> bool:
         """Place one already-validated LIMIT+ALO candidate.
 
         B0 continues to use :meth:`step`; the volume probe uses this narrow
@@ -1362,7 +1380,7 @@ class CalibrationController:
         inheriting B0's edge-selection policy.
         """
 
-        await self._place_quote(candidate)
+        return await self._place_quote(candidate)
 
     def _current_order_edge(self) -> Decimal | None:
         if not self.current_candidate or not self.lifecycle.client_id:

@@ -12,6 +12,7 @@ import pytest
 from entropy_arb.arcus_execution import (
     ArcusAccountRest,
     ArcusAccountState,
+    ArcusAloWouldCross,
     ArcusFeeTier,
     ArcusMakerClient,
     ArcusOrderRejected,
@@ -806,6 +807,358 @@ def test_explicit_place_order_rejected_halts_volume_probe_without_cancel_or_reco
             )
         )
         assert stack.hedge.hedges == []
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_async_zero_fill_post_only_rejection_sets_reconcile_barrier_without_halt(
+    tmp_path,
+) -> None:
+    stack = _reconciliation_probe_stack(tmp_path)
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.10"))
+        await probe.place_next_quote()
+        candidate = executor.current_candidate
+        assert candidate is not None
+        await executor.on_order(
+            ArcusOrderUpdate(
+                order_id=executor.lifecycle.order_id or "order-post-only",
+                client_id=executor.lifecycle.client_id,
+                market_id=33,
+                market_display_name="HYPE-USD",
+                side=candidate.side,
+                status="REJECTED",
+                state="REJECTED",
+                price=candidate.price,
+                original_size=candidate.quantity,
+                remaining_size=candidate.quantity,
+                avg_fill_price=None,
+                created_at_us=1_000,
+                updated_at_us=1_001,
+                sequence_number=1,
+                is_snapshot=False,
+                filled_size=Decimal("0"),
+                rejection_reason="POST_ONLY_WOULD_CROSS",
+            )
+        )
+
+        assert executor.lifecycle.state == "REJECTED"
+        assert executor.risk.halted is False
+        assert executor._terminal_reconcile_pending is True
+        assert stack.hedge.hedges == []
+        executor.telemetry.store.flush()
+        rows = executor.telemetry.store._conn.execute(
+            "SELECT event_type, lifecycle_state, halt_reason "
+            "FROM arcus_calibration_events ORDER BY id"
+        ).fetchall()
+        assert any(
+            event_type == "post_only_reject"
+            and lifecycle_state == "REJECTED"
+            and halt_reason == "POST_ONLY_WOULD_CROSS"
+            for event_type, lifecycle_state, halt_reason in rows
+        )
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+@pytest.mark.parametrize(
+    "update_fields",
+    [
+        {"filled_size": Decimal("0.001")},
+        {"filled_size": None},
+        {"remaining_size": Decimal("0.099")},
+        {"rejection_reason": "OTHER_REASON"},
+    ],
+)
+def test_async_non_proven_post_only_rejection_still_halts(
+    tmp_path, update_fields: dict[str, Any]
+) -> None:
+    stack = _reconciliation_probe_stack(tmp_path)
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.10"))
+        await probe.place_next_quote()
+        candidate = executor.current_candidate
+        assert candidate is not None
+        await executor.on_order(
+            ArcusOrderUpdate(
+                order_id=executor.lifecycle.order_id or "order-post-only",
+                client_id=executor.lifecycle.client_id,
+                market_id=33,
+                market_display_name="HYPE-USD",
+                side=candidate.side,
+                status="REJECTED",
+                state="REJECTED",
+                price=candidate.price,
+                original_size=candidate.quantity,
+                remaining_size=update_fields.pop("remaining_size", candidate.quantity),
+                avg_fill_price=None,
+                created_at_us=1_000,
+                updated_at_us=1_001,
+                sequence_number=1,
+                is_snapshot=False,
+                filled_size=update_fields.pop("filled_size", Decimal("0")),
+                rejection_reason=update_fields.pop(
+                    "rejection_reason", "POST_ONLY_WOULD_CROSS"
+                ),
+            )
+        )
+
+        assert executor.risk.halted is True
+        assert executor._terminal_reconcile_pending is False
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_local_would_cross_returns_no_submission_and_cleans_context(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        place_exception=ArcusAloWouldCross("would cross"),
+    )
+    executor = stack.executor
+
+    async def exercise() -> None:
+        submitted = await executor.place_quote(_stack_candidate())
+
+        assert submitted is False
+        assert executor.risk.halted is False
+        assert executor.current_candidate is None
+        assert executor.current_execution_id is None
+        assert executor._current_context is None
+        assert executor.has_live_order is False
+        assert executor.account_state.calibration_client_ids == set()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+def _post_only_reject_update(
+    executor: CalibrationController,
+    *,
+    filled_size: Decimal = Decimal("0"),
+    rejection_reason: str = "POST_ONLY_WOULD_CROSS",
+) -> ArcusOrderUpdate:
+    candidate = executor.current_candidate
+    assert candidate is not None
+    return ArcusOrderUpdate(
+        order_id=executor.lifecycle.order_id or "",
+        client_id=executor.lifecycle.client_id,
+        market_id=33,
+        market_display_name="HYPE-USD",
+        side=candidate.side,
+        status="REJECTED",
+        state="REJECTED",
+        price=candidate.price,
+        original_size=candidate.quantity,
+        remaining_size=candidate.quantity,
+        avg_fill_price=None,
+        created_at_us=1_000,
+        updated_at_us=1_001,
+        sequence_number=1,
+        is_snapshot=False,
+        filled_size=filled_size,
+        rejection_reason=rejection_reason,
+    )
+
+
+def test_post_only_retry_waits_for_reconcile_delay_and_fresh_bbo(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(tmp_path)
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.10"))
+        assert await probe.place_next_quote() is True
+        first_execution_id = executor.current_execution_id
+        first_update = _post_only_reject_update(executor)
+        await probe.on_order(first_update)
+        await probe.on_order(first_update)
+        assert probe._consecutive_post_only_rejects == 1
+        assert executor._terminal_reconcile_pending is True
+
+        await executor.reconcile()
+        assert executor._terminal_reconcile_pending is False
+        assert await probe.place_next_quote() is False
+        assert stack.maker.place_calls == 1
+
+        executor.arcus.book.ask = Decimal("100.20")
+        probe._post_only_retry_not_before_mono = 0.0
+        assert await probe.place_next_quote() is True
+        assert stack.maker.place_calls == 2
+        assert executor.current_execution_id != first_execution_id
+        assert executor.current_candidate is not None
+        assert executor.current_candidate.price == Decimal("100.20")
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+@pytest.mark.parametrize("normal_status", ["OPEN", "PARTIALLY_FILLED"])
+def test_post_only_retry_counter_resets_on_normal_update(
+    tmp_path, normal_status: str
+) -> None:
+    stack = _reconciliation_probe_stack(tmp_path)
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.10"))
+        await probe.place_next_quote()
+        await probe.on_order(_post_only_reject_update(executor))
+        assert probe._consecutive_post_only_rejects == 1
+        await executor.reconcile()
+        probe._post_only_retry_not_before_mono = 0.0
+        assert await probe.place_next_quote() is True
+
+        candidate = executor.current_candidate
+        assert candidate is not None
+        await probe.on_order(
+            ArcusOrderUpdate(
+                order_id=executor.lifecycle.order_id or "",
+                client_id=executor.lifecycle.client_id,
+                market_id=33,
+                market_display_name="HYPE-USD",
+                side=candidate.side,
+                status=normal_status,
+                state=normal_status,
+                price=candidate.price,
+                original_size=candidate.quantity,
+                remaining_size=candidate.quantity,
+                avg_fill_price=None,
+                created_at_us=1_000,
+                updated_at_us=1_001,
+                sequence_number=1,
+                is_snapshot=False,
+            )
+        )
+        assert probe._consecutive_post_only_rejects == 0
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_post_only_retry_policy_applies_during_unwind(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(tmp_path)
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.10"))
+        probe.build_base_qty = Decimal("0.10")
+        probe.machine.transition(ProbeState.HEDGED)
+        probe.begin_unwind()
+        await probe.place_next_quote()
+        assert executor.current_candidate is not None
+        assert executor.current_candidate.side == "BUY"
+
+        await probe.on_order(_post_only_reject_update(executor))
+
+        assert probe._consecutive_post_only_rejects == 1
+        assert probe.status is None
+        assert executor.risk.halted is False
+        assert executor._terminal_reconcile_pending is True
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_five_consecutive_post_only_rejections_halt_without_sixth_quote(
+    tmp_path,
+) -> None:
+    stack = _reconciliation_probe_stack(tmp_path)
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.60"))
+        await probe.place_next_quote()
+        for attempt in range(5):
+            await probe.on_order(_post_only_reject_update(executor))
+            if attempt == 4:
+                break
+            await executor.reconcile()
+            probe._post_only_retry_not_before_mono = 0.0
+            assert await probe.place_next_quote() is True
+
+        assert probe._consecutive_post_only_rejects == 5
+        assert probe.status is ProbeStatus.HALTED
+        assert executor.risk.halted is True
+        assert stack.maker.place_calls == 5
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_local_would_cross_uses_same_cooldown_and_fresh_retry(tmp_path, caplog) -> None:
+    stack = _reconciliation_probe_stack(tmp_path)
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+    calls = 0
+
+    async def place_alo(**kwargs: Any):
+        nonlocal calls
+        calls += 1
+        stack.maker.place_calls += 1
+        stack.maker.quantities.append(Decimal(str(kwargs["quantity"])))
+        if calls == 1:
+            raise ArcusAloWouldCross("would cross")
+        return SimpleNamespace(
+            order_id=f"order-local-{calls}",
+            client_id=kwargs["client_id"],
+        )
+
+    stack.maker.place_alo = place_alo
+    caplog.set_level(logging.INFO, logger="volume-probe")
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.10"))
+        first_client_id = None
+        assert await probe.place_next_quote() is False
+        first_client_id = executor.lifecycle.client_id
+        assert executor.risk.halted is False
+        assert stack.maker.place_calls == 1
+        assert "quote placed" not in caplog.text
+
+        assert await probe.place_next_quote() is False
+        assert stack.maker.place_calls == 1
+        executor.arcus.book.ask = Decimal("100.30")
+        probe._post_only_retry_not_before_mono = 0.0
+        assert await probe.place_next_quote() is True
+        assert stack.maker.place_calls == 2
+        assert executor.lifecycle.client_id != first_client_id
+        assert executor.current_candidate is not None
+        assert executor.current_candidate.price == Decimal("100.30")
 
     try:
         asyncio.run(exercise())

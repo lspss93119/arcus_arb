@@ -36,6 +36,7 @@ try:
         ArcusOrderRejected,
         ArcusOrderUpdate,
         ArcusUserFill,
+        is_retryable_post_only_reject,
         parse_arcus_account_fee_tier,
         parse_arcus_fee_tiers,
         parse_arcus_order_snapshot,
@@ -1482,6 +1483,62 @@ def test_arcus_order_update_supports_cancel_fill_race_states() -> None:
     assert update.status == "CANCELED"
     assert update.remaining_size == Decimal("0.005")
     assert update.sequence_number == 8
+
+
+def test_arcus_order_update_preserves_zero_fill_post_only_rejection_evidence() -> None:
+    update = parse_arcus_order_update(
+        {
+            "type": "channel_data",
+            "channel": "orders",
+            "contents": {
+                "orderId": "o-post-only",
+                "clientId": "b0-post-only-1",
+                "marketId": 33,
+                "side": "SELL",
+                "status": "REJECTED",
+                "originalSize": "0.227",
+                "remainingSize": "0.227",
+                "filledSize": "0",
+                "rejectionReason": "POST_ONLY_WOULD_CROSS",
+            },
+        }
+    )
+
+    assert update.filled_size == Decimal("0")
+    assert update.rejection_reason == "POST_ONLY_WOULD_CROSS"
+    assert is_retryable_post_only_reject(update)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"filledSize": None},
+        {"filledSize": "0.001"},
+        {"remainingSize": "0.226"},
+        {"rejectionReason": "OTHER_REASON"},
+        {"status": "OPEN"},
+    ],
+)
+def test_post_only_retry_predicate_requires_exact_zero_fill_evidence(
+    overrides: dict[str, Any],
+) -> None:
+    content: dict[str, Any] = {
+        "orderId": "o-post-only",
+        "clientId": "b0-post-only-1",
+        "marketId": 33,
+        "side": "SELL",
+        "status": "REJECTED",
+        "originalSize": "0.227",
+        "remainingSize": "0.227",
+        "filledSize": "0",
+        "rejectionReason": "POST_ONLY_WOULD_CROSS",
+    }
+    content.update(overrides)
+    update = parse_arcus_order_update(
+        {"type": "channel_data", "channel": "orders", "contents": content}
+    )
+
+    assert not is_retryable_post_only_reject(update)
 
 
 def test_rh_reject_halts_new_arcus_quoting() -> None:
