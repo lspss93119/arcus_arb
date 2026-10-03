@@ -260,6 +260,27 @@ class VolumeProbeController:
         self._phase_started_mono["build"] = time.monotonic()
         self.metrics.build_first_quote_at = None
 
+    def mark_preorder_only(
+        self,
+        *,
+        arcus_position: Decimal,
+        rh_position: Decimal,
+    ) -> ProbeStatus:
+        """Finalize a no-approval preview without entering a failure state."""
+
+        if self.state is not ProbeState.BUILD or self._status is not None:
+            raise RuntimeError("volume probe is not ready for PREORDER_ONLY")
+        if not self.reprice_allowed:
+            raise RuntimeError("cannot mark PREORDER_ONLY with a pending Arcus order")
+        self.metrics.final_arcus_position = _decimal(
+            arcus_position, "final Arcus position"
+        )
+        self.metrics.final_rh_position = _decimal(rh_position, "final RH position")
+        self.metrics.finished_at = _now_text()
+        self.metrics.status = ProbeStatus.PREORDER_ONLY
+        self._status = ProbeStatus.PREORDER_ONLY
+        return self._status
+
     def begin_unwind(self) -> None:
         if self.state is not ProbeState.HEDGED:
             raise RuntimeError("cannot begin unwind before BUILD is fully hedged")
@@ -673,7 +694,10 @@ class VolumeProbeController:
         await self.executor.on_order(update)
 
     async def on_disconnect(self) -> None:
-        if self.state is ProbeState.DONE or self.status is ProbeStatus.COMPLETED:
+        if self.state is ProbeState.DONE or self.status in (
+            ProbeStatus.COMPLETED,
+            ProbeStatus.PREORDER_ONLY,
+        ):
             return
         await self.executor.on_disconnect()
         self._halt(

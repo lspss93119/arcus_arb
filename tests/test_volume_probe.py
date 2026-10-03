@@ -886,6 +886,80 @@ def test_completed_volume_probe_ignores_expected_shutdown_disconnect(caplog) -> 
     assert "disconnect" not in caplog.text.lower()
 
 
+def _disconnect_tracking_probe() -> tuple[VolumeProbeController, Any]:
+    class FakeRisk:
+        halted = False
+        halt_reason = None
+
+        def __init__(self) -> None:
+            self.halt_calls = 0
+
+        def halt(self, reason: str) -> None:
+            self.halt_calls += 1
+            self.halted = True
+            self.halt_reason = reason
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.risk = FakeRisk()
+            self.has_live_order = False
+            self._terminal_reconcile_pending = False
+            self.disconnect_calls = 0
+
+        async def on_disconnect(self) -> None:
+            self.disconnect_calls += 1
+            self.risk.halt("Arcus account websocket disconnected")
+
+    executor = FakeExecutor()
+    controller = VolumeProbeController(
+        executor=cast(Any, executor),
+        config=ProbeConfig(clip_usd=Decimal("10"), probe_side="sell"),
+        symbol="HYPE-USD",
+        session_id="vp-disconnect-test",
+    )
+    return controller, executor
+
+
+def test_preorder_only_disconnect_is_intentional_noop(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="volume-probe")
+    controller, executor = _disconnect_tracking_probe()
+    controller.begin_build(Decimal("0.10"))
+
+    controller.mark_preorder_only(
+        arcus_position=Decimal("0"),
+        rh_position=Decimal("0"),
+    )
+    asyncio.run(controller.on_disconnect())
+
+    assert controller.state is ProbeState.BUILD
+    assert controller.status is ProbeStatus.PREORDER_ONLY
+    assert controller.metrics.status is ProbeStatus.PREORDER_ONLY
+    assert controller.metrics.final_arcus_position == Decimal("0")
+    assert controller.metrics.final_rh_position == Decimal("0")
+    assert controller.metrics.finished_at is not None
+    assert controller.failure_reason is None
+    assert executor.disconnect_calls == 0
+    assert executor.risk.halt_calls == 0
+    assert "HALTED" not in caplog.text
+
+
+def test_active_probe_disconnect_still_halts(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="volume-probe")
+    controller, executor = _disconnect_tracking_probe()
+    controller.begin_build(Decimal("0.10"))
+
+    asyncio.run(controller.on_disconnect())
+
+    assert controller.state is ProbeState.HALTED
+    assert controller.status is ProbeStatus.HALTED
+    assert controller.failure_reason == "Arcus account websocket disconnected"
+    assert executor.disconnect_calls == 1
+    assert executor.risk.halt_calls == 1
+    assert "[volume-probe] HALTED reason=Arcus account websocket disconnected" in (
+        caplog.text
+    )
+
+
 @pytest.mark.parametrize(
     "place_exception",
     [

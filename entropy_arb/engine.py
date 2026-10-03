@@ -921,10 +921,10 @@ class Engine:
                 self.probe_max_loss_usd,
             )
             if not self.allow_first_order:
-                controller.metrics.status = "PREORDER_ONLY"
-                controller.metrics.final_arcus_position = arcus_position
-                controller.metrics.final_rh_position = rh_position
-                controller.metrics.finished_at = datetime.now(UTC).isoformat()
+                controller.mark_preorder_only(
+                    arcus_position=arcus_position,
+                    rh_position=rh_position,
+                )
                 writer.append(controller.metrics)
                 round_logged = True
                 log.warning(
