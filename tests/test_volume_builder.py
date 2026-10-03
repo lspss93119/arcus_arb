@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import sys
 from dataclasses import replace
 from decimal import Decimal
@@ -19,6 +20,9 @@ from tools.volume_builder import (
     build_child_argv,
     read_round_rows,
     realized_round_volumes,
+)
+from tools.volume_builder import (
+    main as builder_main,
 )
 
 
@@ -80,13 +84,16 @@ def _append_completed_round(
 
 
 class _FakeProcess:
-    def __init__(self, returncode: int = 0) -> None:
+    def __init__(self, returncode: int = 0, wait_hook=None) -> None:
         self.returncode = returncode
+        self.wait_hook = wait_hook
         self.wait_calls = 0
         self.signals: list[int] = []
 
     def wait(self) -> int:
         self.wait_calls += 1
+        if self.wait_hook is not None:
+            self.wait_hook()
         return self.returncode
 
     def send_signal(self, sig: int) -> None:
@@ -94,9 +101,10 @@ class _FakeProcess:
 
 
 class _FakePopen:
-    def __init__(self, callback=None, *, returncode: int = 0) -> None:
+    def __init__(self, callback=None, *, returncode: int = 0, wait_hook=None) -> None:
         self.callback = callback
         self.returncode = returncode
+        self.wait_hook = wait_hook
         self.calls: list[tuple[list[str], dict[str, object]]] = []
         self.processes: list[_FakeProcess] = []
 
@@ -104,7 +112,7 @@ class _FakePopen:
         self.calls.append((list(argv), dict(kwargs)))
         if self.callback is not None:
             self.callback()
-        process = _FakeProcess(self.returncode)
+        process = _FakeProcess(self.returncode, self.wait_hook)
         self.processes.append(process)
         return process
 
@@ -212,6 +220,33 @@ def test_builder_session_writer_has_stable_append_only_schema(tmp_path) -> None:
     assert lines[1].split(",")[-1] == ""
 
 
+def test_builder_session_writer_rejects_existing_header_mismatch(tmp_path) -> None:
+    path = tmp_path / "volume_builder_sessions.csv"
+    path.write_text("wrong_header\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="header mismatch"):
+        VolumeBuilderSessionWriter(path).append(
+            BuilderSessionRow(
+                builder_session_id="vb-1",
+                symbol="HYPE",
+                probe_side="sell",
+                clip_usd=Decimal("20"),
+                target_arcus_volume_usd=Decimal("400"),
+                max_rounds=10,
+                started_at="2026-10-03T00:00:00+00:00",
+                finished_at=None,
+                rounds_started=0,
+                rounds_completed=0,
+                cumulative_arcus_volume_usd=Decimal("0"),
+                cumulative_rh_volume_usd=Decimal("0"),
+                cumulative_realized_pnl_usd=Decimal("0"),
+                max_round_slippage_bps=Decimal("0"),
+                status=BuilderStatus.PREORDER_ONLY,
+                failure_reason=None,
+            )
+        )
+
+
 def test_missing_live_approval_does_not_launch_child_and_logs_preorder_only(
     tmp_path, capsys
 ) -> None:
@@ -301,6 +336,22 @@ def test_noncompleted_round_status_stops_builder(tmp_path, status: str) -> None:
     assert result.rounds_completed == 0
 
 
+def test_completed_round_with_failure_reason_stops_builder(tmp_path) -> None:
+    config = _approved_config(tmp_path)
+    popen = _FakePopen(
+        callback=lambda: _append_completed_round(
+            config.round_log_path,
+            session_id="vp-failure-reason",
+            failure_reason="round warning",
+        )
+    )
+
+    result = VolumeBuilder(config, popen_factory=popen).run()
+
+    assert result.status is BuilderStatus.ROUND_NOT_COMPLETED
+    assert result.rounds_completed == 0
+
+
 def test_nonzero_child_exit_stops_builder(tmp_path) -> None:
     config = _approved_config(tmp_path)
     popen = _FakePopen(returncode=7)
@@ -310,3 +361,156 @@ def test_nonzero_child_exit_stops_builder(tmp_path) -> None:
     assert result.status is BuilderStatus.CHILD_FAILED
     assert result.rounds_started == 1
     assert result.rounds_completed == 0
+
+
+def test_successful_rounds_use_separate_children_and_stop_at_target(tmp_path) -> None:
+    config = _approved_config(tmp_path, target_volume_usd=Decimal("40.20"))
+    round_number = 0
+    delays: list[float] = []
+
+    def append_round() -> None:
+        nonlocal round_number
+        round_number += 1
+        _append_completed_round(config.round_log_path, session_id=f"vp-{round_number}")
+
+    popen = _FakePopen(callback=append_round)
+    result = VolumeBuilder(config, popen_factory=popen, sleep_fn=delays.append).run()
+
+    assert result.status is BuilderStatus.COMPLETED
+    assert result.rounds_started == 2
+    assert result.rounds_completed == 2
+    assert len(popen.calls) == 2
+    assert popen.processes[0] is not popen.processes[1]
+    assert delays == [2.0]
+
+
+def test_max_rounds_stops_after_last_success_without_extra_delay(tmp_path) -> None:
+    config = _approved_config(
+        tmp_path,
+        target_volume_usd=Decimal("1000"),
+        max_rounds=2,
+        inter_round_delay_sec=Decimal("0"),
+    )
+    round_number = 0
+    delays: list[float] = []
+
+    def append_round() -> None:
+        nonlocal round_number
+        round_number += 1
+        _append_completed_round(
+            config.round_log_path, session_id=f"vp-max-{round_number}"
+        )
+
+    result = VolumeBuilder(
+        config,
+        popen_factory=_FakePopen(callback=append_round),
+        sleep_fn=delays.append,
+    ).run()
+
+    assert result.status is BuilderStatus.STOPPED_MAX_ROUNDS
+    assert result.rounds_completed == 2
+    assert delays == [0.0]
+
+
+def test_cumulative_loss_stops_after_completed_round(tmp_path) -> None:
+    config = _approved_config(tmp_path, max_loss_usd=Decimal("0.03"))
+    popen = _FakePopen(
+        callback=lambda: _append_completed_round(
+            config.round_log_path, session_id="vp-loss"
+        )
+    )
+
+    result = VolumeBuilder(config, popen_factory=popen).run()
+
+    assert result.status is BuilderStatus.STOPPED_MAX_LOSS
+    assert result.rounds_completed == 1
+    assert len(popen.calls) == 1
+
+
+def test_failed_child_does_not_trigger_inter_round_delay(tmp_path) -> None:
+    config = _approved_config(tmp_path, inter_round_delay_sec=Decimal("2"))
+    delays: list[float] = []
+
+    result = VolumeBuilder(
+        config,
+        popen_factory=_FakePopen(returncode=9),
+        sleep_fn=delays.append,
+    ).run()
+
+    assert result.status is BuilderStatus.CHILD_FAILED
+    assert delays == []
+
+
+def test_ctrl_c_before_first_child_is_interrupted_without_launch(tmp_path) -> None:
+    config = _approved_config(tmp_path)
+    popen = _FakePopen()
+    builder = VolumeBuilder(config, popen_factory=popen)
+    builder.request_interrupt()
+
+    result = builder.run()
+
+    assert result.status is BuilderStatus.INTERRUPTED
+    assert popen.calls == []
+
+
+def test_ctrl_c_active_child_is_forwarded_and_never_relaunched(tmp_path) -> None:
+    config = _approved_config(tmp_path)
+    builder_ref: list[VolumeBuilder] = []
+
+    def interrupt_active_child() -> None:
+        builder_ref[0].request_interrupt()
+
+    popen = _FakePopen(
+        callback=lambda: _append_completed_round(
+            config.round_log_path, session_id="vp-interrupted", status="COMPLETED"
+        ),
+        returncode=130,
+        wait_hook=interrupt_active_child,
+    )
+    builder = VolumeBuilder(config, popen_factory=popen)
+    builder_ref.append(builder)
+
+    result = builder.run()
+
+    assert result.status is BuilderStatus.INTERRUPTED
+    assert len(popen.calls) == 1
+    assert popen.processes[0].signals == [signal.SIGINT]
+    assert "vp-interrupted" in (result.failure_reason or "")
+
+
+def test_cli_preorder_only_prints_exact_child_command_without_launching(
+    tmp_path, capsys
+) -> None:
+    round_log = tmp_path / "rounds.csv"
+    builder_log = tmp_path / "builder.csv"
+
+    exit_code = builder_main(
+        [
+            "--config",
+            "config.yaml",
+            "--symbol",
+            "HYPE",
+            "--hedge",
+            "lighter-rh",
+            "--probe-side",
+            "sell",
+            "--clip-usd",
+            "20",
+            "--target-volume-usd",
+            "400",
+            "--max-rounds",
+            "10",
+            "--max-loss-usd",
+            "5",
+            "--round-log",
+            str(round_log),
+            "--builder-log",
+            str(builder_log),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "[builder] PREORDER_ONLY no child launched" in output
+    assert f"{sys.executable} main.py --config config.yaml" in output
+    assert read_round_rows(builder_log)[0]["status"] == "PREORDER_ONLY"

@@ -7,11 +7,15 @@ reconciliation behavior.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import csv
 import os
 import shlex
+import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -156,6 +160,11 @@ class VolumeBuilderSessionWriter:
     def append(self, row: BuilderSessionRow) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         write_header = not self.path.exists() or self.path.stat().st_size == 0
+        if not write_header:
+            with self.path.open("r", encoding="utf-8", newline="") as stream:
+                header = tuple(next(csv.reader(stream), []))
+            if header != BUILDER_SESSION_FIELDS:
+                raise ValueError("volume builder session CSV header mismatch")
         with self.path.open("a", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=BUILDER_SESSION_FIELDS)
             if write_header:
@@ -238,9 +247,25 @@ class VolumeBuilder:
         config: BuilderConfig,
         *,
         popen_factory: Callable[..., Any] = subprocess.Popen,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
         self._popen_factory = popen_factory
+        self._sleep_fn = sleep_fn
+        self._active_process: Any | None = None
+        self._interrupt_requested = False
+
+    def request_interrupt(self) -> None:
+        """Request a clean stop and forward SIGINT to an active child."""
+
+        self._interrupt_requested = True
+        process = self._active_process
+        if process is not None:
+            with contextlib.suppress(OSError, ProcessLookupError):
+                process.send_signal(signal.SIGINT)
+
+    def _handle_sigint(self, _signum: int, _frame: Any) -> None:
+        self.request_interrupt()
 
     def _validate_new_round(
         self,
@@ -282,11 +307,34 @@ class VolumeBuilder:
             env=os.environ.copy(),
             cwd=str(self.config.repo_root),
         )
-        return int(process.wait())
+        self._active_process = process
+        try:
+            if self._interrupt_requested:
+                process.send_signal(signal.SIGINT)
+            return int(process.wait())
+        finally:
+            self._active_process = None
 
     def _preorder_only(self, argv: list[str]) -> None:
         print("[builder] PREORDER_ONLY no child launched")
         print(f"[builder] child command: {shlex.join(argv)}")
+
+    def _interrupted_round_reason(self, before_rows: list[dict[str, str]]) -> str:
+        try:
+            rows = read_round_rows(self.config.round_log_path)
+        except Exception as exc:
+            return (
+                f"builder interrupted; latest round unavailable ({type(exc).__name__})"
+            )
+        if len(rows) > len(before_rows):
+            latest = rows[-1]
+            session_id = latest.get("session_id") or "<empty>"
+            round_status = latest.get("status") or "<empty>"
+            return (
+                f"builder interrupted; latest round session_id={session_id} "
+                f"status={round_status}"
+            )
+        return "builder interrupted; no new round row observed"
 
     def run(self) -> BuilderSessionRow:
         started_at = _utc_now()
@@ -300,9 +348,13 @@ class VolumeBuilder:
         status: BuilderStatus | str = BuilderStatus.CHILD_FAILED
         failure_reason: str | None = None
         argv = build_child_argv(self.config)
+        previous_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
 
         try:
-            if not (self.config.confirm_mainnet and self.config.approve_live_builder):
+            if self._interrupt_requested:
+                status = BuilderStatus.INTERRUPTED
+                failure_reason = "builder interrupted"
+            elif not (self.config.confirm_mainnet and self.config.approve_live_builder):
                 status = BuilderStatus.PREORDER_ONLY
                 failure_reason = (
                     "missing --confirm-mainnet and/or --approve-live-builder"
@@ -311,18 +363,34 @@ class VolumeBuilder:
             else:
                 before_rows = read_round_rows(self.config.round_log_path)
                 while rounds_completed < self.config.max_rounds:
+                    if self._interrupt_requested:
+                        status = BuilderStatus.INTERRUPTED
+                        failure_reason = "builder interrupted"
+                        break
                     rounds_started += 1
                     try:
                         returncode = self._launch_and_wait(argv)
                     except Exception as exc:
+                        if self._interrupt_requested:
+                            status = BuilderStatus.INTERRUPTED
+                            failure_reason = self._interrupted_round_reason(before_rows)
+                            break
                         status = BuilderStatus.CHILD_FAILED
                         failure_reason = (
                             f"child launch/wait failed ({type(exc).__name__})"
                         )
                         break
                     if returncode != 0:
+                        if self._interrupt_requested:
+                            status = BuilderStatus.INTERRUPTED
+                            failure_reason = self._interrupted_round_reason(before_rows)
+                            break
                         status = BuilderStatus.CHILD_FAILED
                         failure_reason = f"child exit code={returncode}"
+                        break
+                    if self._interrupt_requested:
+                        status = BuilderStatus.INTERRUPTED
+                        failure_reason = self._interrupted_round_reason(before_rows)
                         break
                     after_rows = read_round_rows(self.config.round_log_path)
                     try:
@@ -359,9 +427,19 @@ class VolumeBuilder:
                     if rounds_completed >= self.config.max_rounds:
                         status = BuilderStatus.STOPPED_MAX_ROUNDS
                         break
+                    if self._interrupt_requested:
+                        status = BuilderStatus.INTERRUPTED
+                        failure_reason = "builder interrupted"
+                        break
+                    self._sleep_fn(float(self.config.inter_round_delay_sec))
+                    if self._interrupt_requested:
+                        status = BuilderStatus.INTERRUPTED
+                        failure_reason = "builder interrupted"
+                        break
                 else:
                     status = BuilderStatus.STOPPED_MAX_ROUNDS
         finally:
+            signal.signal(signal.SIGINT, previous_sigint)
             row = BuilderSessionRow(
                 builder_session_id=builder_session_id,
                 symbol=self.config.symbol,
@@ -382,3 +460,70 @@ class VolumeBuilder:
             )
             VolumeBuilderSessionWriter(self.config.builder_log_path).append(row)
         return row
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Supervise fresh one-shot Arcus volume-probe rounds"
+    )
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--symbol", required=True)
+    parser.add_argument("--hedge", required=True, choices=("lighter-rh",))
+    parser.add_argument("--probe-side", required=True, choices=("buy", "sell"))
+    parser.add_argument("--clip-usd", type=Decimal, required=True)
+    parser.add_argument("--target-volume-usd", type=Decimal, required=True)
+    parser.add_argument("--max-rounds", type=int, required=True)
+    parser.add_argument("--max-loss-usd", type=Decimal, required=True)
+    parser.add_argument("--inter-round-delay-sec", type=Decimal, default=Decimal("2"))
+    parser.add_argument("--confirm-mainnet", action="store_true")
+    parser.add_argument("--approve-live-builder", action="store_true")
+    parser.add_argument(
+        "--round-log",
+        default="logs/volume_probe_rounds.csv",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--builder-log",
+        default="logs/volume_builder_sessions.csv",
+        help=argparse.SUPPRESS,
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        config = BuilderConfig(
+            config_path=Path(args.config),
+            symbol=args.symbol,
+            hedge=args.hedge,
+            probe_side=args.probe_side,
+            clip_usd=args.clip_usd,
+            target_volume_usd=args.target_volume_usd,
+            max_rounds=args.max_rounds,
+            max_loss_usd=args.max_loss_usd,
+            inter_round_delay_sec=args.inter_round_delay_sec,
+            round_log_path=Path(args.round_log),
+            builder_log_path=Path(args.builder_log),
+            repo_root=Path(__file__).resolve().parents[1],
+            confirm_mainnet=args.confirm_mainnet,
+            approve_live_builder=args.approve_live_builder,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    row = VolumeBuilder(config).run()
+    print(f"[builder] finished status={row.status}")
+    if row.failure_reason:
+        print(f"[builder] failure_reason={row.failure_reason}")
+    if row.status in {
+        BuilderStatus.CHILD_FAILED,
+        BuilderStatus.ROUND_NOT_COMPLETED,
+        BuilderStatus.INTERRUPTED,
+    }:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

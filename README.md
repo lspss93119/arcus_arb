@@ -109,6 +109,29 @@ There is no funding-direction optimization, no configurable hold period, and
 no mainnet probe is part of repository verification; tests use local fakes and
 static checks only.
 
+## Volume Builder V2A
+
+V2A supervises the live-validated one-shot volume probe as a fresh child
+process per round. It requires both `--confirm-mainnet` and
+`--approve-live-builder`; without both flags it prints the exact child command,
+writes a `PREORDER_ONLY` builder row, and launches nothing:
+
+```bash
+python tools/volume_builder.py \
+  --config config.yaml --symbol HYPE --hedge lighter-rh \
+  --probe-side sell --clip-usd 20 --target-volume-usd 400 \
+  --max-rounds 10 --max-loss-usd 5 --inter-round-delay-sec 2 \
+  --confirm-mainnet --approve-live-builder
+```
+
+The builder counts only newly appended, `COMPLETED`, flat one-shot rows from
+`logs/volume_probe_rounds.csv`. `--target-volume-usd` is realized Arcus
+turnover; Arcus and RH turnover and cumulative realized PnL are tracked
+separately in the append-only `logs/volume_builder_sessions.csv` log. Any
+failed child, non-completed/non-flat row, loss limit, round limit, or Ctrl-C
+stops the builder without launching another round. Only the existing child
+runtime can access exchange execution APIs.
+
 ## Arcus public API used
 
 The implementation follows the official documentation at
