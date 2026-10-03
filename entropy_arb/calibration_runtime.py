@@ -818,6 +818,8 @@ class CalibrationController:
     async def on_fill(self, fill: ArcusUserFill) -> None:
         self.last_hedge_result = None
         context = self._context_for_fill(fill)
+        if context is None and self.account_state.is_pre_start_fill(fill):
+            return
         if context is None and (
             not fill.is_snapshot
             and fill.client_id
@@ -1512,6 +1514,7 @@ class CalibrationController:
                 self.maker.credentials.account_address,
                 self.metadata.symbol,
                 self.maker.credentials.account_index,
+                from_us=self.account_state.startup_watermark_us,
             )
         except ArcusRateLimited as exc:
             return self._rate_limited_reconciliation(exc)

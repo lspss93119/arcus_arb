@@ -644,6 +644,10 @@ class VolumeProbeController:
             # tied to this probe is an identity ambiguity, not a harmless
             # unrelated event; stop before the inherited controller can
             # ignore it.
+            account_state = getattr(self.executor, "account_state", None)
+            is_pre_start_fill = getattr(account_state, "is_pre_start_fill", None)
+            if callable(is_pre_start_fill) and is_pre_start_fill(fill):
+                return
             if not bool(getattr(fill, "is_snapshot", False)):
                 reason = "unknown Arcus fill identity during volume probe"
                 halt = getattr(self.executor.risk, "halt", None)

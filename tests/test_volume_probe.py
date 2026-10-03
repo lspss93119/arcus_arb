@@ -133,6 +133,60 @@ def test_arcus_account_rest_non_429_keeps_http_failure_behavior() -> None:
     asyncio.run(exercise())
 
 
+def test_arcus_account_rest_fills_passes_microsecond_from_filter() -> None:
+    class Response:
+        status = 200
+        headers: dict[str, str] = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self):
+            return {"fills": []}
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        def get(self, url, *, params, timeout):
+            del timeout
+            self.calls.append((url, params))
+            return Response()
+
+    async def exercise() -> None:
+        session = Session()
+        rest = ArcusAccountRest(cast(Any, session), rest_url="https://arcus.test")
+        assert (
+            await rest.fills(
+                "0x" + "11" * 20,
+                "HYPE-USD",
+                0,
+                from_us=1_791_005_438_292_751,
+            )
+            == []
+        )
+        assert session.calls == [
+            (
+                "https://arcus.test/v1/fills",
+                {
+                    "address": "0x" + "11" * 20,
+                    "market": "HYPE-USD",
+                    "accountIndex": 0,
+                    "limit": 1000,
+                    "from": 1_791_005_438_292_751,
+                },
+            )
+        ]
+
+    asyncio.run(exercise())
+
+
 def test_reconcile_rate_limit_result_keeps_pending_and_uses_bounded_backoff(
     tmp_path, monkeypatch
 ) -> None:
@@ -494,6 +548,8 @@ def _reconciliation_probe_stack(
     rh_min_base: Decimal = Decimal("0.01"),
     rh_min_quote: Decimal | None = None,
     max_order_qty: Decimal = Decimal("0.10"),
+    startup_watermark_us: int = 0,
+    client_prefix: str = "b0-",
 ):
     class FakeBook:
         ready = True
@@ -524,6 +580,7 @@ def _reconciliation_probe_stack(
             self.fills_data: list[ArcusUserFill] = []
             self.open_orders_calls = 0
             self.fills_calls = 0
+            self.fills_from_us: list[int | None] = []
 
         async def open_orders(self, *args: Any, **kwargs: Any):
             self.open_orders_calls += 1
@@ -531,6 +588,7 @@ def _reconciliation_probe_stack(
 
         async def fills(self, *args: Any, **kwargs: Any):
             self.fills_calls += 1
+            self.fills_from_us.append(kwargs.get("from_us"))
             return list(self.fills_data)
 
     class FakeMaker:
@@ -597,7 +655,7 @@ def _reconciliation_probe_stack(
         maker=cast(ArcusMakerClient, maker),
         account_feed=feed,
         account_rest=cast(ArcusAccountRest, rest),
-        account_state=ArcusAccountState(startup_watermark_us=0),
+        account_state=ArcusAccountState(startup_watermark_us=startup_watermark_us),
         metadata=SimpleNamespace(
             market_id=33,
             symbol="HYPE-USD",
@@ -616,6 +674,7 @@ def _reconciliation_probe_stack(
         rh_fee_bps=Decimal("1.0"),
         session_id="vp-reconciliation-test",
         session_limits=SessionLimits(max_order_qty=max_order_qty),
+        client_prefix=client_prefix,
     )
     probe = None
     if with_probe:
@@ -1094,6 +1153,228 @@ def test_reconcile_routes_recovered_build_and_unwind_fills_once(tmp_path) -> Non
 
     try:
         asyncio.run(exercise())
+    finally:
+        executor.telemetry.store.close()
+
+
+@pytest.mark.parametrize("created_at_us", [1_999, 2_000])
+def test_reconcile_ignores_unknown_prestart_vp_fill_and_uses_watermark(
+    tmp_path, created_at_us: int
+) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        with_probe=False,
+        startup_watermark_us=2_000,
+        client_prefix="vp-",
+    )
+    executor = stack.executor
+
+    async def exercise() -> None:
+        await executor._place_quote(_stack_candidate())
+        stack.rest.fills_data = [
+            ArcusUserFill(
+                trade_id="previous-session-fill",
+                order_id="vp-previous-order",
+                client_id="vp-previous-session-1",
+                market_id=33,
+                market_display_name="HYPE-USD",
+                side="SELL",
+                price=Decimal("100.10"),
+                quantity=Decimal("0.04"),
+                fee=Decimal("0.01"),
+                created_at_us=created_at_us,
+                sequence_number=1,
+                is_snapshot=False,
+            )
+        ]
+        await executor.reconcile()
+
+    try:
+        asyncio.run(exercise())
+        assert stack.rest.fills_from_us == [2_000]
+        assert stack.hedge.hedges == []
+        assert executor.risk.halted is False
+        rows = executor.telemetry.store._conn.execute(
+            "SELECT event_type FROM arcus_calibration_events"
+        ).fetchall()
+        assert not any(event_type == "unexpected_fill" for (event_type,) in rows)
+    finally:
+        executor.telemetry.store.close()
+
+
+@pytest.mark.parametrize("created_at_us", [2_001, None])
+def test_reconcile_unknown_non_snapshot_vp_fill_after_or_without_timestamp_halts(
+    tmp_path, created_at_us: int | None
+) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        with_probe=False,
+        startup_watermark_us=2_000,
+        client_prefix="vp-",
+    )
+    executor = stack.executor
+
+    async def exercise() -> None:
+        await executor._place_quote(_stack_candidate())
+        stack.rest.fills_data = [
+            ArcusUserFill(
+                trade_id="unsafe-unknown-fill",
+                order_id="vp-unsafe-order",
+                client_id="vp-unsafe-session-1",
+                market_id=33,
+                market_display_name="HYPE-USD",
+                side="SELL",
+                price=Decimal("100.10"),
+                quantity=Decimal("0.04"),
+                fee=Decimal("0.01"),
+                created_at_us=created_at_us,
+                sequence_number=1,
+                is_snapshot=False,
+            )
+        ]
+        await executor.reconcile()
+
+    try:
+        asyncio.run(exercise())
+        assert executor.risk.halted is True
+        assert stack.hedge.hedges == []
+        executor.telemetry.store.flush()
+        rows = executor.telemetry.store._conn.execute(
+            "SELECT event_type FROM arcus_calibration_events"
+        ).fetchall()
+        assert any(event_type == "unexpected_fill" for (event_type,) in rows)
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_reconcile_mixed_historical_and_current_fill_is_owned_once(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        startup_watermark_us=2_000,
+    )
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    async def exercise() -> None:
+        probe.begin_build(Decimal("0.10"))
+        await probe.place_next_quote()
+        current = ArcusUserFill(
+            trade_id="current-session-fill",
+            order_id=executor.lifecycle.order_id or "",
+            client_id=executor.lifecycle.client_id,
+            market_id=33,
+            market_display_name="HYPE-USD",
+            side="SELL",
+            price=Decimal("100.10"),
+            quantity=Decimal("0.04"),
+            fee=Decimal("0.01"),
+            created_at_us=2_001,
+            sequence_number=2,
+            is_snapshot=False,
+        )
+        historical = ArcusUserFill(
+            trade_id="old-session-fill",
+            order_id="vp-old-order",
+            client_id="vp-old-session-1",
+            market_id=33,
+            market_display_name="HYPE-USD",
+            side="SELL",
+            price=Decimal("100.10"),
+            quantity=Decimal("0.04"),
+            fee=Decimal("0.01"),
+            created_at_us=2_000,
+            sequence_number=1,
+            is_snapshot=False,
+        )
+        stack.rest.fills_data = [current, historical]
+        await executor.reconcile()
+        await probe.on_fill(current)
+        stack.rest.fills_data = [current, historical]
+        await executor.reconcile()
+
+    try:
+        asyncio.run(exercise())
+        assert len(stack.hedge.hedges) == 1
+        assert Decimal(str(stack.hedge.hedges[0]["qty"])) == Decimal("0.04")
+        assert probe.build_base_qty == Decimal("0.04")
+        assert executor.risk.halted is False
+        rows = executor.telemetry.store._conn.execute(
+            "SELECT event_type FROM arcus_calibration_events"
+        ).fetchall()
+        assert not any(event_type == "unexpected_fill" for (event_type,) in rows)
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_volume_probe_unknown_historical_fill_uses_prestart_ownership_rule(
+    tmp_path,
+) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        startup_watermark_us=2_000,
+    )
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    historical = ArcusUserFill(
+        trade_id="old-volume-probe-fill",
+        order_id="vp-old-order",
+        client_id="vp-old-session-1",
+        market_id=33,
+        market_display_name="HYPE-USD",
+        side="SELL",
+        price=Decimal("100.10"),
+        quantity=Decimal("0.04"),
+        fee=Decimal("0.01"),
+        created_at_us=1_999,
+        sequence_number=1,
+        is_snapshot=False,
+    )
+
+    try:
+        probe.begin_build(Decimal("0.10"))
+        asyncio.run(probe.on_fill(historical))
+        assert probe.state is ProbeState.BUILD
+        assert probe.status is None
+        assert executor.risk.halted is False
+        assert stack.hedge.hedges == []
+    finally:
+        executor.telemetry.store.close()
+
+
+def test_volume_probe_unknown_poststart_fill_still_halts(tmp_path) -> None:
+    stack = _reconciliation_probe_stack(
+        tmp_path,
+        startup_watermark_us=2_000,
+    )
+    executor = stack.executor
+    probe = stack.probe
+    assert probe is not None
+
+    poststart = ArcusUserFill(
+        trade_id="unsafe-volume-probe-fill",
+        order_id="vp-unsafe-order",
+        client_id="vp-unsafe-session-1",
+        market_id=33,
+        market_display_name="HYPE-USD",
+        side="SELL",
+        price=Decimal("100.10"),
+        quantity=Decimal("0.04"),
+        fee=Decimal("0.01"),
+        created_at_us=2_001,
+        sequence_number=1,
+        is_snapshot=False,
+    )
+
+    try:
+        probe.begin_build(Decimal("0.10"))
+        asyncio.run(probe.on_fill(poststart))
+        assert probe.state is ProbeState.HALTED
+        assert probe.status is ProbeStatus.HALTED
+        assert executor.risk.halted is True
+        assert stack.hedge.hedges == []
     finally:
         executor.telemetry.store.close()
 

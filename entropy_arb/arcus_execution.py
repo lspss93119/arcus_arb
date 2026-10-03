@@ -564,6 +564,12 @@ class ArcusAccountState:
         if self.seen_trade_ids is None:
             self.seen_trade_ids = set()
 
+    def is_pre_start_fill(self, fill: ArcusUserFill) -> bool:
+        return (
+            fill.created_at_us is not None
+            and fill.created_at_us <= self.startup_watermark_us
+        )
+
     def should_hedge_fill(self, fill: ArcusUserFill) -> bool:
         if fill.trade_id and fill.trade_id in self.seen_trade_ids:
             return False
@@ -573,10 +579,7 @@ class ArcusAccountState:
         # hedge from that snapshot alone.
         if fill.is_snapshot and fill.created_at_us is None:
             return False
-        if (
-            fill.created_at_us is not None
-            and fill.created_at_us <= self.startup_watermark_us
-        ):
+        if self.is_pre_start_fill(fill):
             return False
         if not (
             fill.client_id in self.calibration_client_ids
