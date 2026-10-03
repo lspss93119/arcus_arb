@@ -8,13 +8,18 @@ reconciliation behavior.
 from __future__ import annotations
 
 import csv
+import os
+import shlex
+import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 class BuilderStatus(StrEnum):
@@ -100,7 +105,9 @@ class BuilderConfig:
             raise ValueError("probe_side must be buy or sell")
         if self.max_rounds <= 0:
             raise ValueError("max_rounds must be > 0")
-        object.__setattr__(self, "clip_usd", _positive_decimal(self.clip_usd, "clip_usd"))
+        object.__setattr__(
+            self, "clip_usd", _positive_decimal(self.clip_usd, "clip_usd")
+        )
         object.__setattr__(
             self,
             "target_volume_usd",
@@ -208,3 +215,170 @@ def build_child_argv(config: BuilderConfig) -> list[str]:
         _csv_text(config.clip_usd),
         "--no-dashboard",
     ]
+
+
+@dataclass(frozen=True)
+class _CompletedRound:
+    session_id: str
+    arcus_volume_usd: Decimal
+    rh_volume_usd: Decimal
+    realized_pnl_usd: Decimal
+    max_slippage_bps: Decimal
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+class VolumeBuilder:
+    """Supervise fresh one-shot volume-probe child processes."""
+
+    def __init__(
+        self,
+        config: BuilderConfig,
+        *,
+        popen_factory: Callable[..., Any] = subprocess.Popen,
+    ) -> None:
+        self.config = config
+        self._popen_factory = popen_factory
+
+    def _validate_new_round(
+        self,
+        before_rows: list[dict[str, str]],
+        after_rows: list[dict[str, str]],
+    ) -> _CompletedRound:
+        if len(after_rows) != len(before_rows) + 1:
+            raise ValueError("round CSV did not append exactly one new row")
+        row = after_rows[-1]
+        session_id = (row.get("session_id") or "").strip()
+        if not session_id:
+            raise ValueError("round row has no session_id")
+        if session_id in {item.get("session_id", "") for item in before_rows}:
+            raise ValueError("round row reused an existing session_id")
+        status = (row.get("status") or "").strip()
+        if status != "COMPLETED":
+            raise ValueError(f"round status={status or '<empty>'}")
+        for field in ("final_arcus_position", "final_rh_position"):
+            position = _required_row_decimal(row, field)
+            if position != 0:
+                raise ValueError(f"round {field}={position} is not flat")
+        if row.get("failure_reason") is None or row["failure_reason"].strip():
+            raise ValueError("completed round has failure_reason")
+        arcus_volume, rh_volume = realized_round_volumes(row)
+        realized_pnl = _required_row_decimal(row, "realized_round_pnl_usd")
+        max_slippage = _required_row_decimal(row, "max_rh_slippage_bps")
+        return _CompletedRound(
+            session_id=session_id,
+            arcus_volume_usd=arcus_volume,
+            rh_volume_usd=rh_volume,
+            realized_pnl_usd=realized_pnl,
+            max_slippage_bps=max_slippage,
+        )
+
+    def _launch_and_wait(self, argv: list[str]) -> int:
+        process = self._popen_factory(
+            argv,
+            shell=False,
+            env=os.environ.copy(),
+            cwd=str(self.config.repo_root),
+        )
+        return int(process.wait())
+
+    def _preorder_only(self, argv: list[str]) -> None:
+        print("[builder] PREORDER_ONLY no child launched")
+        print(f"[builder] child command: {shlex.join(argv)}")
+
+    def run(self) -> BuilderSessionRow:
+        started_at = _utc_now()
+        builder_session_id = f"vb-{uuid4().hex[:12]}"
+        rounds_started = 0
+        rounds_completed = 0
+        cumulative_arcus = Decimal("0")
+        cumulative_rh = Decimal("0")
+        cumulative_pnl = Decimal("0")
+        max_slippage = Decimal("0")
+        status: BuilderStatus | str = BuilderStatus.CHILD_FAILED
+        failure_reason: str | None = None
+        argv = build_child_argv(self.config)
+
+        try:
+            if not (self.config.confirm_mainnet and self.config.approve_live_builder):
+                status = BuilderStatus.PREORDER_ONLY
+                failure_reason = (
+                    "missing --confirm-mainnet and/or --approve-live-builder"
+                )
+                self._preorder_only(argv)
+            else:
+                before_rows = read_round_rows(self.config.round_log_path)
+                while rounds_completed < self.config.max_rounds:
+                    rounds_started += 1
+                    try:
+                        returncode = self._launch_and_wait(argv)
+                    except Exception as exc:
+                        status = BuilderStatus.CHILD_FAILED
+                        failure_reason = (
+                            f"child launch/wait failed ({type(exc).__name__})"
+                        )
+                        break
+                    if returncode != 0:
+                        status = BuilderStatus.CHILD_FAILED
+                        failure_reason = f"child exit code={returncode}"
+                        break
+                    after_rows = read_round_rows(self.config.round_log_path)
+                    try:
+                        completed = self._validate_new_round(before_rows, after_rows)
+                    except ValueError as exc:
+                        status = BuilderStatus.ROUND_NOT_COMPLETED
+                        failure_reason = str(exc)
+                        break
+                    before_rows = after_rows
+                    rounds_completed += 1
+                    cumulative_arcus += completed.arcus_volume_usd
+                    cumulative_rh += completed.rh_volume_usd
+                    cumulative_pnl += completed.realized_pnl_usd
+                    max_slippage = max(max_slippage, completed.max_slippage_bps)
+                    print(
+                        f"[builder] round={rounds_completed}/{self.config.max_rounds}"
+                    )
+                    print("status=COMPLETED")
+                    print(
+                        f"arcus_volume=${completed.arcus_volume_usd} "
+                        f"rh_volume=${completed.rh_volume_usd}"
+                    )
+                    print(
+                        f"cumulative_arcus=${cumulative_arcus}/"
+                        f"{self.config.target_volume_usd} "
+                        f"cumulative_pnl=${cumulative_pnl}"
+                    )
+                    if cumulative_pnl <= -self.config.max_loss_usd:
+                        status = BuilderStatus.STOPPED_MAX_LOSS
+                        break
+                    if cumulative_arcus >= self.config.target_volume_usd:
+                        status = BuilderStatus.COMPLETED
+                        break
+                    if rounds_completed >= self.config.max_rounds:
+                        status = BuilderStatus.STOPPED_MAX_ROUNDS
+                        break
+                else:
+                    status = BuilderStatus.STOPPED_MAX_ROUNDS
+        finally:
+            row = BuilderSessionRow(
+                builder_session_id=builder_session_id,
+                symbol=self.config.symbol,
+                probe_side=self.config.probe_side,
+                clip_usd=self.config.clip_usd,
+                target_arcus_volume_usd=self.config.target_volume_usd,
+                max_rounds=self.config.max_rounds,
+                started_at=started_at,
+                finished_at=_utc_now(),
+                rounds_started=rounds_started,
+                rounds_completed=rounds_completed,
+                cumulative_arcus_volume_usd=cumulative_arcus,
+                cumulative_rh_volume_usd=cumulative_rh,
+                cumulative_realized_pnl_usd=cumulative_pnl,
+                max_round_slippage_bps=max_slippage,
+                status=status,
+                failure_reason=failure_reason,
+            )
+            VolumeBuilderSessionWriter(self.config.builder_log_path).append(row)
+        return row
