@@ -65,6 +65,70 @@ def _decimal(value: Any, field: str) -> Decimal:
     return result
 
 
+def _safe_book_fresh(book: Any, staleness_sec: float) -> bool:
+    is_fresh = getattr(book, "is_fresh", None)
+    if not callable(is_fresh):
+        return False
+    try:
+        return bool(is_fresh(staleness_sec))
+    except Exception:
+        return False
+
+
+def _safe_ready_to_trade(hedge: Any) -> bool:
+    ready_to_trade = getattr(hedge, "ready_to_trade", None)
+    if not callable(ready_to_trade):
+        return True
+    try:
+        return bool(ready_to_trade())
+    except Exception:
+        return False
+
+
+def _safe_account_ws_healthy(account_feed: Any) -> bool:
+    channels_healthy = getattr(account_feed, "required_channels_healthy", True)
+    if callable(channels_healthy):
+        try:
+            channels_healthy = bool(channels_healthy())
+        except Exception:
+            channels_healthy = False
+    ready = getattr(account_feed, "ready", None)
+    ready_healthy = False
+    is_set = getattr(ready, "is_set", None)
+    if callable(is_set):
+        try:
+            ready_healthy = bool(is_set())
+        except Exception:
+            ready_healthy = False
+    return bool(
+        getattr(account_feed, "healthy", False) and ready_healthy and channels_healthy
+    )
+
+
+def format_volume_probe_health(
+    *,
+    arcus: Any,
+    hedge: Any,
+    account_feed: Any,
+    staleness_sec: float,
+) -> str:
+    """Format current volume-probe health fields for fail-closed diagnostics."""
+
+    arcus_book = getattr(arcus, "book", None)
+    hedge_book = getattr(hedge, "book", None)
+    return (
+        f"arcus_ready={bool(getattr(arcus_book, 'ready', False))} "
+        f"arcus_sequence={getattr(arcus_book, 'sequence_health', 'STALE')} "
+        "arcus_first_delta_after_snapshot="
+        f"{bool(getattr(arcus_book, 'first_delta_after_snapshot', False))} "
+        f"arcus_fresh={_safe_book_fresh(arcus_book, staleness_sec)} "
+        f"rh_ready={bool(getattr(hedge_book, 'ready', False))} "
+        f"rh_trade_ready={_safe_ready_to_trade(hedge)} "
+        f"rh_fresh={_safe_book_fresh(hedge_book, staleness_sec)} "
+        f"account_ws_healthy={_safe_account_ws_healthy(account_feed)}"
+    )
+
+
 @dataclass
 class _PhaseMetrics:
     base_qty: Decimal = Decimal("0")
@@ -1012,8 +1076,17 @@ class VolumeProbeController:
                     break
                 health = self.executor.market_health()
                 if not health.can_quote:
-                    self.executor.risk.halt("volume-probe market health gate failed")
-                    self._halt("volume-probe market health gate failed")
+                    reason = (
+                        "volume-probe market health gate failed: "
+                        + format_volume_probe_health(
+                            arcus=getattr(self.executor, "arcus", None),
+                            hedge=getattr(self.executor, "hedge", None),
+                            account_feed=getattr(self.executor, "account_feed", None),
+                            staleness_sec=getattr(self.executor, "staleness_sec", 10.0),
+                        )
+                    )
+                    self.executor.risk.halt(reason)
+                    self._halt(reason)
                     await self._cancel_terminal()
                     break
                 if self.state is ProbeState.HEDGED and self.reprice_allowed:

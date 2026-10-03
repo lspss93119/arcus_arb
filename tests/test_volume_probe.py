@@ -40,7 +40,10 @@ from entropy_arb.volume_probe import (
     probe_tolerance,
     unwind_side,
 )
-from entropy_arb.volume_probe_runtime import VolumeProbeController
+from entropy_arb.volume_probe_runtime import (
+    VolumeProbeController,
+    format_volume_probe_health,
+)
 from main import validate_runtime_gates
 
 
@@ -1282,6 +1285,128 @@ def test_volume_probe_logs_reconciliation_required_reason(caplog) -> None:
     assert (
         "[volume-probe] RECONCILIATION_REQUIRED reason="
         "Arcus terminal reconciliation deadline expired"
+    ) in caplog.text
+
+
+def test_volume_probe_health_failure_detail_includes_each_health_field() -> None:
+    ready = asyncio.Event()
+    ready.set()
+
+    class Book:
+        ready = False
+        sequence_health = "BOUNDARY"
+        first_delta_after_snapshot = False
+
+        def best_bid(self) -> Decimal:
+            return Decimal("100")
+
+        def best_ask(self) -> Decimal:
+            return Decimal("101")
+
+        def is_fresh(self, _max_age_sec: float) -> bool:
+            return True
+
+    class HedgeBook(Book):
+        ready = True
+
+    detail = format_volume_probe_health(
+        arcus=SimpleNamespace(book=Book()),
+        hedge=SimpleNamespace(
+            book=HedgeBook(),
+            ready_to_trade=lambda: True,
+        ),
+        account_feed=SimpleNamespace(
+            healthy=True,
+            ready=ready,
+            required_channels_healthy=True,
+        ),
+        staleness_sec=10.0,
+    )
+
+    assert detail == (
+        "arcus_ready=False arcus_sequence=BOUNDARY "
+        "arcus_first_delta_after_snapshot=False arcus_fresh=True "
+        "rh_ready=True rh_trade_ready=True rh_fresh=True "
+        "account_ws_healthy=True"
+    )
+
+
+def test_volume_probe_runtime_health_failure_logs_detailed_reason(caplog) -> None:
+    ready = asyncio.Event()
+    ready.set()
+
+    class Book:
+        ready = False
+        sequence_health = "BOUNDARY"
+        first_delta_after_snapshot = False
+
+        def best_bid(self) -> Decimal:
+            return Decimal("100")
+
+        def best_ask(self) -> Decimal:
+            return Decimal("101")
+
+        def is_fresh(self, _max_age_sec: float) -> bool:
+            return True
+
+    class HedgeBook(Book):
+        ready = True
+
+    class Risk:
+        halted = False
+        halt_reason: str | None = None
+
+        def check_runtime(self) -> None:
+            return None
+
+        def halt(self, reason: str) -> None:
+            self.halted = True
+            self.halt_reason = reason
+
+    executor = SimpleNamespace(
+        risk=Risk(),
+        accumulator=SimpleNamespace(residual_exposure=Decimal("0")),
+        has_live_order=False,
+        _terminal_reconcile_pending=False,
+        arcus=SimpleNamespace(book=Book()),
+        hedge=SimpleNamespace(book=HedgeBook(), ready_to_trade=lambda: True),
+        account_feed=SimpleNamespace(
+            healthy=True,
+            ready=ready,
+            required_channels_healthy=True,
+        ),
+        staleness_sec=10.0,
+        market_health=lambda: SimpleNamespace(can_quote=False),
+    )
+    controller = VolumeProbeController(
+        executor=cast(Any, executor),
+        config=ProbeConfig(clip_usd=Decimal("10"), probe_side="sell"),
+        symbol="HYPE-USD",
+    )
+
+    async def no_initial_quote() -> bool:
+        return False
+
+    setattr(controller, "place_next_quote", no_initial_quote)
+    caplog.set_level(logging.INFO, logger="volume-probe")
+
+    async def final_state_reader():
+        return Decimal("0"), Decimal("0"), [], []
+
+    status = asyncio.run(
+        controller.run(
+            asyncio.Event(),
+            quantity=Decimal("0.10"),
+            final_state_reader=final_state_reader,
+        )
+    )
+
+    assert status is ProbeStatus.HALTED
+    assert (
+        "volume-probe market health gate failed: arcus_ready=False "
+        "arcus_sequence=BOUNDARY arcus_first_delta_after_snapshot=False "
+        "arcus_fresh=True rh_ready=True rh_trade_ready=True rh_fresh=True "
+        "account_ws_healthy=True"
     ) in caplog.text
 
 

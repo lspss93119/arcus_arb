@@ -69,7 +69,10 @@ from .volume_probe import (
     compute_probe_quantity,
     probe_tolerance,
 )
-from .volume_probe_runtime import VolumeProbeController
+from .volume_probe_runtime import (
+    VolumeProbeController,
+    format_volume_probe_health,
+)
 
 log = logging.getLogger("engine")
 
@@ -476,6 +479,104 @@ class Engine:
             await asyncio.sleep(0.1)
         raise RuntimeError(
             "B0 startup timed out waiting for Arcus/RH BBO and market attributes"
+        )
+
+    async def _wait_volume_probe_book_stable(
+        self, account_feed: ArcusAccountFeed, timeout: float = 10.0
+    ) -> None:
+        """Wait for the Arcus snapshot/first-delta boundary to be usable."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            arcus_book = self.arcus.book
+            hedge_book = self.hedge.book
+            try:
+                arcus_bid = arcus_book.best_bid()
+                arcus_ask = arcus_book.best_ask()
+                arcus_fresh = bool(arcus_book.is_fresh(self.cfg.staleness_sec))
+                hedge_fresh = bool(hedge_book.is_fresh(self.cfg.staleness_sec))
+            except Exception:
+                arcus_bid = None
+                arcus_ask = None
+                arcus_fresh = False
+                hedge_fresh = False
+            account_channels_healthy = getattr(
+                account_feed, "required_channels_healthy", False
+            )
+            if callable(account_channels_healthy):
+                try:
+                    account_channels_healthy = bool(account_channels_healthy())
+                except Exception:
+                    account_channels_healthy = False
+            stable = (
+                bool(arcus_book.ready)
+                and getattr(arcus_book, "sequence_health", "STALE") == "OK"
+                and getattr(arcus_book, "first_delta_after_snapshot", True) is False
+                and arcus_bid is not None
+                and arcus_ask is not None
+                and arcus_fresh
+                and bool(hedge_book.ready)
+                and hedge_fresh
+                and bool(account_channels_healthy)
+            )
+            if stable:
+                return
+            health = format_volume_probe_health(
+                arcus=self.arcus,
+                hedge=self.hedge,
+                account_feed=account_feed,
+                staleness_sec=self.cfg.staleness_sec,
+            )
+            if self.stop.is_set():
+                raise RuntimeError(
+                    "volume-probe startup stopped before Arcus book stability: "
+                    + health
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "volume-probe startup book stability timeout: " + health
+                )
+            await asyncio.sleep(min(0.1, remaining))
+
+    def _read_volume_probe_bbo(
+        self, *, account_feed: Any | None = None
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+        """Read the fresh post-barrier Arcus/RH BBO used for the preview."""
+
+        try:
+            arcus_bid = self.arcus.book.best_bid()
+            arcus_ask = self.arcus.book.best_ask()
+            rh_bid = self.hedge.book.best_bid()
+            rh_ask = self.hedge.book.best_ask()
+            arcus_fresh = bool(self.arcus.book.is_fresh(self.cfg.staleness_sec))
+            rh_fresh = bool(self.hedge.book.is_fresh(self.cfg.staleness_sec))
+        except Exception:
+            arcus_bid = arcus_ask = rh_bid = rh_ask = None
+            arcus_fresh = False
+            rh_fresh = False
+        if (
+            arcus_bid is None
+            or arcus_ask is None
+            or rh_bid is None
+            or rh_ask is None
+            or not arcus_fresh
+            or not rh_fresh
+        ):
+            raise RuntimeError(
+                "volume-probe fresh BBO unavailable after startup stability barrier: "
+                + format_volume_probe_health(
+                    arcus=self.arcus,
+                    hedge=self.hedge,
+                    account_feed=account_feed,
+                    staleness_sec=self.cfg.staleness_sec,
+                )
+            )
+        return (
+            Decimal(str(arcus_bid)),
+            Decimal(str(arcus_ask)),
+            Decimal(str(rh_bid)),
+            Decimal(str(rh_ask)),
         )
 
     async def _wait_b0_account_state(
@@ -903,6 +1004,19 @@ class Engine:
                     "RH open order appeared during volume-probe preflight; aborting"
                 )
             ArcusAccountState.validate_starting_inventory(arcus_position, rh_position)
+
+            await self._wait_volume_probe_book_stable(account_feed)
+            arcus_bid, arcus_ask, rh_bid, rh_ask = self._read_volume_probe_bbo(
+                account_feed=account_feed
+            )
+            log.info(
+                "[volume-probe pre-order] fresh_bbo arcus_bid=%s arcus_ask=%s "
+                "rh_bid=%s rh_ask=%s",
+                arcus_bid,
+                arcus_ask,
+                rh_bid,
+                rh_ask,
+            )
 
             controller.begin_build(quantity)
             proposed = controller.candidate(

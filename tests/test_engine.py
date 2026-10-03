@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import time
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -17,6 +18,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from entropy_arb.arcus import ArcusBBO, ArcusBookSnapshot, ArcusBookUpdate  # noqa: E402
+from entropy_arb.arcus_book import ArcusOrderBook  # noqa: E402
 from entropy_arb.book import OrderBook  # noqa: E402
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
@@ -176,6 +179,176 @@ def make_engine(**thr):
 
 def approx(a, b, tol=1e-9):
     assert abs(a - b) <= tol, f"{a} != {b}"
+
+
+class _VolumeProbeStartupBook:
+    def __init__(
+        self,
+        *,
+        ready: bool = True,
+        sequence_health: str = "OK",
+        first_delta_after_snapshot: bool = False,
+        bid: str = "100",
+        ask: str = "101",
+        fresh: bool = True,
+    ) -> None:
+        self.ready = ready
+        self.sequence_health = sequence_health
+        self.first_delta_after_snapshot = first_delta_after_snapshot
+        self.bid = Decimal(bid)
+        self.ask = Decimal(ask)
+        self.fresh = fresh
+
+    def best_bid(self) -> Decimal:
+        return self.bid
+
+    def best_ask(self) -> Decimal:
+        return self.ask
+
+    def is_fresh(self, _max_age_sec: float) -> bool:
+        return self.fresh
+
+
+def _volume_probe_startup_engine(
+    *, arcus_book: Any | None = None
+) -> tuple[Engine, Any]:
+    engine = Engine(make_cfg(recorder_enabled=False))
+    engine.arcus = SimpleNamespace(
+        book=arcus_book or _VolumeProbeStartupBook(),
+    )
+    engine.hedge = SimpleNamespace(book=_VolumeProbeStartupBook())
+    ready = asyncio.Event()
+    ready.set()
+    account_feed = SimpleNamespace(
+        healthy=True,
+        ready=ready,
+        required_channels_healthy=True,
+    )
+    return engine, account_feed
+
+
+def _arcus_startup_snapshot() -> ArcusOrderBook:
+    book = ArcusOrderBook()
+    book.apply_snapshot(
+        ArcusBookSnapshot(
+            bids=(("100", "1"),),
+            asks=(("101", "1"),),
+            last_sequence_id=100,
+            global_sequence_id=1,
+            exchange_timestamp_us=None,
+        ),
+        local_receive_ts_ms=int(time.time() * 1000),
+        local_receive_monotonic_ns=1,
+    )
+    return book
+
+
+def _arcus_startup_delta(sequence: int) -> ArcusBookUpdate:
+    return ArcusBookUpdate(
+        bids=(("100", "1"),),
+        asks=(("101", "1"),),
+        last_sequence_id=sequence,
+        global_sequence_id=sequence,
+        exchange_timestamp_us=None,
+    )
+
+
+def test_volume_probe_startup_snapshot_alone_does_not_satisfy_barrier() -> None:
+    arcus_book = _arcus_startup_snapshot()
+    assert arcus_book.first_delta_after_snapshot
+    engine, account_feed = _volume_probe_startup_engine(arcus_book=arcus_book)
+
+    with pytest.raises(RuntimeError, match="first_delta_after_snapshot=True"):
+        asyncio.run(engine._wait_volume_probe_book_stable(account_feed, timeout=0.0))
+
+
+def test_volume_probe_startup_contiguous_first_delta_satisfies_barrier() -> None:
+    arcus_book = _arcus_startup_snapshot()
+    assert arcus_book.apply_update(
+        _arcus_startup_delta(101),
+        local_receive_ts_ms=int(time.time() * 1000),
+        local_receive_monotonic_ns=2,
+    )
+    engine, account_feed = _volume_probe_startup_engine(arcus_book=arcus_book)
+
+    asyncio.run(engine._wait_volume_probe_book_stable(account_feed, timeout=0.0))
+
+
+def test_volume_probe_startup_boundary_does_not_satisfy_barrier() -> None:
+    arcus_book = _arcus_startup_snapshot()
+    assert arcus_book.apply_update(
+        _arcus_startup_delta(105),
+        local_receive_ts_ms=int(time.time() * 1000),
+        local_receive_monotonic_ns=2,
+    )
+    assert arcus_book.sequence_health == "BOUNDARY"
+    engine, account_feed = _volume_probe_startup_engine(arcus_book=arcus_book)
+
+    with pytest.raises(RuntimeError, match="arcus_sequence=BOUNDARY"):
+        asyncio.run(engine._wait_volume_probe_book_stable(account_feed, timeout=0.0))
+
+
+def test_volume_probe_startup_matching_bbo_after_boundary_allows_barrier() -> None:
+    arcus_book = _arcus_startup_snapshot()
+    assert arcus_book.apply_update(
+        _arcus_startup_delta(105),
+        local_receive_ts_ms=int(time.time() * 1000),
+        local_receive_monotonic_ns=2,
+    )
+    assert arcus_book.sequence_health == "BOUNDARY"
+    assert arcus_book.apply_bbo(
+        ArcusBBO(
+            best_bid=("100", "2"),
+            best_ask=("101", "2"),
+            last_sequence_id=105,
+            global_sequence_id=105,
+            exchange_timestamp_us=None,
+        ),
+        local_receive_ts_ms=int(time.time() * 1000),
+        local_receive_monotonic_ns=3,
+    )
+    assert arcus_book.sequence_health == "OK"
+    assert arcus_book.ready
+    engine, account_feed = _volume_probe_startup_engine(arcus_book=arcus_book)
+
+    asyncio.run(engine._wait_volume_probe_book_stable(account_feed, timeout=0.0))
+
+
+def test_volume_probe_startup_timeout_has_no_place_order_side_effect() -> None:
+    arcus_book = _VolumeProbeStartupBook(
+        ready=False,
+        sequence_health="BOUNDARY",
+        first_delta_after_snapshot=False,
+    )
+    engine, account_feed = _volume_probe_startup_engine(arcus_book=arcus_book)
+    place_calls = 0
+
+    class Maker:
+        async def place_alo(self, **_kwargs: Any) -> None:
+            nonlocal place_calls
+            place_calls += 1
+
+    setattr(engine, "maker", Maker())
+
+    with pytest.raises(RuntimeError, match="volume-probe startup book stability"):
+        asyncio.run(engine._wait_volume_probe_book_stable(account_feed, timeout=0.0))
+    assert place_calls == 0
+
+
+def test_volume_probe_rereads_fresh_bbo_after_startup_barrier() -> None:
+    engine, account_feed = _volume_probe_startup_engine()
+    asyncio.run(engine._wait_volume_probe_book_stable(account_feed, timeout=0.0))
+    engine.arcus.book.bid = Decimal("102")
+    engine.arcus.book.ask = Decimal("103")
+    engine.hedge.book.bid = Decimal("99")
+    engine.hedge.book.ask = Decimal("100")
+
+    assert engine._read_volume_probe_bbo() == (
+        Decimal("102"),
+        Decimal("103"),
+        Decimal("99"),
+        Decimal("100"),
+    )
 
 
 def test_eff_threshold_directions():
