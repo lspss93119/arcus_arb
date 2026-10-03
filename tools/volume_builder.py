@@ -203,9 +203,16 @@ def realized_round_volumes(
     return arcus_volume, rh_volume
 
 
-def build_child_argv(config: BuilderConfig) -> list[str]:
+def build_child_argv(
+    config: BuilderConfig, *, remaining_loss_budget: Decimal | None = None
+) -> list[str]:
     """Build the exact approved one-shot child argv without shell parsing."""
 
+    child_loss_budget = (
+        config.max_loss_usd
+        if remaining_loss_budget is None
+        else _decimal(remaining_loss_budget, "remaining_loss_budget")
+    )
     return [
         sys.executable,
         "main.py",
@@ -222,6 +229,8 @@ def build_child_argv(config: BuilderConfig) -> list[str]:
         config.probe_side,
         "--probe-clip-usd",
         _csv_text(config.clip_usd),
+        "--probe-max-loss-usd",
+        _csv_text(child_loss_budget),
         "--no-dashboard",
     ]
 
@@ -347,7 +356,6 @@ class VolumeBuilder:
         max_slippage = Decimal("0")
         status: BuilderStatus | str = BuilderStatus.CHILD_FAILED
         failure_reason: str | None = None
-        argv = build_child_argv(self.config)
         previous_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
 
         try:
@@ -359,7 +367,12 @@ class VolumeBuilder:
                 failure_reason = (
                     "missing --confirm-mainnet and/or --approve-live-builder"
                 )
-                self._preorder_only(argv)
+                self._preorder_only(
+                    build_child_argv(
+                        self.config,
+                        remaining_loss_budget=self.config.max_loss_usd,
+                    )
+                )
             else:
                 before_rows = read_round_rows(self.config.round_log_path)
                 while rounds_completed < self.config.max_rounds:
@@ -367,6 +380,14 @@ class VolumeBuilder:
                         status = BuilderStatus.INTERRUPTED
                         failure_reason = "builder interrupted"
                         break
+                    remaining_loss_budget = self.config.max_loss_usd + cumulative_pnl
+                    if remaining_loss_budget <= 0:
+                        status = BuilderStatus.STOPPED_MAX_LOSS
+                        break
+                    argv = build_child_argv(
+                        self.config,
+                        remaining_loss_budget=remaining_loss_budget,
+                    )
                     rounds_started += 1
                     try:
                         returncode = self._launch_and_wait(argv)

@@ -1034,6 +1034,68 @@ def test_arcus_recorder_records_bbo_and_attributes(tmp_path: Path) -> None:
     store.close()
 
 
+def _arcus_recorder_books() -> tuple[ArcusOrderBook, SimpleNamespace]:
+    arcus_book = ArcusOrderBook()
+    arcus_book.apply_snapshot(parse_arcus_book_snapshot(SNAPSHOT), 1000, 10)
+    arcus_book.alive_ts = time.time()
+    rh_book = SimpleNamespace(
+        best_bid=lambda: 1539.0,
+        best_ask=lambda: 1540.0,
+        best_bid_size=1.2,
+        best_ask_size=2.3,
+        is_fresh=lambda max_age: True,
+        alive_ts=1000.0,
+        last_update_ts=time.time(),
+    )
+    return arcus_book, rh_book
+
+
+def test_arcus_recorder_default_writes_minute_rows(tmp_path: Path) -> None:
+    arcus_book, rh_book = _arcus_recorder_books()
+    store = MarketHistoryStore(tmp_path / "market-history.sqlite")
+    recorder = ArcusMarketRecorder(
+        store,
+        symbol="SNDK",
+        arcus_book=arcus_book,
+        rh_book=rh_book,
+    )
+
+    assert recorder.record_sample(timestamp_ms=1_700_000_000_000)
+    recorder.close()
+    store.flush()
+
+    assert recorder.rows_written == 1
+    assert recorder.minute_rows_written == 1
+    assert store.count_rows("arcus_samples") == 1
+    assert store.count_rows("arcus_minutes") == 1
+    store.close()
+
+
+def test_arcus_recorder_can_disable_minute_rows_but_keeps_samples(
+    tmp_path: Path,
+) -> None:
+    arcus_book, rh_book = _arcus_recorder_books()
+    store = MarketHistoryStore(tmp_path / "market-history.sqlite")
+    recorder = ArcusMarketRecorder(
+        store,
+        symbol="SNDK",
+        arcus_book=arcus_book,
+        rh_book=rh_book,
+        write_minutes=False,
+    )
+
+    assert recorder.record_sample(timestamp_ms=1_700_000_000_000)
+    assert recorder.record_sample(timestamp_ms=1_700_000_060_000)
+    recorder.close()
+    store.flush()
+
+    assert recorder.rows_written == 2
+    assert recorder.minute_rows_written == 0
+    assert store.count_rows("arcus_samples") == 2
+    assert store.count_rows("arcus_minutes") == 0
+    store.close()
+
+
 def test_record_only_startup_uses_mocked_public_arcus_and_rh_feeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

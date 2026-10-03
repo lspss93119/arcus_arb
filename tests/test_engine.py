@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -1207,6 +1208,57 @@ def test_record_only_drifting_run_inner_skips_strategy_and_observer(monkeypatch)
         "strategy": False,
         "observer": False,
     }
+
+
+def test_volume_probe_disables_arcus_minute_output(monkeypatch) -> None:
+    from entropy_arb import engine as engine_module
+
+    captured = {}
+
+    class StopAfterRecorderConstruction(RuntimeError):
+        pass
+
+    class SpyArcusMarketRecorder:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def record_metadata(self, metadata):
+            raise StopAfterRecorderConstruction
+
+    class NoopRoundWriter:
+        def append(self, metrics):
+            return None
+
+    class FakeVenue:
+        def __init__(self, *, metadata=None):
+            self.book = SimpleNamespace()
+            self.metadata = metadata
+
+        async def load_market(self):
+            return self.metadata
+
+        async def close(self):
+            return None
+
+    metadata = SimpleNamespace(symbol="SNDK", status="ONLINE")
+    arcus = FakeVenue(metadata=metadata)
+    hedge = FakeVenue()
+    eng = Engine(
+        make_cfg(recorder_enabled=False),
+        confirm_mainnet=True,
+        volume_probe=True,
+        probe_clip_usd=20.0,
+        probe_side="sell",
+    )
+    eng.session = cast(Any, object())
+    monkeypatch.setattr(eng, "_make_venue", lambda _conf: hedge)
+    monkeypatch.setattr(engine_module, "ArcusMarketRecorder", SpyArcusMarketRecorder)
+    monkeypatch.setattr(engine_module, "VolumeProbeRoundWriter", NoopRoundWriter)
+
+    with pytest.raises(StopAfterRecorderConstruction):
+        asyncio.run(eng._run_arcus_volume_probe(cast(Any, arcus)))
+
+    assert captured["write_minutes"] is False
 
 
 def attach_reference_venues(

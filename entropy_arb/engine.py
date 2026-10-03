@@ -596,6 +596,7 @@ class Engine:
                 rh_book=self.hedge.book,
                 hedge=cfg.hedge_venue,
                 is_fresh_seconds=cfg.staleness_sec,
+                write_minutes=False,
             )
             self.recorder.record_metadata(metadata)
             self.arcus.set_market_data_sinks(

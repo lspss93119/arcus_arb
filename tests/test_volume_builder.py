@@ -59,6 +59,7 @@ def _append_completed_round(
     status: str = "COMPLETED",
     final_arcus_position: Decimal | str = Decimal("0"),
     final_rh_position: Decimal | str = Decimal("0"),
+    realized_pnl_usd: Decimal | str = Decimal("-0.04"),
     failure_reason: str | None = None,
 ) -> None:
     VolumeProbeRoundWriter(path).append(
@@ -73,7 +74,7 @@ def _append_completed_round(
             unwind_base_qty=Decimal("0.10"),
             unwind_arcus_avg_px=Decimal("101"),
             unwind_rh_avg_px=Decimal("100.9"),
-            realized_round_pnl_usd=Decimal("-0.04"),
+            realized_round_pnl_usd=Decimal(str(realized_pnl_usd)),
             max_rh_slippage_bps=Decimal("2.1"),
             final_arcus_position=Decimal(str(final_arcus_position)),
             final_rh_position=Decimal(str(final_rh_position)),
@@ -136,6 +137,8 @@ def test_build_child_argv_matches_one_shot_volume_probe_command(tmp_path) -> Non
         "sell",
         "--probe-clip-usd",
         "20",
+        "--probe-max-loss-usd",
+        "5",
         "--no-dashboard",
     ]
 
@@ -280,6 +283,8 @@ def test_successful_completed_round_uses_new_flat_session_and_no_shell(
     assert result.cumulative_rh_volume_usd == Decimal("20.10")
     assert popen.calls[0][1]["shell"] is False
     assert popen.calls[0][1]["env"] == os.environ.copy()
+    argv = popen.calls[0][0]
+    assert argv[argv.index("--probe-max-loss-usd") + 1] == "5"
 
 
 def test_round_reusing_existing_session_id_stops_without_counting_it(tmp_path) -> None:
@@ -382,6 +387,85 @@ def test_successful_rounds_use_separate_children_and_stop_at_target(tmp_path) ->
     assert len(popen.calls) == 2
     assert popen.processes[0] is not popen.processes[1]
     assert delays == [2.0]
+
+
+def test_negative_cumulative_pnl_reduces_next_child_loss_budget(tmp_path) -> None:
+    config = _approved_config(tmp_path, target_volume_usd=Decimal("40.20"))
+    round_number = 0
+
+    def append_round() -> None:
+        nonlocal round_number
+        round_number += 1
+        _append_completed_round(
+            config.round_log_path,
+            session_id=f"vp-negative-{round_number}",
+            realized_pnl_usd=(
+                Decimal("-1.25") if round_number == 1 else Decimal("-0.04")
+            ),
+        )
+
+    popen = _FakePopen(callback=append_round)
+    result = VolumeBuilder(config, popen_factory=popen).run()
+
+    assert result.status is BuilderStatus.COMPLETED
+    assert [
+        call[0][call[0].index("--probe-max-loss-usd") + 1] for call in popen.calls
+    ] == ["5", "3.75"]
+
+
+def test_positive_cumulative_pnl_increases_next_child_loss_budget(tmp_path) -> None:
+    config = _approved_config(tmp_path, target_volume_usd=Decimal("40.20"))
+    round_number = 0
+
+    def append_round() -> None:
+        nonlocal round_number
+        round_number += 1
+        _append_completed_round(
+            config.round_log_path,
+            session_id=f"vp-positive-{round_number}",
+            realized_pnl_usd=(Decimal("1") if round_number == 1 else Decimal("-0.04")),
+        )
+
+    popen = _FakePopen(callback=append_round)
+    result = VolumeBuilder(config, popen_factory=popen).run()
+
+    assert result.status is BuilderStatus.COMPLETED
+    assert [
+        call[0][call[0].index("--probe-max-loss-usd") + 1] for call in popen.calls
+    ] == ["5", "6"]
+
+
+def test_exhausted_loss_budget_does_not_launch_next_child(tmp_path) -> None:
+    config = _approved_config(tmp_path, target_volume_usd=Decimal("1000"))
+    popen = _FakePopen(
+        callback=lambda: _append_completed_round(
+            config.round_log_path,
+            session_id="vp-exhausted",
+            realized_pnl_usd=Decimal("-5"),
+        )
+    )
+
+    result = VolumeBuilder(config, popen_factory=popen).run()
+
+    assert result.status is BuilderStatus.STOPPED_MAX_LOSS
+    assert result.rounds_completed == 1
+    assert len(popen.calls) == 1
+
+
+def test_post_round_max_loss_stop_retains_first_child_budget(tmp_path) -> None:
+    config = _approved_config(tmp_path, max_loss_usd=Decimal("0.03"))
+    popen = _FakePopen(
+        callback=lambda: _append_completed_round(
+            config.round_log_path, session_id="vp-post-round-loss"
+        )
+    )
+
+    result = VolumeBuilder(config, popen_factory=popen).run()
+
+    assert result.status is BuilderStatus.STOPPED_MAX_LOSS
+    assert len(popen.calls) == 1
+    argv = popen.calls[0][0]
+    assert argv[argv.index("--probe-max-loss-usd") + 1] == "0.03"
 
 
 def test_max_rounds_stops_after_last_success_without_extra_delay(tmp_path) -> None:

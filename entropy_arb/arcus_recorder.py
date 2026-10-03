@@ -112,6 +112,7 @@ class ArcusMarketRecorder:
         hedge: str = "lighter-rh",
         is_fresh_seconds: float = 10.0,
         interval_sec: float = 1.0,
+        write_minutes: bool = True,
     ) -> None:
         self.store = store
         self.symbol = symbol
@@ -120,6 +121,7 @@ class ArcusMarketRecorder:
         self.rh_book = rh_book
         self.is_fresh_seconds = is_fresh_seconds
         self.interval_sec = interval_sec
+        self.write_minutes = write_minutes
         self.rows_written = 0
         self.minute_rows_written = 0
         self.trades_written = 0
@@ -253,8 +255,9 @@ class ArcusMarketRecorder:
         if self._agg is None or self._agg.n == 0:
             self._agg = None
             return
-        self.store.append_arcus_minute(self._agg.row(self.symbol, self.hedge))
-        self.minute_rows_written += 1
+        if self.write_minutes:
+            self.store.append_arcus_minute(self._agg.row(self.symbol, self.hedge))
+            self.minute_rows_written += 1
         self._agg = None
 
     def record_sample(
