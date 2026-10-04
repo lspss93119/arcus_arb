@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Callable
 
 from .arcus import (
     ArcusL2Event,
@@ -113,6 +114,7 @@ class ArcusMarketRecorder:
         is_fresh_seconds: float = 10.0,
         interval_sec: float = 1.0,
         write_minutes: bool = True,
+        on_minute: Callable[[ArcusMinuteRow], None] | None = None,
     ) -> None:
         self.store = store
         self.symbol = symbol
@@ -122,6 +124,7 @@ class ArcusMarketRecorder:
         self.is_fresh_seconds = is_fresh_seconds
         self.interval_sec = interval_sec
         self.write_minutes = write_minutes
+        self.on_minute = on_minute
         self.rows_written = 0
         self.minute_rows_written = 0
         self.trades_written = 0
@@ -255,9 +258,12 @@ class ArcusMarketRecorder:
         if self._agg is None or self._agg.n == 0:
             self._agg = None
             return
+        row = self._agg.row(self.symbol, self.hedge)
         if self.write_minutes:
-            self.store.append_arcus_minute(self._agg.row(self.symbol, self.hedge))
+            self.store.append_arcus_minute(row)
             self.minute_rows_written += 1
+        if self.on_minute is not None:
+            self.on_minute(row)
         self._agg = None
 
     def record_sample(
