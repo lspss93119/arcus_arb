@@ -838,6 +838,35 @@ class MarketHistoryStore:
             wal_bytes=wal_bytes,
         )
 
+    def recent_arcus_minute_rows(
+        self,
+        symbol: str,
+        hedge: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> list[dict[str, object]]:
+        """Read completed Arcus minute closes in a strict causal interval."""
+        if end_ts <= start_ts:
+            return []
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT minute_ts, premium_close_bps, samples FROM arcus_minutes "
+                "WHERE symbol=? AND hedge=? AND minute_ts>=? AND minute_ts<? "
+                "ORDER BY minute_ts",
+                (symbol, hedge, int(start_ts), int(end_ts)),
+            ).fetchall()
+        return [
+            {
+                "minute_ts": int(minute_ts),
+                "premium_close_bps": float(premium_close_bps),
+                "samples": int(samples),
+            }
+            for minute_ts, premium_close_bps, samples in rows
+            if premium_close_bps is not None
+            and math.isfinite(float(premium_close_bps))
+            and int(samples) > 0
+        ]
+
     def recent_premium_observations(
         self,
         symbol: str,
