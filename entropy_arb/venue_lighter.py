@@ -464,7 +464,14 @@ class LighterVenue:
     ) -> dict:
         """Market order with avg-price protection; settle via account ws."""
         assert self.signer is not None
-        # Keep the send path injectable for tests and alternative signer\n        # implementations. These values are stable protocol constants in the\n        # pinned lighter-sdk (SignerClient: MARKET=1, IOC=0, IOC_EXPIRY=0).\n        order_type_market = 1\n        tif_ioc = 0\n        ioc_expiry = 0\n\n        order_send_ts_ms = time.time_ns() // 1_000_000
+        # Keep the send path injectable for tests and alternative signer
+        # implementations. These values are stable protocol constants in the
+        # pinned lighter-sdk (SignerClient: MARKET=1, IOC=0, IOC_EXPIRY=0).
+        order_type_market = 1
+        tif_ioc = 0
+        ioc_expiry = 0
+
+        order_send_ts_ms = time.time_ns() // 1_000_000
         coi = self._next_coi()
         feed = self.orders_feed
         fut = feed.watch(coi) if feed is not None else None
