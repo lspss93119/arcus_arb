@@ -9,9 +9,9 @@ from __future__ import annotations
 import csv
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from statistics import median
-from collections.abc import Mapping
 
 
 @dataclass(frozen=True)
