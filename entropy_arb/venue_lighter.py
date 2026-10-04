@@ -464,9 +464,7 @@ class LighterVenue:
     ) -> dict:
         """Market order with avg-price protection; settle via account ws."""
         assert self.signer is not None
-        from lighter import SignerClient
-
-        order_send_ts_ms = time.time_ns() // 1_000_000
+        # Keep the send path injectable for tests and alternative signer\n        # implementations. These values are stable protocol constants in the\n        # pinned lighter-sdk (SignerClient: MARKET=1, IOC=0, IOC_EXPIRY=0).\n        order_type_market = 1\n        tif_ioc = 0\n        ioc_expiry = 0\n\n        order_send_ts_ms = time.time_ns() // 1_000_000
         coi = self._next_coi()
         feed = self.orders_feed
         fut = feed.watch(coi) if feed is not None else None
@@ -479,10 +477,10 @@ class LighterVenue:
                 base_amount=base_amount,
                 price=price,
                 is_ask=not is_buy,
-                order_type=SignerClient.ORDER_TYPE_MARKET,
-                time_in_force=SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                order_type=order_type_market,
+                time_in_force=tif_ioc,
                 reduce_only=reduce_only,
-                order_expiry=SignerClient.DEFAULT_IOC_EXPIRY,
+                order_expiry=ioc_expiry,
             )
         except Exception as e:
             if fut is not None:
