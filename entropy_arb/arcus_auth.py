@@ -336,6 +336,7 @@ def build_ordersign_payload(
     timestamp_ns: int,
     good_til_time_us: int,
     client_id: str,
+    reduce_only: bool = False,
 ) -> dict[str, Any]:
     """Build the official Scheme 1 plain ``placeOrder`` payload.
 
@@ -366,7 +367,7 @@ def build_ordersign_payload(
         "op": 1,
         "p": _integer_units(price, tick_size, "price"),
         "q": _integer_units(quantity, step_size, "quantity"),
-        "r": 0,
+        "r": 1 if reduce_only else 0,
         "s": 0 if side.upper() == "BUY" else 1,
         "t": 3,
         "v": 1,
