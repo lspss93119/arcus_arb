@@ -11,7 +11,7 @@ import math
 import os
 from dataclasses import dataclass
 from statistics import median
-from typing import Mapping, Optional
+from collections.abc import Mapping
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,7 @@ class RollingConfig:
 class RollingSnapshot:
     block_start_ts: float
     valid: bool
-    median_bps: Optional[float]
+    median_bps: float | None
     valid_minutes: int
     coverage_pct: float
     reason: str
@@ -56,7 +56,7 @@ class RollingSnapshot:
 class RollingSignal:
     direction: str
     reason: str
-    center_bps: Optional[float]
+    center_bps: float | None
     snapshot_ts: float
     coverage_pct: float
     valid_minutes: int
@@ -164,7 +164,7 @@ class RollingWindow:
         *,
         upper_bps: float,
         lower_bps: float,
-    ) -> Optional[RollingSignal]:
+    ) -> RollingSignal | None:
         """Return the current directional signal around the causal median."""
         try:
             premium = float(premium_bps)
