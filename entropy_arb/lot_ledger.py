@@ -172,6 +172,13 @@ class LotLedger:
         return sum(lot.open_qty for lot in self._lots)
 
     @property
+    def reference_notional(self) -> float:
+        return sum(
+            lot.open_qty * lot.reference_entry_notional_per_base
+            for lot in self._lots
+        )
+
+    @property
     def direction(self) -> Optional[str]:
         directions = {lot.direction for lot in self._lots}
         if len(directions) > 1:
