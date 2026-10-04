@@ -1273,7 +1273,9 @@ class CalibrationController:
             self.risk.halt(f"Arcus cancel unresolved: {exc}")
             self.telemetry.record("cancel_failure", halt_reason=self.risk.halt_reason)
 
-    async def _place_quote(self, candidate: QuoteCandidate) -> bool:
+    async def _place_quote(
+        self, candidate: QuoteCandidate, *, reduce_only: bool = False
+    ) -> bool:
         self._execution_number += 1
         self.current_execution_id = f"{self.session_id}-e{self._execution_number}"
         client_id = f"{self.calibration_prefix}{self._execution_number}"
@@ -1310,6 +1312,7 @@ class CalibrationController:
                 best_bid=self._book_bbo(self.arcus)[0],
                 best_ask=self._book_bbo(self.arcus)[1],
                 client_id=client_id,
+                reduce_only=reduce_only,
             )
         except ArcusAloWouldCross:
             self._forget_order_context(context)
@@ -1372,7 +1375,9 @@ class CalibrationController:
         )
         return True
 
-    async def place_quote(self, candidate: QuoteCandidate) -> bool:
+    async def place_quote(
+        self, candidate: QuoteCandidate, *, reduce_only: bool = False
+    ) -> bool:
         """Place one already-validated LIMIT+ALO candidate.
 
         B0 continues to use :meth:`step`; the volume probe uses this narrow
@@ -1380,7 +1385,7 @@ class CalibrationController:
         inheriting B0's edge-selection policy.
         """
 
-        return await self._place_quote(candidate)
+        return await self._place_quote(candidate, reduce_only=reduce_only)
 
     def _current_order_edge(self) -> Decimal | None:
         if not self.current_candidate or not self.lifecycle.client_id:
