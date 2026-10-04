@@ -726,6 +726,7 @@ class ArcusMakerClient:
         best_bid: Decimal | None,
         best_ask: Decimal | None,
         client_id: str,
+        reduce_only: bool = False,
     ) -> ArcusOrderAck:
         self.validate_calibration_order_type("LIMIT", "ALO")
         side = side.upper()
@@ -756,6 +757,7 @@ class ArcusMakerClient:
             timestamp_ns=timestamp_ns,
             good_til_time_us=good_til_time_us,
             client_id=client_id,
+            reduce_only=reduce_only,
         )
         body = {
             "address": self.credentials.account_address,
@@ -768,7 +770,7 @@ class ArcusMakerClient:
             "timeInForce": "ALO",
             "goodTilTime": str(good_til_time_us),
             "timestamp": timestamp_ns,
-            "reduceOnly": False,
+            "reduceOnly": bool(reduce_only),
             "clientId": client_id,
         }
         response = await self._require_rpc().post(
