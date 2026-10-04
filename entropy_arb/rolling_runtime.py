@@ -13,7 +13,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_FLOOR
+from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
 from .calibration import QuoteCandidate, expected_edge_bps
