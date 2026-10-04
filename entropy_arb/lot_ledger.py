@@ -5,8 +5,8 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import asdict, dataclass, replace
 from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass, replace
 
 SCHEMA_VERSION = 1
 _EPS = 1e-12
@@ -179,7 +179,7 @@ class LotLedger:
         )
 
     @property
-    def direction(self) -> Optional[str]:
+    def direction(self) -> str | None:
         directions = {lot.direction for lot in self._lots}
         if len(directions) > 1:
             raise LotLedgerError("ledger contains mixed rolling directions")
