@@ -89,7 +89,7 @@ class Lot:
         )
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, object]) -> "Lot":
+    def from_dict(cls, raw: Mapping[str, object]) -> Lot:
         required = (
             "lot_id",
             "source_event_id",
