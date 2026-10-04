@@ -6,7 +6,7 @@ import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass, replace
-from typing import Iterable, Mapping, Optional
+from collections.abc import Iterable, Mapping
 
 SCHEMA_VERSION = 1
 _EPS = 1e-12
@@ -151,7 +151,7 @@ class LotLedger:
 
     def __init__(
         self,
-        path: Optional[str] = None,
+        path: str | None = None,
         *,
         symbol: str = "",
         hedge: str = "",
@@ -186,7 +186,7 @@ class LotLedger:
         return next(iter(directions), None)
 
     @property
-    def first_entry_ts(self) -> Optional[float]:
+    def first_entry_ts(self) -> float | None:
         return min((lot.entry_ts for lot in self._lots), default=None)
 
     def _payload(self, lots: Iterable[Lot]) -> dict:
