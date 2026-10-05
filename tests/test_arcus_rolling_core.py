@@ -95,12 +95,16 @@ def test_entry_requires_persistence_but_opposite_reduce_is_immediate():
         policy.window.ingest_row(_row(minute * 60, 0.0))
 
     t0 = 3600.0
-    assert policy.evaluate(
-        premium_bps=1.0, now=t0, open_direction=None, open_lot_count=0
-    ) is None
-    assert policy.evaluate(
-        premium_bps=1.0, now=t0 + 9, open_direction=None, open_lot_count=0
-    ) is None
+    assert (
+        policy.evaluate(premium_bps=1.0, now=t0, open_direction=None, open_lot_count=0)
+        is None
+    )
+    assert (
+        policy.evaluate(
+            premium_bps=1.0, now=t0 + 9, open_direction=None, open_lot_count=0
+        )
+        is None
+    )
     add = policy.evaluate(
         premium_bps=1.0, now=t0 + 10, open_direction=None, open_lot_count=0
     )
@@ -170,7 +174,6 @@ def test_lot_ledger_persists_and_reloads(tmp_path):
     assert loaded.load() == 1
     assert loaded.direction == "buy_arcus"
     assert loaded.total_qty == pytest.approx(0.5)
-
 
 
 class _RollingFakeBook:
