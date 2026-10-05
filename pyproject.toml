@@ -17,3 +17,7 @@ check_untyped_defs = true
 disallow_untyped_defs = false
 warn_unused_ignores = true
 ignore_missing_imports = false
+
+[[tool.mypy.overrides]]
+module = ["lighter", "lighter.*", "eth_account", "eth_account.*", "hyperliquid", "hyperliquid.*"]
+ignore_missing_imports = true
