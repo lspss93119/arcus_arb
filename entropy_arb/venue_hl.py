@@ -222,7 +222,9 @@ class HLVenue:
     # ------------------------------------------------------------- execution
 
     def _next_cloid(self):
-        from hyperliquid.utils.types import Cloid  # type: ignore[import-not-found,import-untyped]
+        from hyperliquid.utils.types import (
+            Cloid,  # type: ignore[import-not-found,import-untyped]
+        )
 
         self._cloid += 1
         return Cloid.from_int(self._cloid)
