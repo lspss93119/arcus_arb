@@ -20,7 +20,7 @@ class LotLedgerError(RuntimeError):
 
 def _finite_positive(value: object, label: str) -> float:
     try:
-        result = float(value)
+        result = float(str(value))
     except (TypeError, ValueError) as exc:
         raise LotLedgerError(f"{label} must be numeric") from exc
     if not math.isfinite(result) or result <= 0:
@@ -30,7 +30,7 @@ def _finite_positive(value: object, label: str) -> float:
 
 def _finite_nonnegative(value: object, label: str) -> float:
     try:
-        result = float(value)
+        result = float(str(value))
     except (TypeError, ValueError) as exc:
         raise LotLedgerError(f"{label} must be numeric") from exc
     if not math.isfinite(result) or result < 0:
@@ -124,7 +124,7 @@ class Lot:
                 sell_fee_bps=_finite_nonnegative(
                     raw["sell_fee_bps"], "lot.sell_fee_bps"
                 ),
-                entry_cash_per_base=float(raw["entry_cash_per_base"]),
+                entry_cash_per_base=float(str(raw["entry_cash_per_base"])),
                 reference_entry_notional_per_base=_finite_positive(
                     raw["reference_entry_notional_per_base"],
                     "lot.reference_entry_notional_per_base",
@@ -353,8 +353,8 @@ class LotLedger:
     def validate_positions(self, positions: Mapping[str, object]) -> None:
         """Validate authoritative Arcus/RH positions against the lot ledger."""
         try:
-            arcus = float(positions.get("arcus", 0.0))
-            hedge = float(positions.get("hedge", 0.0))
+            arcus = float(str(positions.get("arcus", 0.0)))
+            hedge = float(str(positions.get("hedge", 0.0)))
         except (TypeError, ValueError) as exc:
             raise LotLedgerError("positions contain invalid values") from exc
         direction = self.direction
