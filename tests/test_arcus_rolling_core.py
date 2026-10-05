@@ -1,4 +1,7 @@
+import asyncio
 from datetime import UTC, datetime
+from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,8 +12,10 @@ from entropy_arb.market_state import (
     classify_market_state,
     research_profile,
 )
-from entropy_arb.rolling import RollingConfig, RollingWindow
-from entropy_arb.rolling_policy import RollingPolicy
+from entropy_arb.rolling import RollingConfig, RollingSignal, RollingWindow
+from entropy_arb.rolling_policy import RollingDecision, RollingPolicy
+from entropy_arb.rolling_runtime import RollingArcusController
+from main import validate_runtime_gates
 
 
 def _row(minute_ts, premium, samples=1):
@@ -165,3 +170,111 @@ def test_lot_ledger_persists_and_reloads(tmp_path):
     assert loaded.load() == 1
     assert loaded.direction == "buy_arcus"
     assert loaded.total_qty == pytest.approx(0.5)
+
+
+
+class _RollingFakeBook:
+    def __init__(self, bid: str, ask: str) -> None:
+        self._bid = Decimal(bid)
+        self._ask = Decimal(ask)
+
+    def best_bid(self):
+        return self._bid
+
+    def best_ask(self):
+        return self._ask
+
+
+class _RollingFakeExecutor:
+    def __init__(self, *, submit: bool = True) -> None:
+        self.arcus = SimpleNamespace(book=_RollingFakeBook("100", "101"))
+        self.hedge = SimpleNamespace(book=_RollingFakeBook("100", "101"))
+        self.arcus_maker_fee_bps = Decimal("0")
+        self.rh_taker_fee_bps = Decimal("0")
+        self.current_execution_id = None
+        self.on_processed_fill = None
+        self.on_execution_started = None
+        self.submit = submit
+
+    async def place_quote(self, _candidate, *, reduce_only=False):
+        del reduce_only
+        self.current_execution_id = "rolling-test-e1"
+        assert self.on_execution_started is not None
+        self.on_execution_started(self.current_execution_id)
+        return self.submit
+
+
+def _rolling_decision() -> RollingDecision:
+    signal = RollingSignal(
+        direction="sell_arcus",
+        reason="entry",
+        center_bps=0.0,
+        snapshot_ts=0.0,
+        coverage_pct=100.0,
+        valid_minutes=720,
+    )
+    return RollingDecision(
+        action="add",
+        direction="sell_arcus",
+        signal=signal,
+        market_state="rth_normal",
+        reason="persistent_signal",
+    )
+
+
+def _rolling_controller_for_executor(executor) -> RollingArcusController:
+    return RollingArcusController(
+        executor=executor,
+        profile=research_profile("SPY"),
+        ledger=LotLedger(),
+        clip_usd=Decimal("1000"),
+        quantity_step=Decimal("0.01"),
+        min_quantity=Decimal("0.01"),
+        min_notional=Decimal("1"),
+    )
+
+
+def test_rolling_intent_is_registered_before_place_quote_returns():
+    executor = _RollingFakeExecutor()
+    controller = _rolling_controller_for_executor(executor)
+
+    assert asyncio.run(controller._place_decision(_rolling_decision()))
+    assert controller._intents["rolling-test-e1"].action == "add"
+    assert controller._intents["rolling-test-e1"].direction == "sell_arcus"
+
+
+def test_failed_rolling_placement_drops_pre_registered_intent():
+    executor = _RollingFakeExecutor(submit=False)
+    controller = _rolling_controller_for_executor(executor)
+
+    assert not asyncio.run(controller._place_decision(_rolling_decision()))
+    assert controller._intents == {}
+
+
+def test_runtime_gates_accept_only_explicit_rolling_live_mode():
+    assert (
+        validate_runtime_gates(
+            False,
+            False,
+            True,
+            volume_probe=False,
+            rolling_live=True,
+        )
+        == "rolling-live"
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        validate_runtime_gates(
+            True,
+            False,
+            True,
+            volume_probe=False,
+            rolling_live=True,
+        )
+    with pytest.raises(ValueError, match="confirm-mainnet"):
+        validate_runtime_gates(
+            False,
+            False,
+            False,
+            volume_probe=False,
+            rolling_live=True,
+        )
