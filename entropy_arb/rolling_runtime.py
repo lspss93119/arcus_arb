@@ -102,6 +102,7 @@ class RollingArcusController:
         self.policy = RollingPolicy(profile, self.config)
         self._intents: dict[str, RollingOrderIntent] = {}
         self._placing_intent: RollingOrderIntent | None = None
+        self._placing_execution_id: str | None = None
         self._pending_fills: list[_PendingFill] = []
         self._order_placed_mono: float | None = None
         self._lot_sequence = 0
@@ -307,6 +308,7 @@ class RollingArcusController:
         template = self._placing_intent
         if template is None:
             raise RuntimeError("rolling execution started without a pending intent")
+        self._placing_execution_id = str(execution_id)
         self._intents[str(execution_id)] = RollingOrderIntent(
             execution_id=str(execution_id),
             action=template.action,
@@ -325,15 +327,19 @@ class RollingArcusController:
             direction=decision.direction,
             allocations=[dict(item) for item in allocations],
         )
+        self._placing_execution_id = None
         try:
             submitted = await self.executor.place_quote(
                 candidate, reduce_only=decision.action == "reduce"
             )
         finally:
             self._placing_intent = None
+        execution_id = self._placing_execution_id
+        self._placing_execution_id = None
         if not submitted:
+            if execution_id is not None:
+                self._intents.pop(execution_id, None)
             return False
-        execution_id = self.executor.current_execution_id
         if not execution_id or execution_id not in self._intents:
             raise RuntimeError("rolling maker placement has no registered execution intent")
         self._order_placed_mono = time.monotonic()
