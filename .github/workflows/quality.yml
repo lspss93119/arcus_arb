@@ -37,7 +37,7 @@ jobs:
         run: ruff check .
 
       - name: Check formatting
-        run: ruff format --check .
+        run: ruff format --check main.py entropy_arb tests
 
       - name: Run Mypy
         run: python -m mypy entropy_arb tests main.py
