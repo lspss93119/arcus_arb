@@ -34,6 +34,7 @@ def validate_runtime_gates(
     confirm_mainnet: bool,
     *,
     volume_probe: bool = False,
+    rolling_live: bool = False,
 ) -> str:
     """Validate the explicit runtime mode gates before loading credentials.
 
@@ -42,21 +43,19 @@ def validate_runtime_gates(
     helper independent makes accidental live-by-default regressions easy to
     test without constructing an exchange client.
     """
-    if record_only and tiny_live:
-        raise ValueError("--record-only and --tiny-live are mutually exclusive")
-    if volume_probe and (record_only or tiny_live):
+    selected = int(bool(record_only)) + int(bool(tiny_live)) + int(bool(volume_probe)) + int(bool(rolling_live))
+    if selected > 1:
         raise ValueError(
-            "--volume-probe is mutually exclusive with --record-only and --tiny-live"
+            "--record-only, --tiny-live, --volume-probe, and --rolling-live are mutually exclusive"
         )
-    if volume_probe and not confirm_mainnet:
+    if (volume_probe or rolling_live or tiny_live) and not confirm_mainnet:
+        flag = "--rolling-live" if rolling_live else "--volume-probe" if volume_probe else "--tiny-live"
         raise ValueError(
-            "--volume-probe requires the explicit --confirm-mainnet acknowledgement"
+            f"{flag} requires the explicit --confirm-mainnet acknowledgement"
         )
-    if confirm_mainnet and not tiny_live and not volume_probe:
-        raise ValueError("--confirm-mainnet requires --tiny-live")
-    if tiny_live and not confirm_mainnet:
+    if confirm_mainnet and not (tiny_live or volume_probe or rolling_live):
         raise ValueError(
-            "--tiny-live requires the explicit --confirm-mainnet acknowledgement"
+            "--confirm-mainnet requires --tiny-live, --volume-probe, or --rolling-live"
         )
     if record_only:
         return "record-only"
@@ -64,6 +63,8 @@ def validate_runtime_gates(
         return "tiny-live"
     if volume_probe:
         return "volume-probe"
+    if rolling_live:
+        return "rolling-live"
     raise ValueError("pass --record-only, or pass one live mode with --confirm-mainnet")
 
 
@@ -104,6 +105,11 @@ async def amain(
     confirm_mainnet: bool = False,
     approve_first_order: bool = False,
     volume_probe: bool = False,
+    rolling_live: bool = False,
+    rolling_clip_usd: float = 1000.0,
+    rolling_reprice_sec: float = 30.0,
+    rolling_max_runtime_sec: int = 3600,
+    rolling_max_loss_usd: float = 10.0,
     probe_clip_usd: float | None = None,
     probe_side: str | None = None,
     probe_reprice_sec: float = 30.0,
@@ -117,6 +123,11 @@ async def amain(
         confirm_mainnet=confirm_mainnet,
         allow_first_order=approve_first_order,
         volume_probe=volume_probe,
+        rolling_live=rolling_live,
+        rolling_clip_usd=rolling_clip_usd,
+        rolling_reprice_sec=rolling_reprice_sec,
+        rolling_max_runtime_sec=rolling_max_runtime_sec,
+        rolling_max_loss_usd=rolling_max_loss_usd,
         probe_clip_usd=probe_clip_usd,
         probe_side=probe_side,
         probe_reprice_sec=probe_reprice_sec,
@@ -145,8 +156,7 @@ async def amain(
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Arcus SNDK × Lighter-RH SNDK recorder and gated B0 "
-        "maker-first calibration"
+        description="Arcus × Lighter-RH recorder, probes, and explicitly gated rolling canary"
     )
     p.add_argument(
         "--symbol",
@@ -186,15 +196,44 @@ def main() -> None:
         help="one-shot Arcus maker/RH hedge/unwind probe; independently gated",
     )
     p.add_argument(
+        "--rolling-live",
+        action="store_true",
+        help="long-running research-selected rolling Arcus maker/RH taker canary; explicitly gated",
+    )
+    p.add_argument(
         "--confirm-mainnet",
         action="store_true",
-        help="required acknowledgement for --tiny-live or --volume-probe account access",
+        help="required acknowledgement for any live account-access mode",
     )
     p.add_argument(
         "--approve-first-order",
         action="store_true",
-        help="separate human approval gate; permits the first B0 or volume-probe "
+        help="separate human approval gate; permits the first B0, probe, or rolling "
         "mainnet ALO only after preflight (use deliberately)",
+    )
+    p.add_argument(
+        "--rolling-clip-usd",
+        type=float,
+        default=1000.0,
+        help="rolling canary Arcus maker clip in USD (default: 1000)",
+    )
+    p.add_argument(
+        "--rolling-reprice-sec",
+        type=float,
+        default=30.0,
+        help="rolling canary maker cancel/reprice interval (default: 30)",
+    )
+    p.add_argument(
+        "--rolling-max-runtime-sec",
+        type=int,
+        default=3600,
+        help="rolling canary hard runtime cap (default: 3600)",
+    )
+    p.add_argument(
+        "--rolling-max-loss-usd",
+        type=float,
+        default=10.0,
+        help="rolling canary hard realized-loss cap (default: 10)",
     )
     p.add_argument(
         "--probe-clip-usd",
@@ -250,14 +289,17 @@ def main() -> None:
             args.tiny_live,
             args.confirm_mainnet,
             volume_probe=args.volume_probe,
+            rolling_live=args.rolling_live,
         )
     except ValueError as e:
         print(f"runtime mode error: {e}", file=sys.stderr)
         sys.exit(2)
-    if args.approve_first_order and not (args.tiny_live or args.volume_probe):
+    if args.approve_first_order and not (
+        args.tiny_live or args.volume_probe or args.rolling_live
+    ):
         print(
-            "runtime mode error: --approve-first-order requires --tiny-live "
-            "or --volume-probe",
+            "runtime mode error: --approve-first-order requires --tiny-live, "
+            "--volume-probe, or --rolling-live",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -270,6 +312,30 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
+    if args.rolling_live:
+        if args.rolling_clip_usd <= 0:
+            print(
+                "runtime mode error: --rolling-clip-usd must be > 0", file=sys.stderr
+            )
+            sys.exit(2)
+        if args.rolling_reprice_sec <= 0:
+            print(
+                "runtime mode error: --rolling-reprice-sec must be > 0", file=sys.stderr
+            )
+            sys.exit(2)
+        if args.rolling_max_runtime_sec <= 0:
+            print(
+                "runtime mode error: --rolling-max-runtime-sec must be > 0",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if args.rolling_max_loss_usd <= 0:
+            print(
+                "runtime mode error: --rolling-max-loss-usd must be > 0",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     if args.volume_probe:
         if args.probe_clip_usd is None or args.probe_clip_usd <= 0:
             print(
@@ -340,6 +406,11 @@ def main() -> None:
                 confirm_mainnet=args.confirm_mainnet,
                 approve_first_order=args.approve_first_order,
                 volume_probe=args.volume_probe,
+                rolling_live=args.rolling_live,
+                rolling_clip_usd=args.rolling_clip_usd,
+                rolling_reprice_sec=args.rolling_reprice_sec,
+                rolling_max_runtime_sec=args.rolling_max_runtime_sec,
+                rolling_max_loss_usd=args.rolling_max_loss_usd,
                 probe_clip_usd=args.probe_clip_usd,
                 probe_side=args.probe_side,
                 probe_reprice_sec=args.probe_reprice_sec,
