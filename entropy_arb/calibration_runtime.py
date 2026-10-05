@@ -332,6 +332,7 @@ class CalibrationController:
         session_limits: SessionLimits | None = None,
         client_prefix: str = "b0-",
         on_processed_fill: ProcessedFillObserver | None = None,
+        on_execution_started: Any | None = None,
     ) -> None:
         if not client_prefix:
             raise ValueError("Arcus client prefix must not be empty")
@@ -355,6 +356,7 @@ class CalibrationController:
         self.order_prefix = client_prefix
         self.session_id = session_id or f"{client_prefix}{uuid.uuid4().hex[:12]}"
         self.on_processed_fill = on_processed_fill
+        self.on_execution_started = on_execution_started
         self.limits = session_limits or SessionLimits()
         self.risk = SessionRisk(self.limits)
         self.pnl = CalibrationPnL()
@@ -1301,6 +1303,8 @@ class CalibrationController:
         )
         self._current_context = context
         self._register_order_context(context)
+        if self.on_execution_started is not None:
+            self.on_execution_started(self.current_execution_id)
         try:
             ack = await self.maker.place_alo(
                 market_id=self.metadata.market_id,
