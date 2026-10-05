@@ -1,4 +1,5 @@
 """Research-backed market-state policy for Arcus rolling canaries."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
