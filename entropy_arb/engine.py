@@ -2012,7 +2012,8 @@ class Engine:
                 return
             if not self.record_only:
                 raise RuntimeError(
-                    "Arcus requires --record-only or an explicitly gated live mode"
+                    "Phase A is record-only by default; pass --record-only or "
+                    "an explicitly gated Arcus live mode"
                 )
             await self._run_arcus_record_only(selected)
             return
