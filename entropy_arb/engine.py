@@ -1705,7 +1705,9 @@ class Engine:
             tasks += self.arcus.start_tasks(self.stop, self._update_evt.set, False)
             tasks += self.hedge.start_tasks(self.stop, self._update_evt.set, True)
             tasks.append(
-                asyncio.create_task(account_feed.run(self.stop), name="acct-arcus-rolling")
+                asyncio.create_task(
+                    account_feed.run(self.stop), name="acct-arcus-rolling"
+                )
             )
             tasks.append(
                 asyncio.create_task(self._storage_flush_loop(), name="storage-flush")
@@ -1767,7 +1769,9 @@ class Engine:
                     credentials.account_index,
                 )
                 stale_order_ids = {
-                    order.order_id for order in stale_orders if order.order_id is not None
+                    order.order_id
+                    for order in stale_orders
+                    if order.order_id is not None
                 }
                 stale_client_ids = {
                     order.client_id
@@ -1992,13 +1996,21 @@ class Engine:
 
     async def _run_inner(self) -> None:
         cfg = self.cfg
-        live_modes = int(bool(self.tiny_live)) + int(bool(self.volume_probe)) + int(bool(self.rolling_live))
+        live_modes = (
+            int(bool(self.tiny_live))
+            + int(bool(self.volume_probe))
+            + int(bool(self.rolling_live))
+        )
         if self.record_only and live_modes:
             raise RuntimeError("record-only is mutually exclusive with live modes")
         if live_modes > 1:
-            raise RuntimeError("tiny-live, volume-probe, and rolling-live are mutually exclusive")
+            raise RuntimeError(
+                "tiny-live, volume-probe, and rolling-live are mutually exclusive"
+            )
         selected = self._make_venue(getattr(cfg, "arcus", cfg.entropy))
-        if (self.volume_probe or self.rolling_live) and not isinstance(selected, ArcusVenue):
+        if (self.volume_probe or self.rolling_live) and not isinstance(
+            selected, ArcusVenue
+        ):
             raise RuntimeError("Arcus live modes require an Arcus primary venue")
         if isinstance(selected, ArcusVenue):
             if self.rolling_live:
