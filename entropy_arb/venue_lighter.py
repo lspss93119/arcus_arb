@@ -334,7 +334,9 @@ class LighterVenue:
         ):
             raise RuntimeError(f"[{self.name}] missing credentials")
         try:
-            from lighter import SignerClient  # type: ignore[import-not-found,import-untyped]
+            from lighter import (
+                SignerClient,  # type: ignore[import-not-found,import-untyped]
+            )
         except ImportError as e:
             raise RuntimeError(
                 "live trading on Lighter needs the official SDK — "
