@@ -1,4 +1,5 @@
 """Pure ADD/REDUCE decisions for the Arcus rolling strategy."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
