@@ -4,6 +4,7 @@ This is the venue-agnostic strategy core ported from ``entropy-arb``.  It
 consumes completed minute rows only and never lets the current update block
 influence its own center.
 """
+
 from __future__ import annotations
 
 import csv
@@ -83,9 +84,7 @@ class RollingWindow:
         return max(
             1,
             int(
-                math.ceil(
-                    self.expected_minutes * self.config.min_coverage_pct / 100.0
-                )
+                math.ceil(self.expected_minutes * self.config.min_coverage_pct / 100.0)
             ),
         )
 
@@ -97,11 +96,7 @@ class RollingWindow:
             premium = float(row["premium_close_bps"])
         except (KeyError, TypeError, ValueError):
             return False
-        if (
-            not math.isfinite(minute_ts)
-            or not math.isfinite(premium)
-            or samples <= 0
-        ):
+        if not math.isfinite(minute_ts) or not math.isfinite(premium) or samples <= 0:
             return False
         self._points[minute_ts] = premium
         self._snapshots.clear()
