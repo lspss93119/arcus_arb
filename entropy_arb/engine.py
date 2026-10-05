@@ -52,8 +52,12 @@ from .calibration_runtime import (
 )
 from .config import Config
 from .entropy_quota import EntropyQuotaCoordinator
+from .lot_ledger import LotLedger
+from .market_state import research_profile
 from .premium import calculate_premiums
 from .recorder import MinuteRecorder
+from .rolling import RollingConfig
+from .rolling_runtime import RollingArcusController
 from .reference import ReferenceRecorder
 from .storage import FLUSH_INTERVAL_SEC, MarketHistoryStore
 from .strategy import RollingCenterUpdate, StrategyState, build_strategy
@@ -168,6 +172,11 @@ class Engine:
         confirm_mainnet: bool = False,
         allow_first_order: bool = False,
         volume_probe: bool = False,
+        rolling_live: bool = False,
+        rolling_clip_usd: float = 1000.0,
+        rolling_reprice_sec: float = 30.0,
+        rolling_max_runtime_sec: int = 3600,
+        rolling_max_loss_usd: float = 10.0,
         probe_clip_usd: float | None = None,
         probe_side: str | None = None,
         probe_reprice_sec: float = 30.0,
@@ -182,6 +191,11 @@ class Engine:
         self.confirm_mainnet = confirm_mainnet
         self.allow_first_order = allow_first_order
         self.volume_probe = volume_probe
+        self.rolling_live = rolling_live
+        self.rolling_clip_usd = rolling_clip_usd
+        self.rolling_reprice_sec = rolling_reprice_sec
+        self.rolling_max_runtime_sec = rolling_max_runtime_sec
+        self.rolling_max_loss_usd = rolling_max_loss_usd
         self.probe_clip_usd = probe_clip_usd
         self.probe_side = probe_side
         self.probe_reprice_sec = probe_reprice_sec
@@ -245,6 +259,7 @@ class Engine:
         self.execution_telemetry_csv: str | None = None
         self.calibration: CalibrationController | None = None
         self.volume_probe_controller: VolumeProbeController | None = None
+        self.rolling_controller: RollingArcusController | None = None
 
     # ------------------------------------------------------------- utilities
 
@@ -1559,16 +1574,436 @@ class Engine:
             "20.0",
         )
 
+    async def _run_arcus_rolling_live(self, arcus: ArcusVenue) -> None:
+        """Run the research-selected rolling Arcus maker/RH taker canary."""
+        if not self.rolling_live or not self.confirm_mainnet:
+            raise RuntimeError(
+                "rolling canary requires --rolling-live and --confirm-mainnet"
+            )
+        if self.session is None:
+            raise RuntimeError("HTTP session is not initialized")
+
+        cfg = self.cfg
+        profile = research_profile(cfg.symbol)
+        if not profile.enabled:
+            raise RuntimeError(
+                f"{profile.symbol} rolling profile is disabled by the 9/26-10/3 study"
+            )
+        if not profile.live_candidate:
+            raise RuntimeError(
+                f"{profile.symbol} is shadow-only; rolling live is limited to selected canaries"
+            )
+
+        self.arcus = arcus
+        self.entropy = arcus
+        self.hedge = self._make_venue(cfg.hedge)
+        self.venues = {"arcus": self.arcus, "hedge": self.hedge}
+        tasks: list[asyncio.Task] = []
+        executor: CalibrationController | None = None
+        controller: RollingArcusController | None = None
+        account_feed: ArcusAccountFeed | None = None
+        credentials: ArcusCredentials | None = None
+        maker: ArcusMakerClient | None = None
+        account_rest: ArcusAccountRest | None = None
+        startup_state: ArcusAccountState | None = None
+        metadata: Any = None
+        prefix = "roll-"
+
+        try:
+            metadata, _ = await asyncio.gather(
+                self.arcus.load_market(), self.hedge.load_market()
+            )
+            self.markets_ready = True
+            if metadata.status != "ONLINE":
+                raise RuntimeError(
+                    f"Arcus {metadata.symbol} market status={metadata.status}; "
+                    "aborting rolling canary"
+                )
+            if not isinstance(self.hedge, LighterVenue):
+                raise RuntimeError("rolling canary requires Lighter-RH")
+
+            self.market_history = MarketHistoryStore(cfg.recorder_database)
+            self.recorder = ArcusMarketRecorder(
+                self.market_history,
+                symbol=cfg.symbol,
+                arcus_book=self.arcus.book,
+                rh_book=self.hedge.book,
+                hedge=cfg.hedge_venue,
+                is_fresh_seconds=cfg.staleness_sec,
+            )
+            self.recorder.record_metadata(metadata)
+            self.arcus.set_market_data_sinks(
+                self.recorder.record_trade,
+                lambda attributes, receive_ms, monotonic_ns: (
+                    self.recorder.record_attributes(
+                        attributes,
+                        receive_ms,
+                        monotonic_ns,
+                        market_status=metadata.status,
+                    )
+                ),
+                self.recorder.record_l2_event,
+            )
+
+            credentials = ArcusCredentials.from_env()
+            signer = ArcusSigner(credentials)
+            if not cfg.creds_complete:
+                raise RuntimeError(
+                    "rolling canary requires Lighter-RH credentials in .env: "
+                    "LIGHTER_ACCOUNT_INDEX, LIGHTER_API_KEY_INDEX, and "
+                    "LIGHTER_API_PRIVATE_KEY"
+                )
+            self.hedge.init_signer()
+            rh_account_limits = await self.hedge.fetch_account_limits()
+            rh_fee_bps = resolve_verified_rh_fee_bps(self.hedge, rh_account_limits)
+            account_rest = ArcusAccountRest(self.session, rest_url=cfg.arcus_rest_url)
+            await _arcus_credential_preflight(account_rest, credentials, signer)
+            fee_table = await account_rest.fee_tiers()
+            startup_state = ArcusAccountState(
+                startup_watermark_us=time.time_ns() // 1000
+            )
+
+            arcus_position = await account_rest.position(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            rh_position = Decimal(str(await self.hedge.fetch_position()))
+            rh_open_orders = await fetch_lighter_open_orders(self.hedge)
+            if rh_open_orders:
+                raise RuntimeError(
+                    "RH open order exists; aborting rolling canary without touching it"
+                )
+            arcus_open_orders = await account_rest.open_orders(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            stale_orders = startup_state.validate_startup_orders(
+                arcus_open_orders, calibration_prefix=prefix
+            )
+
+            account_feed = ArcusAccountFeed(
+                credentials.account_address,
+                metadata.symbol,
+                ws_url=cfg.arcus_ws_url,
+                account_index=credentials.account_index,
+                startup_state=startup_state,
+                api_key=credentials.api_key,
+                client_prefix=prefix,
+                fixed_quantity=None,
+            )
+            maker = ArcusMakerClient(
+                credentials=credentials,
+                signer=signer,
+                rpc=account_feed,
+                ws_url=cfg.arcus_ws_url,
+                client_prefix=prefix,
+                fixed_quantity=None,
+            )
+
+            tasks += self.arcus.start_tasks(self.stop, self._update_evt.set, False)
+            tasks += self.hedge.start_tasks(self.stop, self._update_evt.set, True)
+            tasks.append(
+                asyncio.create_task(account_feed.run(self.stop), name="acct-arcus-rolling")
+            )
+            tasks.append(
+                asyncio.create_task(self._storage_flush_loop(), name="storage-flush")
+            )
+            tasks.append(
+                asyncio.create_task(self.recorder.run(self.stop), name="recorder")
+            )
+
+            await self._wait_b0_account_state(account_feed)
+            await self._wait_b0_market_state()
+            account_fee = account_feed.latest_fee_tier
+            fee_tier = resolve_arcus_account_fee_tier(fee_table, account_fee)
+            if fee_tier is None:
+                raise RuntimeError(
+                    "Arcus account fee tier could not be resolved; aborting rolling canary"
+                )
+
+            for stale_order in stale_orders:
+                if stale_order.client_id is None:
+                    raise RuntimeError("known roll- Arcus order has no clientId")
+                await maker.cancel_calibration_order(
+                    market_id=metadata.market_id,
+                    client_id=stale_order.client_id,
+                )
+                log.warning(
+                    "[rolling] canceled stale Arcus order clientId=%s orderId=%s",
+                    stale_order.client_id,
+                    stale_order.order_id,
+                )
+            if stale_orders:
+                cancel_deadline = time.monotonic() + 15.0
+                while time.monotonic() < cancel_deadline:
+                    remaining = await account_rest.open_orders(
+                        credentials.account_address,
+                        metadata.symbol,
+                        credentials.account_index,
+                    )
+                    if not any(
+                        (
+                            stale.order_id is not None
+                            and stale.order_id == order.order_id
+                        )
+                        or (
+                            stale.client_id is not None
+                            and stale.client_id == order.client_id
+                        )
+                        for stale in stale_orders
+                        for order in remaining
+                    ):
+                        break
+                    await asyncio.sleep(1.0)
+                else:
+                    raise RuntimeError(
+                        "stale roll- Arcus order did not reach terminal state"
+                    )
+                stale_fills = await account_rest.fills(
+                    credentials.account_address,
+                    metadata.symbol,
+                    credentials.account_index,
+                )
+                stale_order_ids = {
+                    order.order_id for order in stale_orders if order.order_id is not None
+                }
+                stale_client_ids = {
+                    order.client_id
+                    for order in stale_orders
+                    if order.client_id is not None
+                }
+                if any(
+                    fill.created_at_us is not None
+                    and fill.created_at_us > startup_state.startup_watermark_us
+                    and (
+                        fill.order_id in stale_order_ids
+                        or fill.client_id in stale_client_ids
+                    )
+                    for fill in stale_fills
+                ):
+                    raise RuntimeError(
+                        "stale roll- Arcus order filled during startup cancellation"
+                    )
+
+            fresh_arcus_open_orders = await account_rest.open_orders(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            if fresh_arcus_open_orders:
+                startup_state.validate_startup_orders(
+                    fresh_arcus_open_orders, calibration_prefix=prefix
+                )
+                raise RuntimeError(
+                    "Arcus roll- order remains open after cancellation; aborting"
+                )
+            arcus_position = await account_rest.position(
+                credentials.account_address,
+                metadata.symbol,
+                credentials.account_index,
+            )
+            rh_position = Decimal(str(await self.hedge.fetch_position()))
+            rh_open_orders = await fetch_lighter_open_orders(self.hedge)
+            if rh_open_orders:
+                raise RuntimeError(
+                    "RH open order appeared during rolling preflight; aborting"
+                )
+
+            await self._wait_volume_probe_book_stable(account_feed)
+            arcus_bid, arcus_ask, rh_bid, rh_ask = self._read_volume_probe_bbo(
+                account_feed=account_feed
+            )
+
+            arcus_step = Decimal(metadata.step_size)
+            rh_step = Decimal(1).scaleb(-int(self.hedge.size_decimals))
+            common_step = common_executable_step(
+                arcus_step=arcus_step,
+                rh_step=rh_step,
+            )
+            rh_min = max(
+                RH_HEDGE_MIN_QTY,
+                rh_step,
+                Decimal(str(self.hedge.min_base)),
+            )
+            arcus_min = (
+                Decimal(metadata.min_order_size)
+                if metadata.min_order_size is not None
+                else arcus_step
+            )
+            min_quantity = max(common_step, rh_min, arcus_min)
+            max_quantity = (
+                Decimal(metadata.max_order_size)
+                if metadata.max_order_size is not None
+                else None
+            )
+            min_notional = max(
+                Decimal(str(cfg.min_order_notional)),
+                Decimal(str(self.hedge.min_quote)),
+                (
+                    Decimal(metadata.min_order_notional)
+                    if metadata.min_order_notional is not None
+                    else Decimal("0")
+                ),
+            )
+            clip = Decimal(str(self.rolling_clip_usd))
+            reference_px = min(arcus_bid, arcus_ask)
+            risk_order_qty = clip / reference_px * Decimal("2")
+            if max_quantity is not None:
+                risk_order_qty = min(risk_order_qty, max_quantity)
+            risk_order_qty = max(risk_order_qty, min_quantity)
+            limits = SessionLimits(
+                max_fill_events=max(100, profile.max_lots * 20),
+                max_filled_notional_usd=clip * Decimal(profile.max_lots * 4),
+                max_loss_usd=Decimal(str(self.rolling_max_loss_usd)),
+                max_runtime_seconds=self.rolling_max_runtime_sec,
+                max_order_qty=risk_order_qty,
+            )
+
+            executor = CalibrationController(
+                arcus=self.arcus,
+                hedge=self.hedge,
+                maker=maker,
+                account_feed=account_feed,
+                account_rest=account_rest,
+                account_state=startup_state,
+                metadata=metadata,
+                fee_tier=fee_tier,
+                strategy=self.strategy,
+                store=self.market_history,
+                allow_first_order=True,
+                staleness_sec=cfg.staleness_sec,
+                rh_fee_bps=rh_fee_bps,
+                session_limits=limits,
+                client_prefix=prefix,
+            )
+            ledger_dir = os.path.dirname(cfg.recorder_database) or "data"
+            ledger_path = os.path.join(
+                ledger_dir,
+                f"rolling-lots-{cfg.symbol}-{cfg.hedge_venue}.json",
+            )
+            ledger = LotLedger(
+                ledger_path,
+                symbol=cfg.symbol,
+                hedge=cfg.hedge_venue,
+                tolerance=float(common_step) / 2.0,
+            )
+            ledger.load()
+            controller = RollingArcusController(
+                executor=executor,
+                profile=profile,
+                ledger=ledger,
+                clip_usd=clip,
+                quantity_step=common_step,
+                min_quantity=min_quantity,
+                min_notional=min_notional,
+                max_quantity=max_quantity,
+                rolling_config=RollingConfig(
+                    window_hours=12.0,
+                    update_minutes=15,
+                    min_coverage_pct=80.0,
+                    min_exit_capture_bps=0.0,
+                    persistence_sec=10.0,
+                ),
+                reprice_sec=self.rolling_reprice_sec,
+                tolerance=common_step / Decimal("2"),
+            )
+            self.calibration = executor
+            self.rolling_controller = controller
+            account_feed.on_fill = controller.on_fill
+            account_feed.on_order = controller.on_order
+            account_feed.on_disconnect = controller.on_disconnect
+            account_feed.on_connect = controller.on_connect
+            self.recorder.on_minute = controller.ingest_minute
+
+            now = time.time()
+            block_start = int(now // (15 * 60)) * (15 * 60)
+            history = await asyncio.to_thread(
+                self.market_history.recent_arcus_minute_rows,
+                cfg.symbol,
+                cfg.hedge_venue,
+                block_start - 12 * 60 * 60,
+                block_start,
+            )
+            seeded = controller.seed_minutes(history)
+            controller.validate_authoritative_positions(
+                arcus_position=arcus_position,
+                rh_position=rh_position,
+            )
+            snapshot = controller.policy.window.snapshot_for(block_start)
+            log.info(
+                "[rolling pre-order] symbol=%s threshold=(%.2f,%.2f) max_lots=%d "
+                "clip=$%s reprice=%ss seeded_minutes=%d coverage=%.1f%% "
+                "center=%s ARCUS=%s/%s RH=%s/%s positions=(%s,%s) ledger=%s",
+                profile.symbol,
+                profile.upper_bps,
+                profile.lower_bps,
+                profile.max_lots,
+                clip,
+                self.rolling_reprice_sec,
+                seeded,
+                snapshot.coverage_pct,
+                snapshot.median_bps,
+                arcus_bid,
+                arcus_ask,
+                rh_bid,
+                rh_ask,
+                arcus_position,
+                rh_position,
+                ledger_path,
+            )
+            if not snapshot.valid:
+                log.warning(
+                    "[rolling] center not ready yet: %s; ADD remains fail-closed",
+                    snapshot.reason,
+                )
+
+            if not self.allow_first_order:
+                log.warning(
+                    "[rolling] pre-order STOP: no Arcus order submitted; "
+                    "use --approve-first-order only after human review"
+                )
+                return
+
+            tasks.append(
+                asyncio.create_task(
+                    controller.run(self.stop),
+                    name="arcus-rolling-canary",
+                )
+            )
+            await self.stop.wait()
+        finally:
+            self.stop.set()
+            if executor is not None:
+                with contextlib.suppress(Exception):
+                    await executor.shutdown()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for venue in self.venues.values():
+                with contextlib.suppress(Exception):
+                    await venue.close()
+            if self.market_history is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self.market_history.flush)
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self.market_history.close)
+
     async def _run_inner(self) -> None:
         cfg = self.cfg
-        if self.volume_probe and (self.record_only or self.tiny_live):
-            raise RuntimeError(
-                "volume probe is mutually exclusive with record-only and tiny-live"
-            )
+        live_modes = int(bool(self.tiny_live)) + int(bool(self.volume_probe)) + int(bool(self.rolling_live))
+        if self.record_only and live_modes:
+            raise RuntimeError("record-only is mutually exclusive with live modes")
+        if live_modes > 1:
+            raise RuntimeError("tiny-live, volume-probe, and rolling-live are mutually exclusive")
         selected = self._make_venue(getattr(cfg, "arcus", cfg.entropy))
-        if self.volume_probe and not isinstance(selected, ArcusVenue):
-            raise RuntimeError("volume probe requires an Arcus primary venue")
+        if (self.volume_probe or self.rolling_live) and not isinstance(selected, ArcusVenue):
+            raise RuntimeError("Arcus live modes require an Arcus primary venue")
         if isinstance(selected, ArcusVenue):
+            if self.rolling_live:
+                await self._run_arcus_rolling_live(selected)
+                return
             if self.volume_probe:
                 await self._run_arcus_volume_probe(selected)
                 return
@@ -1577,8 +2012,7 @@ class Engine:
                 return
             if not self.record_only:
                 raise RuntimeError(
-                    "Phase A is record-only; pass --record-only. "
-                    "Arcus trading is not implemented in Phase A"
+                    "Arcus requires --record-only or an explicitly gated live mode"
                 )
             await self._run_arcus_record_only(selected)
             return
