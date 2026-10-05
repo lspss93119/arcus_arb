@@ -101,6 +101,7 @@ class RollingArcusController:
         self.config = rolling_config or RollingConfig()
         self.policy = RollingPolicy(profile, self.config)
         self._intents: dict[str, RollingOrderIntent] = {}
+        self._placing_intent: RollingOrderIntent | None = None
         self._pending_fills: list[_PendingFill] = []
         self._order_placed_mono: float | None = None
         self._lot_sequence = 0
@@ -109,6 +110,7 @@ class RollingArcusController:
         self.realized_capture_usd = 0.0
         self.last_realized_capture_bps: float | None = None
         self.executor.on_processed_fill = self._on_processed_fill
+        self.executor.on_execution_started = self._on_execution_started
 
     @property
     def open_reference_notional(self) -> Decimal:
@@ -300,25 +302,40 @@ class RollingArcusController:
             return None
         return self._candidate(side=side, quantity=total), allocations
 
+    def _on_execution_started(self, execution_id: str) -> None:
+        """Bind the strategy intent before Arcus placeOrder can race a fill."""
+        template = self._placing_intent
+        if template is None:
+            raise RuntimeError("rolling execution started without a pending intent")
+        self._intents[str(execution_id)] = RollingOrderIntent(
+            execution_id=str(execution_id),
+            action=template.action,
+            direction=template.direction,
+            allocations=[dict(item) for item in template.allocations],
+        )
+
     async def _place_decision(self, decision: RollingDecision) -> bool:
         prepared = self._decision_order(decision)
         if prepared is None:
             return False
         candidate, allocations = prepared
-        submitted = await self.executor.place_quote(
-            candidate, reduce_only=decision.action == "reduce"
-        )
-        if not submitted:
-            return False
-        execution_id = self.executor.current_execution_id
-        if not execution_id:
-            raise RuntimeError("rolling maker placement has no execution id")
-        self._intents[execution_id] = RollingOrderIntent(
-            execution_id=execution_id,
+        self._placing_intent = RollingOrderIntent(
+            execution_id="",
             action=decision.action,
             direction=decision.direction,
             allocations=[dict(item) for item in allocations],
         )
+        try:
+            submitted = await self.executor.place_quote(
+                candidate, reduce_only=decision.action == "reduce"
+            )
+        finally:
+            self._placing_intent = None
+        if not submitted:
+            return False
+        execution_id = self.executor.current_execution_id
+        if not execution_id or execution_id not in self._intents:
+            raise RuntimeError("rolling maker placement has no registered execution intent")
         self._order_placed_mono = time.monotonic()
         log.info(
             "[rolling] %s %s state=%s px=%s qty=%s center=%s threshold=(%s,%s) "
