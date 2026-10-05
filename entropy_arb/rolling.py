@@ -91,9 +91,9 @@ class RollingWindow:
     def ingest_row(self, row: Mapping[str, object]) -> bool:
         """Add one completed recorder row; return false for unusable rows."""
         try:
-            minute_ts = float(row["minute_ts"])
-            samples = int(float(row.get("samples", 0)))
-            premium = float(row["premium_close_bps"])
+            minute_ts = float(str(row["minute_ts"]))
+            samples = int(float(str(row.get("samples", 0))))
+            premium = float(str(row["premium_close_bps"]))
         except (KeyError, TypeError, ValueError):
             return False
         if not math.isfinite(minute_ts) or not math.isfinite(premium) or samples <= 0:
