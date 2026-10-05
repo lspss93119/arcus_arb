@@ -194,7 +194,7 @@ class _RollingFakeExecutor:
         self.hedge = SimpleNamespace(book=_RollingFakeBook("100", "101"))
         self.arcus_maker_fee_bps = Decimal("0")
         self.rh_taker_fee_bps = Decimal("0")
-        self.current_execution_id = None
+        self.current_execution_id: str | None = None
         self.on_processed_fill = None
         self.on_execution_started = None
         self.submit = submit
