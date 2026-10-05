@@ -46,7 +46,7 @@ class HLAccount:
     def __init__(
         self, private_key: str, account_address: str | None, api_url: str
     ) -> None:
-        from eth_account import Account
+        from eth_account import Account  # type: ignore[import-not-found,import-untyped]
 
         self.wallet = Account.from_key(private_key)
         self.query_address = (account_address or self.wallet.address).lower()
@@ -149,7 +149,7 @@ class HLVenue:
         if c is None or not c.complete or c.private_key is None:
             raise RuntimeError(f"[{self.name}] missing credentials")
         try:
-            from hyperliquid.utils import (  # type: ignore[import-untyped]
+            from hyperliquid.utils import (  # type: ignore[import-not-found,import-untyped]
                 signing as hl_signing,
             )
         except ImportError as e:
@@ -222,7 +222,7 @@ class HLVenue:
     # ------------------------------------------------------------- execution
 
     def _next_cloid(self):
-        from hyperliquid.utils.types import Cloid  # type: ignore[import-untyped]
+        from hyperliquid.utils.types import Cloid  # type: ignore[import-not-found,import-untyped]
 
         self._cloid += 1
         return Cloid.from_int(self._cloid)
