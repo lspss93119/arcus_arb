@@ -292,9 +292,7 @@ class RollingArcusController:
         allocations = self._eligible_reduce_allocations(decision.direction, clip_qty)
         if not allocations:
             return None
-        total = sum(
-            (Decimal(str(item["qty"])) for item in allocations), Decimal("0")
-        )
+        total = sum((Decimal(str(item["qty"])) for item in allocations), Decimal("0"))
         total = self._round_quantity(total)
         if total <= self.tolerance:
             return None
