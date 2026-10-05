@@ -1,4 +1,5 @@
 """Persistent Arcus rolling lots and actual-fill break-even accounting."""
+
 from __future__ import annotations
 
 import json
@@ -79,9 +80,7 @@ class Lot:
         buy_fee_bps: float,
         sell_fee_bps: float,
     ) -> float:
-        exit_cash = self.exit_cash_per_base(
-            buy_px, sell_px, buy_fee_bps, sell_fee_bps
-        )
+        exit_cash = self.exit_cash_per_base(buy_px, sell_px, buy_fee_bps, sell_fee_bps)
         return (
             (self.entry_cash_per_base + exit_cash)
             / self.reference_entry_notional_per_base
@@ -121,9 +120,7 @@ class Lot:
                 sell_venue=str(raw["sell_venue"]),
                 buy_avg_px=_finite_positive(raw["buy_avg_px"], "lot.buy_avg_px"),
                 sell_avg_px=_finite_positive(raw["sell_avg_px"], "lot.sell_avg_px"),
-                buy_fee_bps=_finite_nonnegative(
-                    raw["buy_fee_bps"], "lot.buy_fee_bps"
-                ),
+                buy_fee_bps=_finite_nonnegative(raw["buy_fee_bps"], "lot.buy_fee_bps"),
                 sell_fee_bps=_finite_nonnegative(
                     raw["sell_fee_bps"], "lot.sell_fee_bps"
                 ),
@@ -174,8 +171,7 @@ class LotLedger:
     @property
     def reference_notional(self) -> float:
         return sum(
-            lot.open_qty * lot.reference_entry_notional_per_base
-            for lot in self._lots
+            lot.open_qty * lot.reference_entry_notional_per_base for lot in self._lots
         )
 
     @property
@@ -292,9 +288,7 @@ class LotLedger:
         sell_px = _finite_positive(sell_avg_px, "sell_avg_px")
         buy_fee = _finite_nonnegative(buy_fee_bps, "buy_fee_bps")
         sell_fee = _finite_nonnegative(sell_fee_bps, "sell_fee_bps")
-        entry_cash = sell_px * (1.0 - sell_fee / 1e4) - buy_px * (
-            1.0 + buy_fee / 1e4
-        )
+        entry_cash = sell_px * (1.0 - sell_fee / 1e4) - buy_px * (1.0 + buy_fee / 1e4)
         reference = (buy_px + sell_px) / 2.0
         lot = Lot(
             lot_id=str(lot_id),
@@ -397,9 +391,7 @@ class LotLedger:
         if lot is None:
             raise LotLedgerError(f"unknown lot id: {lot_id}")
         quantity = _finite_positive(qty, "closed qty")
-        exit_cash = lot.exit_cash_per_base(
-            buy_px, sell_px, buy_fee_bps, sell_fee_bps
-        )
+        exit_cash = lot.exit_cash_per_base(buy_px, sell_px, buy_fee_bps, sell_fee_bps)
         cash_per_base = lot.entry_cash_per_base + exit_cash
         return (
             quantity * cash_per_base,
