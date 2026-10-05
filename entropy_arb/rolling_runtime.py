@@ -42,7 +42,7 @@ class RollingOrderIntent:
     execution_id: str
     action: str
     direction: str
-    allocations: list[dict[str, float]] = field(default_factory=list)
+    allocations: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -231,7 +231,7 @@ class RollingArcusController:
 
     def _eligible_reduce_allocations(
         self, direction: str, quantity_cap: Decimal
-    ) -> list[dict[str, float]]:
+    ) -> list[dict[str, Any]]:
         arcus_bid, arcus_ask, rh_bid, rh_ask = self._books()
         floor = self.config.min_exit_capture_bps
         scored: list[tuple[float, Any]] = []
@@ -257,7 +257,7 @@ class RollingArcusController:
         scored.sort(key=lambda item: item[0], reverse=True)
 
         remaining = quantity_cap
-        allocations: list[dict[str, float]] = []
+        allocations: list[dict[str, Any]] = []
         for _capture, lot in scored:
             if remaining <= self.tolerance:
                 break
@@ -271,7 +271,7 @@ class RollingArcusController:
 
     def _decision_order(
         self, decision: RollingDecision
-    ) -> tuple[QuoteCandidate, list[dict[str, float]]] | None:
+    ) -> tuple[QuoteCandidate, list[dict[str, Any]]] | None:
         if decision.action == "add":
             remaining_usd = self.max_reference_notional - self.open_reference_notional
             if remaining_usd <= 0:
@@ -292,7 +292,9 @@ class RollingArcusController:
         allocations = self._eligible_reduce_allocations(decision.direction, clip_qty)
         if not allocations:
             return None
-        total = sum(Decimal(str(item["qty"])) for item in allocations)
+        total = sum(
+            (Decimal(str(item["qty"])) for item in allocations), Decimal("0")
+        )
         total = self._round_quantity(total)
         if total <= self.tolerance:
             return None
@@ -452,7 +454,7 @@ class RollingArcusController:
         hedge: HedgeExecutionResult,
     ) -> None:
         remaining = quantity
-        closes: list[dict[str, float]] = []
+        closes: list[dict[str, Any]] = []
         for item in intent.allocations:
             if remaining <= self.tolerance:
                 break
