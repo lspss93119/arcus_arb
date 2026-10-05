@@ -43,13 +43,24 @@ def validate_runtime_gates(
     helper independent makes accidental live-by-default regressions easy to
     test without constructing an exchange client.
     """
-    selected = int(bool(record_only)) + int(bool(tiny_live)) + int(bool(volume_probe)) + int(bool(rolling_live))
+    selected = (
+        int(bool(record_only))
+        + int(bool(tiny_live))
+        + int(bool(volume_probe))
+        + int(bool(rolling_live))
+    )
     if selected > 1:
         raise ValueError(
             "--record-only, --tiny-live, --volume-probe, and --rolling-live are mutually exclusive"
         )
     if (volume_probe or rolling_live or tiny_live) and not confirm_mainnet:
-        flag = "--rolling-live" if rolling_live else "--volume-probe" if volume_probe else "--tiny-live"
+        flag = (
+            "--rolling-live"
+            if rolling_live
+            else "--volume-probe"
+            if volume_probe
+            else "--tiny-live"
+        )
         raise ValueError(
             f"{flag} requires the explicit --confirm-mainnet acknowledgement"
         )
@@ -314,9 +325,7 @@ def main() -> None:
         sys.exit(2)
     if args.rolling_live:
         if args.rolling_clip_usd <= 0:
-            print(
-                "runtime mode error: --rolling-clip-usd must be > 0", file=sys.stderr
-            )
+            print("runtime mode error: --rolling-clip-usd must be > 0", file=sys.stderr)
             sys.exit(2)
         if args.rolling_reprice_sec <= 0:
             print(
