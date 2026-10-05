@@ -5,6 +5,7 @@ instead of duplicating its order, fill, hedge, and reconciliation machinery.
 It owns only strategy state, inventory lots, maker repricing, and BE-safe
 reduction selection.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -81,9 +82,7 @@ class RollingArcusController:
         self.min_quantity = _decimal(min_quantity, "min_quantity")
         self.min_notional = _decimal(min_notional, "min_notional")
         self.max_quantity = (
-            _decimal(max_quantity, "max_quantity")
-            if max_quantity is not None
-            else None
+            _decimal(max_quantity, "max_quantity") if max_quantity is not None else None
         )
         self.reprice_sec = float(reprice_sec)
         self.tolerance = _decimal(tolerance, "tolerance")
@@ -175,9 +174,7 @@ class RollingArcusController:
         return float((arcus_mid / rh_mid - Decimal("1")) * Decimal("10000"))
 
     def _round_quantity(self, quantity: Decimal) -> Decimal:
-        units = (quantity / self.quantity_step).to_integral_value(
-            rounding=ROUND_FLOOR
-        )
+        units = (quantity / self.quantity_step).to_integral_value(rounding=ROUND_FLOOR)
         result = units * self.quantity_step
         if self.max_quantity is not None:
             max_units = (self.max_quantity / self.quantity_step).to_integral_value(
@@ -292,9 +289,7 @@ class RollingArcusController:
         clip_qty = self._quantity_for_usd(side, self.clip_usd)
         if clip_qty is None:
             return None
-        allocations = self._eligible_reduce_allocations(
-            decision.direction, clip_qty
-        )
+        allocations = self._eligible_reduce_allocations(decision.direction, clip_qty)
         if not allocations:
             return None
         total = sum(Decimal(str(item["qty"])) for item in allocations)
@@ -341,7 +336,9 @@ class RollingArcusController:
                 self._intents.pop(execution_id, None)
             return False
         if not execution_id or execution_id not in self._intents:
-            raise RuntimeError("rolling maker placement has no registered execution intent")
+            raise RuntimeError(
+                "rolling maker placement has no registered execution intent"
+            )
         self._order_placed_mono = time.monotonic()
         log.info(
             "[rolling] %s %s state=%s px=%s qty=%s center=%s threshold=(%s,%s) "
@@ -464,8 +461,11 @@ class RollingArcusController:
                 continue
             qty = min(available, remaining)
             lot = next(
-                (candidate for candidate in self.ledger.lots
-                 if candidate.lot_id == item["lot_id"]),
+                (
+                    candidate
+                    for candidate in self.ledger.lots
+                    if candidate.lot_id == item["lot_id"]
+                ),
                 None,
             )
             if lot is None:
